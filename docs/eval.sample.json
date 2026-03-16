@@ -1,0 +1,14 @@
+[
+  {
+    "query": "budget approval for q2",
+    "relevant_msg_ids": ["17c6f123abc"],
+    "account_email": "you@gmail.com",
+    "label": "INBOX"
+  },
+  {
+    "query": "travel receipt reimbursement",
+    "relevant_msg_ids": ["17c6f456def"],
+    "account_email": "you@gmail.com",
+    "scope": "sent-only"
+  }
+]

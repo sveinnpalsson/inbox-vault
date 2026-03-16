@@ -1,0 +1,37 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local virtualenv/tool caches
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local secrets / account config
+.env
+.env.*
+config.toml
+config.local*.toml
+config.*.local.toml
+env/
+
+# Runtime data + generated artifacts
+data/
+.runs/
+.stress-runs/
+logs/
+tmp/
+.tmux/
+test-results/
+
+# Local packaged skill artifacts
+*.skill
+
+# Generated reports (keep curated markdown snapshots versionable)
+reports/**
+!reports/*.md
+!reports/.gitkeep
+
+# Internal release planning docs
+docs/release/

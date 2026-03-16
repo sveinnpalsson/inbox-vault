@@ -1,0 +1,19 @@
+flowchart LR
+    U["You / agents / cron"] --> C["CLI\n(backfill, update, repair)"]
+    G["Gmail API"] --> C
+    C --> DB["SQLCipher database\n(encrypted at rest)"]
+
+    DB --> E["Enrichment\n(local LLM)"]
+    E --> DB
+
+    DB --> P["Contact profiles"]
+    DB --> V["Vector index\n(chunk-level)"]
+    P --> R["Hybrid search\n+ clearance gate"]
+    V --> R
+
+    classDef core fill:#e8f0fe,stroke:#1a73e8,color:#0b3d91;
+    classDef data fill:#e6f4ea,stroke:#188038,color:#0d652d;
+    classDef opt fill:#fef7e0,stroke:#ea8600,color:#7a4700;
+    class C,R core;
+    class DB,P,V data;
+    class E opt;
