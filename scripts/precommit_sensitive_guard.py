@@ -35,6 +35,7 @@ FORBIDDEN_FILE_PATTERNS = [
 CONFIG_GLOB = "config*.toml"
 CONFIG_ALLOWLIST = {
     "config.example.toml",
+    "config.multi-account.example.toml",
 }
 SENSITIVE_CONFIG_MARKERS = [
     re.compile(r"^\s*credentials_file\s*=", re.MULTILINE),

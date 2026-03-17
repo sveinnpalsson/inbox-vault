@@ -25,4 +25,5 @@ def test_sensitive_guard_does_not_allowlist_account_configs() -> None:
     content = Path("scripts/precommit_sensitive_guard.py").read_text(encoding="utf-8")
     assert '"config.example.toml"' in content
     assert '"config.account-main.toml"' not in content
+    assert '"config.multi-account.example.toml"' in content
     assert '"config.live20.toml"' not in content

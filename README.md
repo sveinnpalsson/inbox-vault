@@ -178,7 +178,7 @@ The two primary commands are `update` and `repair`. Everything else is available
 | File | Purpose |
 |---|---|
 | `config.example.toml` | Generic template -- start here |
-| `config.account-main.toml` | Sanitized multi-account example |
+| `config.multi-account.example.toml` | Sanitized multi-account example |
 | `config.toml` / `config.local*.toml` | Your local config (git-ignored) |
 
 Key config sections: `[database]`, `[gmail]`, `[llm]`, `[embeddings]`, `[redaction]`, `[retrieval]`, `[indexing]`, `[profiles]`, `[[accounts]]`. See `config.example.toml` for all options with comments.
