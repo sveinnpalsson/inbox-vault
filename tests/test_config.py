@@ -37,7 +37,7 @@ query = "label:inbox"
     assert cfg.llm.enabled is False
     assert cfg.embeddings.endpoint == "http://localhost:8080"
     assert cfg.embeddings.max_retries == 4
-    assert cfg.embeddings.fallback == "hash"
+    assert cfg.embeddings.fallback == "none"
     assert cfg.redaction.mode == "hybrid"
     assert cfg.retrieval.search_strategy == "hybrid"
     assert cfg.retrieval.vector_backend == "sqlite"

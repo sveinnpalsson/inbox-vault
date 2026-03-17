@@ -21,6 +21,7 @@ path = "test.db"
 password_env = "TEST_DB_PASSWORD"
 """.strip()
     )
+    (path.parent / "fake-creds.json").write_text("{}")
 
 
 def test_validate_command_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):

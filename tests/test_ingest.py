@@ -16,6 +16,11 @@ class _FakeResp:
     reason = "Not Found"
 
 
+@pytest.fixture(autouse=True)
+def _skip_email_resolve(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(ingest, "_resolve_account_email", lambda *_args, **_kw: None)
+
+
 def test_backfill_ingests_and_skips_existing(conn, app_cfg, monkeypatch: pytest.MonkeyPatch):
     service = object()
 
