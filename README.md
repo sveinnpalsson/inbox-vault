@@ -55,14 +55,19 @@ Requires **Python 3.11+** (the CLI will refuse to start on older versions).
 ```bash
 git clone https://github.com/sveinnpalsson/inbox-vault.git
 cd inbox-vault
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -e .[dev]
+python -m pip install --upgrade pip
+python -m pip install -e .[dev]
 
 # optional extras
-pip install -e .[redaction]   # scrubadub-based NER detection
-pip install -e .[retrieval]   # LanceDB + sentence-transformers
+python -m pip install -e .[redaction]   # scrubadub-based NER detection
+python -m pip install -e .[retrieval]   # LanceDB + sentence-transformers
 ```
+
+If `python3` on your machine still points to Python 3.10 (common on Ubuntu/WSL), use
+`python3.11` explicitly when creating the virtualenv. Installing under Python 3.10 can trigger
+slow dependency backtracking before pip reports the version mismatch.
 
 ### 2. Set up Gmail API credentials
 

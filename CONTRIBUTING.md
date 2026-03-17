@@ -7,16 +7,17 @@ This project handles private email data, so contributions should prioritize corr
 ## Quick setup
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -e .[dev]
+python -m pip install --upgrade pip
+python -m pip install -e .[dev]
 ```
 
 Optional extras:
 
 ```bash
-pip install -e .[redaction]
-pip install -e .[retrieval]
+python -m pip install -e .[redaction]
+python -m pip install -e .[retrieval]
 ```
 
 Use `config.example.toml` as your starting point for local config.

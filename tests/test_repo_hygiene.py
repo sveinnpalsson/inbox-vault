@@ -1,3 +1,4 @@
+import stat
 from pathlib import Path
 
 
@@ -6,6 +7,8 @@ def test_gitignore_covers_runtime_artifacts() -> None:
     for expected in [
         ".runs/",
         ".stress-runs/",
+        "build/",
+        "dist/",
         "logs/",
         "tmp/",
         "env/",
@@ -27,3 +30,16 @@ def test_sensitive_guard_does_not_allowlist_account_configs() -> None:
     assert '"config.account-main.toml"' not in content
     assert '"config.multi-account.example.toml"' in content
     assert '"config.live20.toml"' not in content
+
+
+def test_setup_docs_require_python311_and_pip_upgrade() -> None:
+    for path in [Path("README.md"), Path("CONTRIBUTING.md")]:
+        content = path.read_text(encoding="utf-8")
+        assert "python3.11 -m venv .venv" in content
+        assert "python -m pip install --upgrade pip" in content
+
+
+def test_shell_scripts_are_executable() -> None:
+    for path in Path("scripts").glob("*.sh"):
+        mode = path.stat().st_mode
+        assert mode & stat.S_IXUSR, f"{path} must be executable"
