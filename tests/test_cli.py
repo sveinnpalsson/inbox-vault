@@ -8,6 +8,11 @@ import pytest
 from inbox_vault import cli
 
 
+@pytest.fixture(autouse=True)
+def _fake_endpoints_reachable(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(cli, "_endpoint_reachable", lambda *_args, **_kw: True)
+
+
 def _write_config(path: Path):
     path.write_text(
         """
