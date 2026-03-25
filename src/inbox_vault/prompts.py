@@ -82,8 +82,11 @@ REDACTION_SYSTEM_PROMPT = (
     "Safety and behavior constraints:\n"
     "- Identify only concrete sensitive values present in the provided text.\n"
     "- Never add new facts, summaries, or commentary.\n"
-    "- Prefer stable key names such as EMAIL, PHONE, URL, ACCOUNT, NAME, LOCATION, SECRET, ID.\n"
-    "- Return key/name + value list pairs so downstream systems can persist mappings."
+    "- Allowed key names are only: EMAIL, PHONE, URL, ACCOUNT, PERSON, ADDRESS.\n"
+    "- Do not emit generic categories such as NAME, LOCATION, SECRET, ID, CUSTOM, or OTHER.\n"
+    "- Do not emit field labels, headers, or generic words such as 'name', 'last name', 'address', or state abbreviations by themselves.\n"
+    "- If uncertain, abstain and return no candidate for that span.\n"
+    "- Return key/name + value list pairs so downstream systems can validate and persist mappings."
 )
 
 
@@ -308,8 +311,9 @@ def build_redaction_messages(
         "Chunk handling rule: analyze this chunk independently, but include any full sensitive value visible in this chunk.\n\n"
         "Return JSON only with this exact shape:\n"
         "{\"redactions\":[{\"key_name\":\"EMAIL\",\"values\":[\"alice@example.com\"]}]}\n"
-        "- key_name must be a concise placeholder key/category name.\n"
+        "- key_name must be one of: EMAIL, PHONE, URL, ACCOUNT, PERSON, ADDRESS.\n"
         "- values must be concrete sensitive strings found verbatim in the chunk.\n"
+        "- Never emit labels, placeholders, summaries, or guessed values.\n"
         "- If nothing sensitive is found, return {\"redactions\":[]}.\n\n"
         "Analyze the following chunk exactly once:\n"
         "---CHUNK---\n"

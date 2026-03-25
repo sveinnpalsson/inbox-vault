@@ -3,6 +3,7 @@ from __future__ import annotations
 from inbox_vault.config import LLMConfig
 from inbox_vault.db import (
     fetch_redaction_entries,
+    prune_invalid_redaction_entries,
     unredact_with_scope,
     upsert_redaction_entries,
 )
@@ -94,3 +95,72 @@ def test_unredaction_round_trip_with_db(conn):
         text="Please email <REDACTED_EMAIL_A>",
     )
     assert restored == "Please email amy@example.com"
+
+
+def test_invalid_redaction_entries_are_not_persisted(conn):
+    upsert_redaction_entries(
+        conn,
+        scope_type="account",
+        scope_id="acct@example.com",
+        entries=[
+            {
+                "key_name": "PERSON",
+                "placeholder": "<REDACTED_PERSON_A>",
+                "value_norm": "name",
+                "original_value": "name",
+                "source_mode": "llm_chunk",
+            },
+            {
+                "key_name": "EMAIL",
+                "placeholder": "<REDACTED_EMAIL_A>",
+                "value_norm": "amy@example.com",
+                "original_value": "amy@example.com",
+                "source_mode": "llm_chunk",
+            },
+        ],
+    )
+    conn.commit()
+
+    rows = fetch_redaction_entries(conn, scope_type="account", scope_id="acct@example.com")
+    assert rows == [("EMAIL", "<REDACTED_EMAIL_A>", "amy@example.com", "amy@example.com")]
+
+
+def test_prune_invalid_redaction_entries_marks_rejected(conn):
+    conn.execute(
+        """
+        INSERT INTO redaction_entries (
+          scope_type, scope_id, key_name, placeholder, value_norm, original_value, source_mode,
+          policy_version, status, validator_name, detector_sources, modality, source_field,
+          first_seen_at, last_seen_at, hit_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)
+        """,
+        (
+            "account",
+            "acct@example.com",
+            "ADDRESS",
+            "<REDACTED_ADDRESS_A>",
+            "ca",
+            "CA",
+            "llm_chunk",
+            "",
+            "active",
+            "",
+            "",
+            "email",
+            "body",
+            1,
+        ),
+    )
+    conn.commit()
+
+    pruned = prune_invalid_redaction_entries(
+        conn, scope_type="account", scope_id="acct@example.com"
+    )
+    conn.commit()
+
+    assert pruned == 1
+    row = conn.execute(
+        "SELECT status FROM redaction_entries WHERE placeholder = ?",
+        ("<REDACTED_ADDRESS_A>",),
+    ).fetchone()
+    assert row[0] == "rejected"

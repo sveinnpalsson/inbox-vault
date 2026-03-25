@@ -201,6 +201,30 @@ Cron-ready scripts in `scripts/`:
 
 Scripts auto-resolve the repo path from their location. Override with `INBOX_VAULT_REPO_DIR` if needed.
 
+## Unified cross-vault skill
+
+Inbox Vault is designed to participate in a shared operator surface across Gmail + docs + photos.
+
+Current boundary:
+- the canonical unified skill currently lives in the `docs-vault` repo
+- some local/operator deployments mirror that skill into `inbox-vault`
+- a clean `inbox-vault` clone should not assume the mirror is present unless you add it intentionally
+
+Examples:
+
+```bash
+# from a deployment that also has the mirrored unified skill installed
+skills/vault-unified-local/scripts/vault-unified-cli.sh status --sources all
+skills/vault-unified-local/scripts/vault-unified-cli.sh search "tax receipt" --sources all --top-k 10
+```
+
+Default behavior:
+- source fan-out across inbox/docs/photos (unless filtered)
+- redacted clearance by default
+- weighted RRF fusion over backend results
+
+If you mirror the skill into this repo, keep it aligned with the canonical copy before release.
+
 ## Privacy and safety defaults
 
 - **Encrypted at rest** -- SQLCipher for all stored messages, enrichments, profiles, and vectors
@@ -208,6 +232,15 @@ Scripts auto-resolve the repo path from their location. Override with `INBOX_VAU
 - **Local endpoints** -- LLM and embedding calls target `localhost` by default
 - **Git-safe** -- runtime paths (`data/`, `.runs/`, `logs/`, `env/`) are ignored; pre-commit hook blocks credential commits
 - **No telemetry**
+
+## Redaction v1.1 operator model
+
+The current operator model adds:
+
+- `upgrade --index-level redacted|full`
+- `search --search-level auto|redacted|full`
+
+Default behavior still prefers redacted retrieval. The optional `full` dense index is only created through an explicit `upgrade` run.
 
 ## Tests
 

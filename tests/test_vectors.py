@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-from inbox_vault.db import DBLockRetryExhausted, upsert_message
+from inbox_vault.db import DBLockRetryExhausted, upsert_message, vector_level_counts
 from inbox_vault.redaction import redact_text
-from inbox_vault.vectors import count_pending_vector_updates, index_vectors, search_vectors
+from inbox_vault.vectors import (
+    INDEX_LEVEL_FULL,
+    INDEX_LEVEL_REDACTED,
+    count_pending_vector_updates,
+    index_vectors,
+    search_vectors,
+)
 
 
 def _insert_msg(
@@ -106,6 +112,81 @@ def test_index_and_search_with_scope_and_clearance(conn, app_cfg, monkeypatch):
     assert "alice@example.com" in full[0].content
 
 
+def test_default_index_builds_redacted_level_only(conn, app_cfg, monkeypatch):
+    _insert_msg(
+        conn,
+        msg_id="m-redacted-default",
+        account="acct@example.com",
+        labels=["INBOX"],
+        subject="Project alpha",
+        body="Reach alice@example.com about the project",
+    )
+    conn.commit()
+
+    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0])
+
+    stats = index_vectors(conn, app_cfg)
+    assert stats["index_level"] == INDEX_LEVEL_REDACTED
+
+    counts = vector_level_counts(conn)
+    assert counts[INDEX_LEVEL_REDACTED]["messages"] == 1
+    assert INDEX_LEVEL_FULL not in counts
+
+
+def test_full_clearance_can_fallback_to_redacted_rank_with_diagnostics(conn, app_cfg, monkeypatch):
+    _insert_msg(
+        conn,
+        msg_id="m-fallback",
+        account="acct@example.com",
+        labels=["INBOX"],
+        subject="Project alpha",
+        body="Contact alice@example.com about invoice 998877.",
+    )
+    conn.commit()
+
+    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0])
+    index_vectors(conn, app_cfg, index_level=INDEX_LEVEL_REDACTED)
+
+    rows, diagnostics = search_vectors(
+        conn,
+        app_cfg,
+        "project alpha",
+        clearance="full",
+        include_diagnostics=True,
+    )
+    assert len(rows) == 1
+    assert "alice@example.com" in rows[0].content
+    assert diagnostics.used_level == INDEX_LEVEL_REDACTED
+    assert diagnostics.fallback_from_level == INDEX_LEVEL_FULL
+    assert diagnostics.full_level_available is False
+
+
+def test_explicit_full_search_level_errors_when_unavailable(conn, app_cfg, monkeypatch):
+    _insert_msg(
+        conn,
+        msg_id="m-no-full",
+        account="acct@example.com",
+        labels=["INBOX"],
+        subject="Project alpha",
+        body="Contact alice@example.com",
+    )
+    conn.commit()
+
+    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0])
+    index_vectors(conn, app_cfg, index_level=INDEX_LEVEL_REDACTED)
+
+    import pytest
+
+    with pytest.raises(ValueError, match="full search level is unavailable"):
+        search_vectors(
+            conn,
+            app_cfg,
+            "project alpha",
+            clearance="full",
+            search_level=INDEX_LEVEL_FULL,
+        )
+
+
 def test_search_applies_date_range_filters_for_dense_and_lexical(conn, app_cfg, monkeypatch):
     _insert_msg(
         conn,
@@ -195,20 +276,24 @@ def test_index_vectors_skips_unchanged_on_rerun_and_pending_counter_matches(
         "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
     )
 
-    pending_before = count_pending_vector_updates(conn, app_cfg)
+    pending_before = count_pending_vector_updates(conn, app_cfg, index_level=INDEX_LEVEL_REDACTED)
     assert pending_before == 1
 
     first = index_vectors(conn, app_cfg)
     assert first["indexed"] == 1
 
-    pending_after_first = count_pending_vector_updates(conn, app_cfg)
+    pending_after_first = count_pending_vector_updates(
+        conn, app_cfg, index_level=INDEX_LEVEL_REDACTED
+    )
     assert pending_after_first == 0
 
     second = index_vectors(conn, app_cfg)
     assert second["indexed"] == 0
     assert second["unchanged"] == 1
 
-    pending_after_second = count_pending_vector_updates(conn, app_cfg)
+    pending_after_second = count_pending_vector_updates(
+        conn, app_cfg, index_level=INDEX_LEVEL_REDACTED
+    )
     assert pending_after_second == 0
 
 
@@ -246,12 +331,12 @@ def test_index_vectors_pending_only_limits_to_pending_rows(conn, app_cfg, monkey
     first = index_vectors(conn, app_cfg, pending_only=True, limit=2)
     assert first["indexed"] == 2
     assert first["unchanged"] == 0
-    assert count_pending_vector_updates(conn, app_cfg) == 1
+    assert count_pending_vector_updates(conn, app_cfg, index_level=INDEX_LEVEL_REDACTED) == 1
 
     second = index_vectors(conn, app_cfg, pending_only=True, limit=2)
     assert second["indexed"] == 1
     assert second["unchanged"] == 0
-    assert count_pending_vector_updates(conn, app_cfg) == 0
+    assert count_pending_vector_updates(conn, app_cfg, index_level=INDEX_LEVEL_REDACTED) == 0
 
 
 def test_index_vectors_lock_exhaustion_marks_failed(conn, app_cfg, monkeypatch):
@@ -269,7 +354,7 @@ def test_index_vectors_lock_exhaustion_marks_failed(conn, app_cfg, monkeypatch):
         "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
     )
     monkeypatch.setattr(
-        "inbox_vault.vectors.upsert_message_vector",
+        "inbox_vault.vectors.upsert_message_vector_v2",
         lambda *_a, **_k: (_ for _ in ()).throw(DBLockRetryExhausted("forced")),
     )
 
@@ -304,7 +389,7 @@ def test_index_vectors_commits_incrementally_by_default(conn, app_cfg, monkeypat
 
     from inbox_vault import vectors as vectors_mod
 
-    original_upsert = vectors_mod.upsert_message_vector
+    original_upsert = vectors_mod.upsert_message_vector_v2
     seen_msg_ids: list[str] = []
 
     def interrupt_on_second(*args, **kwargs):
@@ -314,7 +399,7 @@ def test_index_vectors_commits_incrementally_by_default(conn, app_cfg, monkeypat
             raise KeyboardInterrupt("simulated interruption")
         return original_upsert(*args, **kwargs)
 
-    monkeypatch.setattr("inbox_vault.vectors.upsert_message_vector", interrupt_on_second)
+    monkeypatch.setattr("inbox_vault.vectors.upsert_message_vector_v2", interrupt_on_second)
 
     try:
         index_vectors(conn, app_cfg)
@@ -327,7 +412,8 @@ def test_index_vectors_commits_incrementally_by_default(conn, app_cfg, monkeypat
     committed_ids = {
         row[0]
         for row in conn.execute(
-            "SELECT msg_id FROM message_vectors WHERE msg_id LIKE 'm-commit-%'"
+            "SELECT msg_id FROM message_vectors_v2 WHERE index_level = ? AND msg_id LIKE 'm-commit-%'",
+            (INDEX_LEVEL_REDACTED,),
         ).fetchall()
     }
     assert committed_ids == {"m-commit-1"}
@@ -551,10 +637,11 @@ def test_chunk_indexing_with_overlap_and_message_aggregation(conn, app_cfg, monk
     rows = conn.execute(
         """
         SELECT chunk_index, chunk_start, chunk_end, chunk_type
-        FROM message_chunk_vectors
-        WHERE msg_id = 'm-chunks'
+        FROM message_chunk_vectors_v2
+        WHERE msg_id = 'm-chunks' AND index_level = ?
         ORDER BY chunk_index
-        """
+        """,
+        (INDEX_LEVEL_REDACTED,),
     ).fetchall()
     assert rows[0][3] == "subject"
     # body chunks should overlap: each following start is less than previous end
@@ -632,8 +719,8 @@ def test_index_vectors_normalizes_and_trims_text(conn, app_cfg, monkeypatch):
     assert stats["indexed"] == 1
 
     source_text = conn.execute(
-        "SELECT source_text FROM message_vectors WHERE msg_id = ?",
-        ("m-normalize",),
+        "SELECT source_text FROM message_vectors_v2 WHERE msg_id = ? AND index_level = ?",
+        ("m-normalize", INDEX_LEVEL_REDACTED),
     ).fetchone()[0]
     assert "\u200b" not in source_text
     assert "\u200d" not in source_text
@@ -659,12 +746,7 @@ def test_lancedb_missing_dependency_degrades_cleanly(conn, app_cfg, monkeypatch)
     monkeypatch.setattr(
         "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
     )
-    monkeypatch.setattr(
-        "inbox_vault.vectors._lancedb_available",
-        lambda: (False, "unavailable:ModuleNotFoundError"),
-    )
-
     stats = index_vectors(conn, app_cfg)
     assert stats["indexed"] == 1
-    assert stats["lancedb_status"].startswith("unavailable:")
+    assert stats["lancedb_status"] == "disabled:v2-index-levels"
     assert stats["lancedb_failed"] == 0

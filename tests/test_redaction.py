@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from inbox_vault.config import LLMConfig
-from inbox_vault.redaction import model_redact_text, redact_text, regex_redact_text
+from inbox_vault.redaction import (
+    is_redaction_value_allowed,
+    model_redact_text,
+    redact_text,
+    regex_redact_text,
+)
 
 
 def test_regex_redaction_masks_common_tokens():
@@ -57,3 +62,18 @@ def test_model_redaction_uses_chunking(monkeypatch):
     out = model_redact_text("abcdefghij", llm_cfg=cfg, profile="std", instruction="", chunk_chars=4)
     assert calls == [("abcd", 1, 3), ("efgh", 2, 3), ("ij", 3, 3)]
     assert out == "[4][4][2]"
+
+
+def test_redaction_value_validator_rejects_common_false_positives():
+    assert is_redaction_value_allowed("ACCOUNT", "24") is False
+    assert is_redaction_value_allowed("ADDRESS", "CA") is False
+    assert is_redaction_value_allowed("PERSON", "LAST NAME") is False
+    assert is_redaction_value_allowed("PERSON", "name") is False
+
+
+def test_redaction_value_validator_rejects_custom_and_accepts_valid_entities():
+    assert is_redaction_value_allowed("CUSTOM", "Project Delta") is False
+    assert is_redaction_value_allowed("EMAIL", "alice@example.com") is True
+    assert is_redaction_value_allowed("PHONE", "+1 (617) 555-1212") is True
+    assert is_redaction_value_allowed("PERSON", "Alice Johnson") is True
+    assert is_redaction_value_allowed("ADDRESS", "123 Main Street") is True

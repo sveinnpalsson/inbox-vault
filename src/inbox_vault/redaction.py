@@ -9,21 +9,175 @@ from .llm import chat_text, extract_first_json
 from .prompts import build_redaction_messages
 from .redaction_map import DeterministicRedactionMap, apply_deterministic_redaction
 
+REDACTION_POLICY_VERSION = "2026-03-22-precision-1"
+
+_EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", flags=re.I)
+_PHONE_PATTERN = re.compile(r"\b(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}\b")
+_URL_PATTERN = re.compile(r"\bhttps?://[^\s)]+", flags=re.I)
+_LABELED_ACCOUNT_PATTERN = re.compile(
+    r"\b(?:acct|account|iban|routing|card|ssn)[:\s#-]*[A-Z0-9-]{5,}\b", flags=re.I
+)
+_LONG_DIGITS_PATTERN = re.compile(r"\b\d{10,19}\b")
 _RE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", flags=re.I), "EMAIL"),
+    (_EMAIL_PATTERN, "EMAIL"),
     (
-        re.compile(r"\b(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}\b"),
+        _PHONE_PATTERN,
         "PHONE",
     ),
-    (re.compile(r"\bhttps?://[^\s)]+", flags=re.I), "URL"),
-    (
-        re.compile(r"\b(?:acct|account|iban|routing|card|ssn)[:\s#-]*[A-Z0-9-]{5,}\b", flags=re.I),
-        "ACCOUNT",
-    ),
-    (re.compile(r"\b\d{10,19}\b"), "ACCOUNT"),
+    (_URL_PATTERN, "URL"),
+    (_LABELED_ACCOUNT_PATTERN, "ACCOUNT"),
+    (_LONG_DIGITS_PATTERN, "ACCOUNT"),
 ]
 
 _ALLOWED_MODES = {"regex", "model", "hybrid"}
+_KNOWN_KEYS = {"EMAIL", "PHONE", "URL", "ACCOUNT", "PERSON", "ADDRESS", "CUSTOM"}
+_GENERIC_LABELS = {
+    "",
+    ".",
+    "..",
+    "...",
+    "-",
+    "--",
+    "---",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "unknown",
+    "unspecified",
+    "redacted",
+    "placeholder",
+    "value",
+    "field",
+    "form",
+    "entry",
+    "text",
+    "data",
+    "name",
+    "full name",
+    "first name",
+    "last name",
+    "middle name",
+    "surname",
+    "given name",
+    "company name",
+    "account",
+    "account number",
+    "routing number",
+    "card number",
+    "phone",
+    "phone number",
+    "mobile",
+    "email",
+    "email address",
+    "address",
+    "street",
+    "city",
+    "state",
+    "zip",
+    "zip code",
+    "postal code",
+    "country",
+    "signature",
+    "dob",
+    "date of birth",
+}
+_GENERIC_PERSON_TOKENS = {
+    "name",
+    "first",
+    "last",
+    "middle",
+    "full",
+    "surname",
+    "given",
+    "applicant",
+    "insured",
+    "beneficiary",
+    "patient",
+    "signature",
+}
+_ADDRESS_HINTS = {
+    "street",
+    "st",
+    "avenue",
+    "ave",
+    "road",
+    "rd",
+    "drive",
+    "dr",
+    "lane",
+    "ln",
+    "boulevard",
+    "blvd",
+    "court",
+    "ct",
+    "circle",
+    "cir",
+    "highway",
+    "hwy",
+    "parkway",
+    "pkwy",
+    "suite",
+    "ste",
+    "unit",
+    "apt",
+    "apartment",
+    "box",
+    "po",
+}
+_STATE_OR_REGION_CODES = {
+    "al",
+    "ak",
+    "az",
+    "ar",
+    "ca",
+    "co",
+    "ct",
+    "dc",
+    "de",
+    "fl",
+    "ga",
+    "hi",
+    "ia",
+    "id",
+    "il",
+    "in",
+    "ks",
+    "ky",
+    "la",
+    "ma",
+    "md",
+    "me",
+    "mi",
+    "mn",
+    "mo",
+    "ms",
+    "mt",
+    "nc",
+    "nd",
+    "ne",
+    "nh",
+    "nj",
+    "nm",
+    "nv",
+    "ny",
+    "oh",
+    "ok",
+    "or",
+    "pa",
+    "ri",
+    "sc",
+    "sd",
+    "tn",
+    "tx",
+    "ut",
+    "va",
+    "vt",
+    "wa",
+    "wi",
+    "wv",
+    "wy",
+}
 
 
 @lru_cache(maxsize=1)
@@ -128,6 +282,8 @@ class PersistentRedactionMap:
         obj = cls()
         for key_name, placeholder, value_norm, original_value in rows:
             key = _normalize_key_name(key_name)
+            if not is_redaction_value_allowed(key, original_value):
+                continue
             obj.value_to_placeholder[str(value_norm)] = str(placeholder)
             obj.placeholder_to_value[str(placeholder)] = str(original_value)
             obj.placeholder_to_key[str(placeholder)] = key
@@ -139,6 +295,8 @@ class PersistentRedactionMap:
 
     def register(self, key_name: str, value: str) -> tuple[str, str, bool]:
         key = _normalize_key_name(key_name)
+        if not is_redaction_value_allowed(key, value):
+            return "", "", False
         normalized = _normalize_value(key, value)
         if not normalized:
             return "", "", False
@@ -200,6 +358,121 @@ def _normalize_value(key_name: str, value: str) -> str:
     if key_name in {"URL", "EMAIL"}:
         return stripped.lower().rstrip("/")
     return re.sub(r"\s+", " ", stripped).lower()
+
+
+def _normalize_candidate_display(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (value or "").strip())
+    cleaned = cleaned.strip("`\"'[]{}()")
+    return cleaned.strip()
+
+
+def _looks_like_generic_label(value: str) -> bool:
+    cleaned = _normalize_candidate_display(value).lower().strip(" .,:;")
+    if not cleaned:
+        return True
+    if cleaned in _GENERIC_LABELS:
+        return True
+    if re.fullmatch(r"[_.\- ]+", cleaned):
+        return True
+    if cleaned.endswith(":") and cleaned[:-1].strip() in _GENERIC_LABELS:
+        return True
+    return False
+
+
+def _candidate_present_in_text(key_name: str, value: str, text: str) -> bool:
+    source = str(text or "")
+    if not source:
+        return False
+    display = _normalize_candidate_display(value)
+    if not display:
+        return False
+    if key_name in {"PHONE", "ACCOUNT"}:
+        digits = re.sub(r"\D", "", display)
+        if digits:
+            return digits in re.sub(r"\D", "", source)
+    if key_name in {"EMAIL", "URL"}:
+        return _normalize_value(key_name, display) in _normalize_value(key_name, source)
+    return display.lower() in source.lower()
+
+
+def is_redaction_value_allowed(
+    key_name: str,
+    value: str,
+    *,
+    source_text: str | None = None,
+) -> bool:
+    key = _normalize_key_name(key_name)
+    if key not in _KNOWN_KEYS:
+        return False
+
+    display = _normalize_candidate_display(value)
+    if not display or _looks_like_generic_label(display):
+        return False
+    if len(display) < 3:
+        return False
+    if re.fullmatch(r"[Xx*#._-]+", display):
+        return False
+    if source_text is not None and not _candidate_present_in_text(key, display, source_text):
+        return False
+
+    if key == "EMAIL":
+        return bool(_EMAIL_PATTERN.fullmatch(display))
+
+    if key == "PHONE":
+        digits = _normalize_value(key, display)
+        return digits.isdigit() and 10 <= len(digits) <= 15
+
+    if key == "URL":
+        return bool(_URL_PATTERN.fullmatch(display))
+
+    if key == "ACCOUNT":
+        digits = re.sub(r"\D", "", display)
+        compact = re.sub(r"[\s-]+", "", display)
+        if len(digits) >= 6:
+            return True
+        if len(compact) >= 8 and sum(ch.isdigit() for ch in compact) >= 4:
+            return True
+        return False
+
+    if key == "PERSON":
+        if any(ch.isdigit() for ch in display):
+            return False
+        lowered = display.lower()
+        if lowered in _GENERIC_LABELS:
+            return False
+        if ":" in display or "@" in display or "/" in display:
+            return False
+        tokens = re.findall(r"[A-Za-z][A-Za-z'’-]*", display)
+        if len(tokens) < 2:
+            return False
+        if any(token.lower() in _GENERIC_PERSON_TOKENS for token in tokens):
+            return False
+        if sum(len(token) for token in tokens) < 5:
+            return False
+        return True
+
+    if key == "ADDRESS":
+        lowered = display.lower().strip(" .,:;")
+        if lowered in _GENERIC_LABELS or lowered in _STATE_OR_REGION_CODES:
+            return False
+        if len(display) < 8:
+            return False
+        if re.fullmatch(r"[A-Za-z]{2,3}", display):
+            return False
+        has_digit = any(ch.isdigit() for ch in display)
+        word_tokens = {token.lower().strip(".,") for token in re.findall(r"[A-Za-z0-9#]+", display)}
+        if has_digit:
+            return True
+        if "po" in word_tokens and "box" in word_tokens:
+            return True
+        if word_tokens & _ADDRESS_HINTS:
+            return True
+        return False
+
+    if key == "CUSTOM":
+        return False
+
+    return False
 
 
 def _ordinal_token(n: int) -> str:
@@ -306,7 +579,11 @@ def _model_detect_candidates(
         temperature=0.0,
     )
     parsed = _parse_llm_redaction_json(output)
-    return [RedactionCandidate(key_name=k, value=v, source=source) for k, v in parsed]
+    return [
+        RedactionCandidate(key_name=k, value=v, source=source)
+        for k, v in parsed
+        if is_redaction_value_allowed(k, v, source_text=text)
+    ]
 
 
 def redact_with_persistent_map(

@@ -9,14 +9,26 @@ from datetime import datetime, timedelta, timezone
 
 from .config import load_config, resolve_password
 from .consolidation import run_consolidation
-from .db import clear_contact_profiles, get_conn
+from .db import (
+    clear_contact_profiles,
+    get_conn,
+    prune_invalid_redaction_entries,
+    vector_level_counts,
+)
 from .enrich import enrich_pending
 from .evals import bootstrap_eval_template, run_retrieval_eval
 from .ingest import backfill, repair, update
 from .profiles import build_profiles
-from .redaction import redact_text
+from .redaction import REDACTION_POLICY_VERSION, redact_text
 from .stress import run_isolated_stress
-from .vectors import count_pending_vector_updates, index_vectors, search_vectors
+from .vectors import (
+    INDEX_LEVEL_AUTO,
+    INDEX_LEVEL_FULL,
+    INDEX_LEVEL_REDACTED,
+    count_pending_vector_updates,
+    index_vectors,
+    search_vectors,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -223,6 +235,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Trim indexed subject/snippet/body text per field to this character limit.",
     )
+    p_index.add_argument(
+        "--index-level",
+        choices=[INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL],
+        default=INDEX_LEVEL_REDACTED,
+        help="Which dense index level to build. Redacted is the default safe index; full is operator opt-in.",
+    )
 
     p_search = sub.add_parser("search", help="Semantic search over indexed messages")
     p_search.add_argument("query", help="Search query text")
@@ -230,6 +248,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--label", default=None, help="Optional label filter, e.g. INBOX")
     p_search.add_argument("--top-k", type=int, default=5)
     p_search.add_argument("--clearance", choices=["redacted", "full"], default="redacted")
+    p_search.add_argument(
+        "--search-level",
+        choices=[INDEX_LEVEL_AUTO, INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL],
+        default=INDEX_LEVEL_AUTO,
+        help="Control which dense index level ranking uses. 'auto' prefers full only when available and full clearance is requested.",
+    )
     p_search.add_argument("--strategy", choices=["dense", "lexical", "hybrid"], default=None)
     p_search.add_argument(
         "--from-date",
@@ -316,6 +340,33 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Show mailbox/vector/profile status summary")
     p_status.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON output (default behavior; provided for explicit machine workflows).",
+    )
+
+    p_upgrade = sub.add_parser(
+        "upgrade",
+        help="Preview or apply redaction-policy/vector upgrades, including optional full-index builds",
+    )
+    p_upgrade.add_argument(
+        "--index-level",
+        choices=[INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL, "all"],
+        default=INDEX_LEVEL_REDACTED,
+        help="Which index level(s) to upgrade or build.",
+    )
+    p_upgrade.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional cap on messages to reindex per selected level during execution.",
+    )
+    p_upgrade.add_argument(
+        "--yes",
+        action="store_true",
+        help="Apply the upgrade work. Without this flag, the command only prints a dry-run summary.",
+    )
+    p_upgrade.add_argument(
         "--json",
         action="store_true",
         help="Emit JSON output (default behavior; provided for explicit machine workflows).",
@@ -540,19 +591,72 @@ def _latest_message_status(conn) -> dict[str, object] | None:
 
 
 def run_status(conn, cfg) -> dict[str, object]:
+    level_counts = vector_level_counts(conn)
+    available_levels = sorted(level_counts)
+    full_available = INDEX_LEVEL_FULL in available_levels
+    pending_redacted = count_pending_vector_updates(conn, cfg, index_level=INDEX_LEVEL_REDACTED)
+    pending_full = (
+        count_pending_vector_updates(conn, cfg, index_level=INDEX_LEVEL_FULL)
+        if full_available
+        else None
+    )
+    active_redactions = int(
+        conn.execute(
+            "SELECT count(*) FROM redaction_entries WHERE COALESCE(status, 'active') = 'active'"
+        ).fetchone()[0]
+    )
+    rejected_redactions = int(
+        conn.execute(
+            "SELECT count(*) FROM redaction_entries WHERE COALESCE(status, 'active') = 'rejected'"
+        ).fetchone()[0]
+    )
+    policy_drift = {
+        INDEX_LEVEL_REDACTED: int(
+            conn.execute(
+                """
+                SELECT count(*) FROM vector_index_state_v2
+                WHERE index_level = ? AND COALESCE(redaction_policy_version, '') != ?
+                """,
+                (INDEX_LEVEL_REDACTED, REDACTION_POLICY_VERSION),
+            ).fetchone()[0]
+        )
+    }
+    if full_available:
+        policy_drift[INDEX_LEVEL_FULL] = int(
+            conn.execute(
+                """
+                SELECT count(*) FROM vector_index_state_v2
+                WHERE index_level = ? AND COALESCE(redaction_policy_version, '') != ?
+                """,
+                (INDEX_LEVEL_FULL, REDACTION_POLICY_VERSION),
+            ).fetchone()[0]
+        )
+
     counts = {
         "messages": int(conn.execute("SELECT count(*) FROM messages").fetchone()[0]),
-        "vectors": int(conn.execute("SELECT count(*) FROM message_vectors").fetchone()[0]),
-        "chunk_vectors": int(
-            conn.execute("SELECT count(*) FROM message_chunk_vectors").fetchone()[0]
+        "message_vectors_v2": int(
+            conn.execute("SELECT count(*) FROM message_vectors_v2").fetchone()[0]
+        ),
+        "chunk_vectors_v2": int(
+            conn.execute("SELECT count(*) FROM message_chunk_vectors_v2").fetchone()[0]
         ),
         "enrichments": int(conn.execute("SELECT count(*) FROM message_enrichment").fetchone()[0]),
         "profiles": int(conn.execute("SELECT count(*) FROM contact_profiles").fetchone()[0]),
+        "active_redaction_entries": active_redactions,
+        "rejected_redaction_entries": rejected_redactions,
     }
-    pending_vectors = count_pending_vector_updates(conn, cfg)
     return {
         "counts": counts,
-        "pending_vectors": pending_vectors,
+        "redaction_policy_version": REDACTION_POLICY_VERSION,
+        "available_index_levels": available_levels,
+        "full_search_available": full_available,
+        "vector_level_counts": level_counts,
+        "pending_vectors": {
+            INDEX_LEVEL_REDACTED: pending_redacted,
+            INDEX_LEVEL_FULL: pending_full,
+        },
+        "policy_drift_vectors": policy_drift,
+        "upgrade_needed": any(int(value or 0) > 0 for value in policy_drift.values()),
         "latest_message": _latest_message_status(conn),
     }
 
@@ -774,12 +878,28 @@ def run_validate(conn) -> dict:
             "SELECT name FROM sqlite_master WHERE name='message_vectors'"
         ).fetchone()
         is not None,
+        "message_vectors_v2_table": conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='message_vectors_v2'"
+        ).fetchone()
+        is not None,
         "message_chunk_vectors_table": conn.execute(
             "SELECT name FROM sqlite_master WHERE name='message_chunk_vectors'"
         ).fetchone()
         is not None,
+        "message_chunk_vectors_v2_table": conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='message_chunk_vectors_v2'"
+        ).fetchone()
+        is not None,
         "message_fts_table": conn.execute(
             "SELECT name FROM sqlite_master WHERE name='message_fts'"
+        ).fetchone()
+        is not None,
+        "message_fts_redacted_table": conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='message_fts_redacted'"
+        ).fetchone()
+        is not None,
+        "vector_index_state_v2_table": conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='vector_index_state_v2'"
         ).fetchone()
         is not None,
         "redaction_entries_table": conn.execute(
@@ -789,6 +909,95 @@ def run_validate(conn) -> dict:
     }
     checks["ok"] = all(checks.values())
     return checks
+
+
+def _upgrade_levels_selected(raw_level: str) -> list[str]:
+    choice = (raw_level or INDEX_LEVEL_REDACTED).strip().lower()
+    if choice == "all":
+        return [INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL]
+    if choice in {INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL}:
+        return [choice]
+    raise ValueError(f"Unsupported --index-level value: {raw_level}")
+
+
+def _vector_policy_drift_count(conn, *, index_level: str) -> int:
+    return int(
+        conn.execute(
+            """
+            SELECT count(*) FROM vector_index_state_v2
+            WHERE index_level = ? AND COALESCE(redaction_policy_version, '') != ?
+            """,
+            (index_level, REDACTION_POLICY_VERSION),
+        ).fetchone()[0]
+    )
+
+
+def run_upgrade(conn, cfg, *, index_level: str, limit: int | None, apply: bool) -> dict[str, object]:
+    levels = _upgrade_levels_selected(index_level)
+    pre_counts = vector_level_counts(conn)
+    summary_levels: dict[str, dict[str, object]] = {}
+    for level in levels:
+        existing = pre_counts.get(level, {})
+        summary_levels[level] = {
+            "available": level in pre_counts,
+            "message_vectors": int(existing.get("messages", 0)),
+            "chunk_vectors": int(existing.get("chunks", 0)),
+            "pending_vectors": count_pending_vector_updates(conn, cfg, index_level=level),
+            "policy_drift_vectors": _vector_policy_drift_count(conn, index_level=level),
+        }
+
+    dry_run = {
+        "mode": "apply" if apply else "dry-run",
+        "redaction_policy_version": REDACTION_POLICY_VERSION,
+        "selected_levels": levels,
+        "pre_upgrade": {
+            "vector_levels": pre_counts,
+            "levels": summary_levels,
+            "rejected_redaction_entries": int(
+                conn.execute(
+                    "SELECT count(*) FROM redaction_entries WHERE COALESCE(status, 'active') = 'rejected'"
+                ).fetchone()[0]
+            ),
+        },
+        "actions": {
+            "will_prune_invalid_redactions": True,
+            "will_build_full_index": INDEX_LEVEL_FULL in levels,
+            "limit": limit,
+        },
+    }
+    if not apply:
+        dry_run["action_required"] = "Re-run with `upgrade --yes` to apply these changes."
+        return dry_run
+
+    pruned = prune_invalid_redaction_entries(conn)
+    executed: dict[str, object] = {
+        "redaction_entries_pruned": pruned,
+        "levels": {},
+    }
+    for level in levels:
+        executed["levels"][level] = index_vectors(
+            conn,
+            cfg,
+            index_level=level,
+            pending_only=True,
+            limit=limit,
+            progress_callback=_emit_index_progress,
+        )
+
+    return {
+        **dry_run,
+        "executed": executed,
+        "post_upgrade": {
+            "vector_levels": vector_level_counts(conn),
+            "levels": {
+                level: {
+                    "pending_vectors": count_pending_vector_updates(conn, cfg, index_level=level),
+                    "policy_drift_vectors": _vector_policy_drift_count(conn, index_level=level),
+                }
+                for level in levels
+            },
+        },
+    }
 
 
 def _emit_ingest_progress(event: dict) -> None:
@@ -899,15 +1108,16 @@ def _run_index_vectors_for_ingest(
     limit: int | None,
     pending_only: bool,
 ) -> dict[str, int | str]:
-    pending_before = count_pending_vector_updates(conn, cfg)
+    pending_before = count_pending_vector_updates(conn, cfg, index_level=INDEX_LEVEL_REDACTED)
     out = index_vectors(
         conn,
         cfg,
+        index_level=INDEX_LEVEL_REDACTED,
         limit=limit,
         pending_only=pending_only,
         progress_callback=_emit_index_progress,
     )
-    pending_after = count_pending_vector_updates(conn, cfg)
+    pending_after = count_pending_vector_updates(conn, cfg, index_level=INDEX_LEVEL_REDACTED)
     out["pending_before"] = pending_before
     out["pending_after"] = pending_after
     return out
@@ -1241,6 +1451,7 @@ def main(argv: list[str] | None = None) -> None:
             pending_before = count_pending_vector_updates(
                 conn,
                 cfg,
+                index_level=args.index_level,
                 account_email=args.account_email,
                 include_labels=include_labels,
                 exclude_labels=exclude_labels,
@@ -1249,6 +1460,7 @@ def main(argv: list[str] | None = None) -> None:
             out = index_vectors(
                 conn,
                 cfg,
+                index_level=args.index_level,
                 account_email=args.account_email,
                 limit=args.limit,
                 force=args.force,
@@ -1264,6 +1476,7 @@ def main(argv: list[str] | None = None) -> None:
             pending_after = count_pending_vector_updates(
                 conn,
                 cfg,
+                index_level=args.index_level,
                 account_email=args.account_email,
                 include_labels=include_labels,
                 exclude_labels=exclude_labels,
@@ -1276,7 +1489,7 @@ def main(argv: list[str] | None = None) -> None:
 
         if args.command == "search":
             from_ts_ms, to_ts_ms = _resolve_date_range(args.from_date, args.to_date)
-            rows = search_vectors(
+            rows, diagnostics = search_vectors(
                 conn,
                 cfg,
                 args.query,
@@ -1284,15 +1497,25 @@ def main(argv: list[str] | None = None) -> None:
                 label=args.label,
                 top_k=args.top_k,
                 clearance=args.clearance,
+                search_level=args.search_level,
                 strategy=args.strategy,
                 from_ts_ms=from_ts_ms,
                 to_ts_ms=to_ts_ms,
+                include_diagnostics=True,
             )
             sender_map = _search_sender_map(conn, [item.msg_id for item in rows])
             print(
                 json.dumps(
                     {
+                        "query": args.query,
                         "count": len(rows),
+                        "clearance": args.clearance,
+                        "diagnostics": {
+                            "search_level_requested": diagnostics.requested_level,
+                            "search_level_used": diagnostics.used_level,
+                            "search_level_fallback": diagnostics.fallback_from_level,
+                            "full_level_available": diagnostics.full_level_available,
+                        },
                         "results": [
                             {
                                 "score": round(item.score, 6),
@@ -1341,6 +1564,21 @@ def main(argv: list[str] | None = None) -> None:
                         conn,
                         output_file=args.output_file,
                         limit=args.limit,
+                    ),
+                    indent=2,
+                )
+            )
+            return
+
+        if args.command == "upgrade":
+            print(
+                json.dumps(
+                    run_upgrade(
+                        conn,
+                        cfg,
+                        index_level=args.index_level,
+                        limit=args.limit,
+                        apply=bool(args.yes),
                     ),
                     indent=2,
                 )

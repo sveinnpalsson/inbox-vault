@@ -8,6 +8,8 @@ from typing import Any
 
 from sqlcipher3 import dbapi2 as sqlite
 
+from .redaction import REDACTION_POLICY_VERSION, is_redaction_value_allowed
+
 
 class DBLockRetryExhausted(RuntimeError):
     """Raised when sqlite lock retries are exhausted for a write operation."""
@@ -169,6 +171,12 @@ def get_conn(db_path: str, password: str):
           value_norm TEXT NOT NULL,
           original_value TEXT NOT NULL,
           source_mode TEXT NOT NULL,
+          policy_version TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'active',
+          validator_name TEXT NOT NULL DEFAULT '',
+          detector_sources TEXT NOT NULL DEFAULT '',
+          modality TEXT NOT NULL DEFAULT '',
+          source_field TEXT NOT NULL DEFAULT '',
           first_seen_at TEXT NOT NULL,
           last_seen_at TEXT NOT NULL,
           hit_count INTEGER NOT NULL DEFAULT 1,
@@ -185,18 +193,93 @@ def get_conn(db_path: str, password: str):
           tokenize='unicode61 remove_diacritics 2'
         );
 
+        CREATE TABLE IF NOT EXISTS message_vectors_v2 (
+          msg_id TEXT NOT NULL REFERENCES messages(msg_id) ON DELETE CASCADE,
+          index_level TEXT NOT NULL,
+          account_email TEXT NOT NULL,
+          thread_id TEXT,
+          labels_json TEXT NOT NULL,
+          source_text TEXT NOT NULL,
+          source_text_redacted TEXT NOT NULL,
+          embedding_json TEXT NOT NULL,
+          embedding_dim INTEGER NOT NULL,
+          embedding_model TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          redaction_policy_version TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (msg_id, index_level)
+        );
+
+        CREATE TABLE IF NOT EXISTS message_chunk_vectors_v2 (
+          chunk_id TEXT NOT NULL,
+          index_level TEXT NOT NULL,
+          msg_id TEXT NOT NULL REFERENCES messages(msg_id) ON DELETE CASCADE,
+          account_email TEXT NOT NULL,
+          thread_id TEXT,
+          labels_json TEXT NOT NULL,
+          chunk_index INTEGER NOT NULL,
+          chunk_type TEXT NOT NULL,
+          chunk_start INTEGER NOT NULL,
+          chunk_end INTEGER NOT NULL,
+          chunk_text TEXT NOT NULL,
+          chunk_text_redacted TEXT NOT NULL,
+          embedding_json TEXT NOT NULL,
+          embedding_dim INTEGER NOT NULL,
+          embedding_model TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          redaction_policy_version TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (chunk_id, index_level)
+        );
+
+        CREATE TABLE IF NOT EXISTS vector_index_state_v2 (
+          msg_id TEXT NOT NULL REFERENCES messages(msg_id) ON DELETE CASCADE,
+          index_level TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          redaction_policy_version TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (msg_id, index_level)
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS message_fts_redacted USING fts5(
+          msg_id UNINDEXED,
+          account_email UNINDEXED,
+          thread_id UNINDEXED,
+          labels_text UNINDEXED,
+          content,
+          tokenize='unicode61 remove_diacritics 2'
+        );
+
         CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_email);
         CREATE INDEX IF NOT EXISTS idx_vectors_account ON message_vectors(account_email);
         CREATE INDEX IF NOT EXISTS idx_chunk_vectors_msg ON message_chunk_vectors(msg_id);
         CREATE INDEX IF NOT EXISTS idx_chunk_vectors_account ON message_chunk_vectors(account_email);
         CREATE INDEX IF NOT EXISTS idx_redaction_scope ON redaction_entries(scope_type, scope_id);
         CREATE INDEX IF NOT EXISTS idx_redaction_placeholder ON redaction_entries(scope_type, scope_id, placeholder);
+        CREATE INDEX IF NOT EXISTS idx_vectors_v2_account ON message_vectors_v2(account_email, index_level);
+        CREATE INDEX IF NOT EXISTS idx_chunk_vectors_v2_msg ON message_chunk_vectors_v2(msg_id, index_level);
+        CREATE INDEX IF NOT EXISTS idx_chunk_vectors_v2_account ON message_chunk_vectors_v2(account_email, index_level);
+        CREATE INDEX IF NOT EXISTS idx_vector_state_v2_level ON vector_index_state_v2(index_level);
         """
     )
 
     cols = {row[1] for row in conn.execute("PRAGMA table_info(message_vectors)").fetchall()}
     if cols and "thread_id" not in cols:
         conn.execute("ALTER TABLE message_vectors ADD COLUMN thread_id TEXT")
+
+    redaction_cols = {row[1] for row in conn.execute("PRAGMA table_info(redaction_entries)").fetchall()}
+    for column, column_type, default in [
+        ("policy_version", "TEXT", "''"),
+        ("status", "TEXT", "'active'"),
+        ("validator_name", "TEXT", "''"),
+        ("detector_sources", "TEXT", "''"),
+        ("modality", "TEXT", "''"),
+        ("source_field", "TEXT", "''"),
+    ]:
+        if redaction_cols and column not in redaction_cols:
+            conn.execute(
+                f"ALTER TABLE redaction_entries ADD COLUMN {column} {column_type} NOT NULL DEFAULT {default}"
+            )
 
     try:
         conn.execute("SELECT count(*) FROM sqlite_master;").fetchone()
@@ -228,6 +311,26 @@ def upsert_message_fts(
         VALUES (?, ?, ?, ?, ?)
         """,
         (msg_id, account_email, thread_id, labels_text, content),
+    )
+
+
+def upsert_message_fts_redacted(
+    conn,
+    *,
+    msg_id: str,
+    account_email: str,
+    thread_id: str | None,
+    labels: list[str],
+    redacted_content: str,
+):
+    labels_text = " ".join((label or "").strip().upper() for label in labels if str(label).strip())
+    conn.execute("DELETE FROM message_fts_redacted WHERE msg_id = ?", (msg_id,))
+    conn.execute(
+        """
+        INSERT INTO message_fts_redacted (msg_id, account_email, thread_id, labels_text, content)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (msg_id, account_email, thread_id, labels_text, redacted_content),
     )
 
 
@@ -516,6 +619,17 @@ def get_vector_row(conn, msg_id: str):
     ).fetchone()
 
 
+def get_vector_state_v2(conn, msg_id: str, *, index_level: str):
+    return conn.execute(
+        """
+        SELECT content_hash, redaction_policy_version
+        FROM vector_index_state_v2
+        WHERE msg_id = ? AND index_level = ?
+        """,
+        (msg_id, index_level),
+    ).fetchone()
+
+
 def upsert_message_vector(
     conn,
     *,
@@ -572,6 +686,67 @@ def upsert_message_vector(
     return retries_used
 
 
+def upsert_message_vector_v2(
+    conn,
+    *,
+    msg_id: str,
+    index_level: str,
+    account_email: str,
+    thread_id: str | None,
+    labels: list[str],
+    source_text: str,
+    source_text_redacted: str,
+    embedding: list[float],
+    embedding_model: str,
+    content_hash: str,
+    redaction_policy_version: str = REDACTION_POLICY_VERSION,
+    lock_max_retries: int = 0,
+    lock_backoff_base_seconds: float = 0.05,
+) -> int:
+    _, retries_used = _run_with_lock_retry(
+        lambda: conn.execute(
+            """
+            INSERT INTO message_vectors_v2 (
+              msg_id, index_level, account_email, thread_id, labels_json, source_text, source_text_redacted,
+              embedding_json, embedding_dim, embedding_model, content_hash, redaction_policy_version, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(msg_id, index_level) DO UPDATE SET
+              account_email=excluded.account_email,
+              thread_id=excluded.thread_id,
+              labels_json=excluded.labels_json,
+              source_text=excluded.source_text,
+              source_text_redacted=excluded.source_text_redacted,
+              embedding_json=excluded.embedding_json,
+              embedding_dim=excluded.embedding_dim,
+              embedding_model=excluded.embedding_model,
+              content_hash=excluded.content_hash,
+              redaction_policy_version=excluded.redaction_policy_version,
+              updated_at=excluded.updated_at
+            """,
+            (
+                msg_id,
+                index_level,
+                account_email,
+                thread_id,
+                json.dumps(labels),
+                source_text,
+                source_text_redacted,
+                json.dumps(embedding),
+                len(embedding),
+                embedding_model,
+                content_hash,
+                redaction_policy_version,
+                utc_now(),
+            ),
+        ),
+        op_name="upsert_message_vector_v2",
+        max_retries=lock_max_retries,
+        backoff_base_seconds=lock_backoff_base_seconds,
+    )
+    return retries_used
+
+
 def delete_message_chunk_vectors(
     conn,
     *,
@@ -582,6 +757,26 @@ def delete_message_chunk_vectors(
     _, retries_used = _run_with_lock_retry(
         lambda: conn.execute("DELETE FROM message_chunk_vectors WHERE msg_id = ?", (msg_id,)),
         op_name="delete_message_chunk_vectors",
+        max_retries=lock_max_retries,
+        backoff_base_seconds=lock_backoff_base_seconds,
+    )
+    return retries_used
+
+
+def delete_message_chunk_vectors_v2(
+    conn,
+    *,
+    msg_id: str,
+    index_level: str,
+    lock_max_retries: int = 0,
+    lock_backoff_base_seconds: float = 0.05,
+) -> int:
+    _, retries_used = _run_with_lock_retry(
+        lambda: conn.execute(
+            "DELETE FROM message_chunk_vectors_v2 WHERE msg_id = ? AND index_level = ?",
+            (msg_id, index_level),
+        ),
+        op_name="delete_message_chunk_vectors_v2",
         max_retries=lock_max_retries,
         backoff_base_seconds=lock_backoff_base_seconds,
     )
@@ -661,6 +856,115 @@ def upsert_message_chunk_vector(
     return retries_used
 
 
+def upsert_message_chunk_vector_v2(
+    conn,
+    *,
+    chunk_id: str,
+    index_level: str,
+    msg_id: str,
+    account_email: str,
+    thread_id: str | None,
+    labels: list[str],
+    chunk_index: int,
+    chunk_type: str,
+    chunk_start: int,
+    chunk_end: int,
+    chunk_text: str,
+    chunk_text_redacted: str,
+    embedding: list[float],
+    embedding_model: str,
+    content_hash: str,
+    redaction_policy_version: str = REDACTION_POLICY_VERSION,
+    lock_max_retries: int = 0,
+    lock_backoff_base_seconds: float = 0.05,
+) -> int:
+    _, retries_used = _run_with_lock_retry(
+        lambda: conn.execute(
+            """
+            INSERT INTO message_chunk_vectors_v2 (
+              chunk_id, index_level, msg_id, account_email, thread_id, labels_json,
+              chunk_index, chunk_type, chunk_start, chunk_end,
+              chunk_text, chunk_text_redacted,
+              embedding_json, embedding_dim, embedding_model, content_hash, redaction_policy_version, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_id, index_level) DO UPDATE SET
+              msg_id=excluded.msg_id,
+              account_email=excluded.account_email,
+              thread_id=excluded.thread_id,
+              labels_json=excluded.labels_json,
+              chunk_index=excluded.chunk_index,
+              chunk_type=excluded.chunk_type,
+              chunk_start=excluded.chunk_start,
+              chunk_end=excluded.chunk_end,
+              chunk_text=excluded.chunk_text,
+              chunk_text_redacted=excluded.chunk_text_redacted,
+              embedding_json=excluded.embedding_json,
+              embedding_dim=excluded.embedding_dim,
+              embedding_model=excluded.embedding_model,
+              content_hash=excluded.content_hash,
+              redaction_policy_version=excluded.redaction_policy_version,
+              updated_at=excluded.updated_at
+            """,
+            (
+                chunk_id,
+                index_level,
+                msg_id,
+                account_email,
+                thread_id,
+                json.dumps(labels),
+                chunk_index,
+                chunk_type,
+                chunk_start,
+                chunk_end,
+                chunk_text,
+                chunk_text_redacted,
+                json.dumps(embedding),
+                len(embedding),
+                embedding_model,
+                content_hash,
+                redaction_policy_version,
+                utc_now(),
+            ),
+        ),
+        op_name="upsert_message_chunk_vector_v2",
+        max_retries=lock_max_retries,
+        backoff_base_seconds=lock_backoff_base_seconds,
+    )
+    return retries_used
+
+
+def upsert_vector_state_v2(
+    conn,
+    *,
+    msg_id: str,
+    index_level: str,
+    content_hash: str,
+    redaction_policy_version: str = REDACTION_POLICY_VERSION,
+    lock_max_retries: int = 0,
+    lock_backoff_base_seconds: float = 0.05,
+) -> int:
+    _, retries_used = _run_with_lock_retry(
+        lambda: conn.execute(
+            """
+            INSERT INTO vector_index_state_v2 (
+              msg_id, index_level, content_hash, redaction_policy_version, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(msg_id, index_level) DO UPDATE SET
+              content_hash=excluded.content_hash,
+              redaction_policy_version=excluded.redaction_policy_version,
+              updated_at=excluded.updated_at
+            """,
+            (msg_id, index_level, content_hash, redaction_policy_version, utc_now()),
+        ),
+        op_name="upsert_vector_state_v2",
+        max_retries=lock_max_retries,
+        backoff_base_seconds=lock_backoff_base_seconds,
+    )
+    return retries_used
+
+
 def fetch_redaction_entries(
     conn,
     *,
@@ -671,12 +975,62 @@ def fetch_redaction_entries(
         """
         SELECT key_name, placeholder, value_norm, original_value
         FROM redaction_entries
-        WHERE scope_type = ? AND scope_id = ?
+        WHERE scope_type = ? AND scope_id = ? AND status = 'active'
         ORDER BY key_name, placeholder
         """,
         (scope_type, scope_id),
     ).fetchall()
-    return [(str(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows]
+    out: list[tuple[str, str, str, str]] = []
+    for row in rows:
+        key_name = str(row[0])
+        placeholder = str(row[1])
+        value_norm = str(row[2])
+        original_value = str(row[3])
+        if not is_redaction_value_allowed(key_name, original_value):
+            continue
+        out.append((key_name, placeholder, value_norm, original_value))
+    return out
+
+
+def prune_invalid_redaction_entries(
+    conn,
+    *,
+    scope_type: str,
+    scope_id: str,
+    lock_max_retries: int = 0,
+    lock_backoff_base_seconds: float = 0.05,
+) -> int:
+    rows = conn.execute(
+        """
+        SELECT id, key_name, original_value
+        FROM redaction_entries
+        WHERE scope_type = ? AND scope_id = ? AND status = 'active'
+        """,
+        (scope_type, scope_id),
+    ).fetchall()
+    invalid_ids = [
+        int(row[0])
+        for row in rows
+        if not is_redaction_value_allowed(str(row[1]), str(row[2]))
+    ]
+    if not invalid_ids:
+        return 0
+
+    now = utc_now()
+
+    def _write():
+        conn.executemany(
+            "UPDATE redaction_entries SET status = 'rejected', last_seen_at = ? WHERE id = ?",
+            [(now, row_id) for row_id in invalid_ids],
+        )
+
+    _run_with_lock_retry(
+        _write,
+        op_name="prune_invalid_redaction_entries",
+        max_retries=lock_max_retries,
+        backoff_base_seconds=lock_backoff_base_seconds,
+    )
+    return len(invalid_ids)
 
 
 def upsert_redaction_entries(
@@ -690,22 +1044,39 @@ def upsert_redaction_entries(
 ) -> int:
     if not entries:
         return 0
+    sanitized_entries = [
+        entry
+        for entry in entries
+        if is_redaction_value_allowed(
+            str(entry.get("key_name") or ""),
+            str(entry.get("original_value") or ""),
+        )
+    ]
+    if not sanitized_entries:
+        return 0
 
     now = utc_now()
 
     def _write():
-        for entry in entries:
+        for entry in sanitized_entries:
             conn.execute(
                 """
                 INSERT INTO redaction_entries (
                   scope_type, scope_id, key_name, placeholder, value_norm,
-                  original_value, source_mode, first_seen_at, last_seen_at, hit_count
+                  original_value, source_mode, policy_version, status, validator_name, detector_sources,
+                  modality, source_field, first_seen_at, last_seen_at, hit_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(scope_type, scope_id, key_name, value_norm) DO UPDATE SET
                   placeholder=excluded.placeholder,
                   original_value=excluded.original_value,
                   source_mode=excluded.source_mode,
+                  policy_version=excluded.policy_version,
+                  status=excluded.status,
+                  validator_name=excluded.validator_name,
+                  detector_sources=excluded.detector_sources,
+                  modality=excluded.modality,
+                  source_field=excluded.source_field,
                   last_seen_at=excluded.last_seen_at,
                   hit_count=redaction_entries.hit_count + 1
                 """,
@@ -717,6 +1088,12 @@ def upsert_redaction_entries(
                     entry["value_norm"],
                     entry["original_value"],
                     entry.get("source_mode", "unknown"),
+                    entry.get("policy_version", REDACTION_POLICY_VERSION),
+                    entry.get("status", "active"),
+                    entry.get("validator_name", "typed_v1"),
+                    entry.get("detector_sources", entry.get("source_mode", "unknown")),
+                    entry.get("modality", ""),
+                    entry.get("source_field", ""),
                     now,
                     now,
                 ),
@@ -742,17 +1119,60 @@ def unredact_with_scope(
         return ""
     rows = conn.execute(
         """
-        SELECT placeholder, original_value
+        SELECT key_name, placeholder, original_value
         FROM redaction_entries
-        WHERE scope_type = ? AND scope_id = ?
+        WHERE scope_type = ? AND scope_id = ? AND status = 'active'
         ORDER BY length(placeholder) DESC
         """,
         (scope_type, scope_id),
     ).fetchall()
     out = text
-    for placeholder, original_value in rows:
+    for key_name, placeholder, original_value in rows:
+        if not is_redaction_value_allowed(str(key_name), str(original_value)):
+            continue
         out = out.replace(str(placeholder), str(original_value))
     return out
+
+
+def fetch_chunk_vectors_for_search_v2(
+    conn,
+    *,
+    index_level: str,
+    account_email: str | None = None,
+    label: str | None = None,
+    from_ts_ms: int | None = None,
+    to_ts_ms: int | None = None,
+):
+    sql = (
+        "SELECT c.chunk_id, c.msg_id, c.account_email, c.thread_id, c.labels_json, c.chunk_index, "
+        "c.chunk_type, c.chunk_start, c.chunk_end, c.chunk_text, c.chunk_text_redacted, c.embedding_json, "
+        "c.embedding_model FROM message_chunk_vectors_v2 c "
+        "JOIN messages m ON m.msg_id = c.msg_id"
+    )
+    params: list[Any] = []
+    clauses: list[str] = ["c.index_level = ?"]
+    params.append(index_level)
+    if account_email:
+        clauses.append("c.account_email = ?")
+        params.append(account_email)
+    if from_ts_ms is not None:
+        clauses.append("COALESCE(m.internal_ts, 0) >= ?")
+        params.append(int(from_ts_ms))
+    if to_ts_ms is not None:
+        clauses.append("COALESCE(m.internal_ts, 0) < ?")
+        params.append(int(to_ts_ms))
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    rows = conn.execute(sql, params).fetchall()
+    if not label:
+        return rows
+    filtered = []
+    wanted = label.strip().upper()
+    for row in rows:
+        labels = [v.upper() for v in json.loads(row[4] or "[]")]
+        if wanted in labels:
+            filtered.append(row)
+    return filtered
 
 
 def fetch_chunk_vectors_for_search(
@@ -836,6 +1256,46 @@ def fetch_vectors_for_search(
     return filtered
 
 
+def fetch_vectors_for_search_v2(
+    conn,
+    *,
+    index_level: str,
+    account_email: str | None = None,
+    label: str | None = None,
+    from_ts_ms: int | None = None,
+    to_ts_ms: int | None = None,
+):
+    sql = (
+        "SELECT v.msg_id, v.account_email, v.thread_id, v.labels_json, v.source_text, v.source_text_redacted, "
+        "v.embedding_json, v.embedding_model FROM message_vectors_v2 v "
+        "JOIN messages m ON m.msg_id = v.msg_id"
+    )
+    params: list[Any] = []
+    clauses: list[str] = ["v.index_level = ?"]
+    params.append(index_level)
+    if account_email:
+        clauses.append("v.account_email = ?")
+        params.append(account_email)
+    if from_ts_ms is not None:
+        clauses.append("COALESCE(m.internal_ts, 0) >= ?")
+        params.append(int(from_ts_ms))
+    if to_ts_ms is not None:
+        clauses.append("COALESCE(m.internal_ts, 0) < ?")
+        params.append(int(to_ts_ms))
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    rows = conn.execute(sql, params).fetchall()
+    if not label:
+        return rows
+    filtered = []
+    wanted = label.strip().upper()
+    for row in rows:
+        labels = [v.upper() for v in json.loads(row[3] or "[]")]
+        if wanted in labels:
+            filtered.append(row)
+    return filtered
+
+
 def fetch_messages_by_ids(conn, msg_ids: list[str]):
     if not msg_ids:
         return {}
@@ -860,6 +1320,45 @@ def fetch_messages_by_ids(conn, msg_ids: list[str]):
         msg_ids,
     ).fetchall()
     return {row[0]: row for row in rows}
+
+
+def fetch_messages_by_ids_v2(conn, msg_ids: list[str], *, index_level: str):
+    if not msg_ids:
+        return {}
+    placeholders = ",".join("?" for _ in msg_ids)
+    rows = conn.execute(
+        f"""
+        SELECT
+          m.msg_id,
+          m.account_email,
+          m.thread_id,
+          m.labels_json,
+          m.internal_ts,
+          m.subject,
+          m.snippet,
+          m.body_text,
+          v.source_text,
+          v.source_text_redacted
+        FROM messages m
+        LEFT JOIN message_vectors_v2 v ON v.msg_id = m.msg_id AND v.index_level = ?
+        WHERE m.msg_id IN ({placeholders})
+        """,
+        [index_level, *msg_ids],
+    ).fetchall()
+    return {row[0]: row for row in rows}
+
+
+def vector_level_counts(conn) -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {}
+    for level, n in conn.execute(
+        "SELECT index_level, COUNT(*) FROM message_vectors_v2 GROUP BY index_level ORDER BY index_level"
+    ).fetchall():
+        counts.setdefault(str(level), {})["messages"] = int(n)
+    for level, n in conn.execute(
+        "SELECT index_level, COUNT(*) FROM message_chunk_vectors_v2 GROUP BY index_level ORDER BY index_level"
+    ).fetchall():
+        counts.setdefault(str(level), {})["chunks"] = int(n)
+    return counts
 
 
 def lexical_search_rows(
@@ -905,6 +1404,55 @@ def lexical_search_rows(
     if not label:
         return rows
 
+    wanted = label.strip().upper()
+    filtered = []
+    for row in rows:
+        labels = [v.upper() for v in json.loads(row[3] or "[]")]
+        if wanted in labels:
+            filtered.append(row)
+    return filtered
+
+
+def lexical_search_rows_redacted(
+    conn,
+    *,
+    query: str,
+    account_email: str | None = None,
+    label: str | None = None,
+    from_ts_ms: int | None = None,
+    to_ts_ms: int | None = None,
+    limit: int = 50,
+):
+    safe_limit = max(1, int(limit))
+    sql = """
+        SELECT
+          f.msg_id,
+          m.account_email,
+          m.thread_id,
+          m.labels_json,
+          m.subject,
+          m.snippet,
+          m.body_text,
+          bm25(message_fts_redacted) AS bm25_score
+        FROM message_fts_redacted f
+        JOIN messages m ON m.msg_id = f.msg_id
+        WHERE message_fts_redacted MATCH ?
+        """
+    params: list[Any] = [query]
+    if account_email:
+        sql += " AND m.account_email = ?"
+        params.append(account_email)
+    if from_ts_ms is not None:
+        sql += " AND COALESCE(m.internal_ts, 0) >= ?"
+        params.append(int(from_ts_ms))
+    if to_ts_ms is not None:
+        sql += " AND COALESCE(m.internal_ts, 0) < ?"
+        params.append(int(to_ts_ms))
+    sql += " ORDER BY bm25_score LIMIT ?"
+    params.append(safe_limit)
+    rows = conn.execute(sql, params).fetchall()
+    if not label:
+        return rows
     wanted = label.strip().upper()
     filtered = []
     for row in rows:

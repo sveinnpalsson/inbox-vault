@@ -140,3 +140,5 @@ def test_redaction_prompt_includes_chunk_position_and_boundaries():
     assert "Chunk position: 2/5" in messages[1]["content"]
     assert "---CHUNK---" in messages[1]["content"]
     assert "---END CHUNK---" in messages[1]["content"]
+    assert "EMAIL, PHONE, URL, ACCOUNT, PERSON, ADDRESS" in messages[0]["content"]
+    assert "Do not emit generic categories such as NAME, LOCATION, SECRET, ID, CUSTOM, or OTHER." in messages[0]["content"]

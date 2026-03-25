@@ -13,22 +13,36 @@ from typing import Any, Callable
 from .config import AppConfig
 from .db import (
     DBLockRetryExhausted,
-    delete_message_chunk_vectors,
-    fetch_chunk_vectors_for_search,
-    fetch_messages_by_ids,
+    delete_message_chunk_vectors_v2,
+    fetch_chunk_vectors_for_search_v2,
+    fetch_messages_by_ids_v2,
     fetch_redaction_entries,
     fetch_vectors_for_search,
-    get_vector_row,
+    fetch_vectors_for_search_v2,
+    get_vector_state_v2,
     lexical_search_rows,
-    upsert_message_chunk_vector,
-    upsert_message_vector,
+    lexical_search_rows_redacted,
+    prune_invalid_redaction_entries,
+    upsert_message_chunk_vector_v2,
+    upsert_message_fts_redacted,
+    upsert_message_vector_v2,
     upsert_redaction_entries,
+    upsert_vector_state_v2,
     vector_index_source_rows,
+    vector_level_counts,
 )
 from .llm import embedding_vector
-from .redaction import PersistentRedactionMap, redact_text, redact_with_persistent_map
+from .redaction import (
+    REDACTION_POLICY_VERSION,
+    PersistentRedactionMap,
+    redact_text,
+    redact_with_persistent_map,
+)
 
 LOG = logging.getLogger(__name__)
+INDEX_LEVEL_REDACTED = "redacted"
+INDEX_LEVEL_FULL = "full"
+INDEX_LEVEL_AUTO = "auto"
 
 
 @dataclass(slots=True)
@@ -39,6 +53,14 @@ class SearchResult:
     account_email: str
     labels: list[str]
     content: str
+
+
+@dataclass(slots=True)
+class SearchDiagnostics:
+    requested_level: str
+    used_level: str
+    fallback_from_level: str | None = None
+    full_level_available: bool = False
 
 
 @dataclass(slots=True)
@@ -129,6 +151,57 @@ def _should_filter_message(
 
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _vector_content_hash(*, source_text: str, index_level: str) -> str:
+    payload = {
+        "index_level": index_level,
+        "policy_version": REDACTION_POLICY_VERSION,
+        "source_hash": _content_hash(source_text),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _vector_levels_available(conn) -> set[str]:
+    counts = vector_level_counts(conn)
+    return {level for level, bucket in counts.items() if int(bucket.get("messages", 0)) > 0}
+
+
+def _resolve_effective_search_level(
+    conn,
+    *,
+    clearance: str,
+    search_level: str,
+) -> SearchDiagnostics:
+    requested = (search_level or INDEX_LEVEL_AUTO).strip().lower()
+    if requested not in {INDEX_LEVEL_AUTO, INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL}:
+        requested = INDEX_LEVEL_AUTO
+
+    available = _vector_levels_available(conn)
+    full_available = INDEX_LEVEL_FULL in available
+    if requested == INDEX_LEVEL_FULL:
+        if not full_available:
+            raise ValueError("full search level is unavailable; run upgrade to build the full index.")
+        return SearchDiagnostics(
+            requested_level=INDEX_LEVEL_FULL,
+            used_level=INDEX_LEVEL_FULL,
+            full_level_available=True,
+        )
+    if requested == INDEX_LEVEL_REDACTED:
+        return SearchDiagnostics(
+            requested_level=INDEX_LEVEL_REDACTED,
+            used_level=INDEX_LEVEL_REDACTED,
+            full_level_available=full_available,
+        )
+
+    desired = INDEX_LEVEL_FULL if clearance == "full" and full_available else INDEX_LEVEL_REDACTED
+    fallback = INDEX_LEVEL_FULL if clearance == "full" and not full_available else None
+    return SearchDiagnostics(
+        requested_level=INDEX_LEVEL_AUTO,
+        used_level=desired,
+        fallback_from_level=fallback,
+        full_level_available=full_available,
+    )
 
 
 def _chunk_id(msg_id: str, chunk_index: int) -> str:
@@ -328,6 +401,7 @@ def _pending_message_ids_for_index(
     exclude_labels: list[str] | None = None,
     max_index_chars: int | None = None,
     limit: int | None = None,
+    index_level: str = INDEX_LEVEL_REDACTED,
 ) -> list[str]:
     rows = vector_index_source_rows(conn, account_email=account_email, limit=None)
     effective_include_labels = _normalized_label_set(
@@ -372,8 +446,9 @@ def _pending_message_ids_for_index(
             max_chars=effective_max_chars,
         )
         source = _compose_source_text(normalized_subject, normalized_snippet, normalized_body)
-        prior = get_vector_row(conn, msg_id)
-        if not prior or prior[0] != _content_hash(source):
+        expected_hash = _vector_content_hash(source_text=source, index_level=index_level)
+        prior = get_vector_state_v2(conn, msg_id, index_level=index_level)
+        if not prior or str(prior[0]) != expected_hash or str(prior[1] or "") != REDACTION_POLICY_VERSION:
             pending_msg_ids.append(msg_id)
             if safe_limit is not None and len(pending_msg_ids) >= safe_limit:
                 break
@@ -389,6 +464,7 @@ def count_pending_vector_updates(
     include_labels: list[str] | None = None,
     exclude_labels: list[str] | None = None,
     max_index_chars: int | None = None,
+    index_level: str = INDEX_LEVEL_REDACTED,
 ) -> int:
     return len(
         _pending_message_ids_for_index(
@@ -398,6 +474,7 @@ def count_pending_vector_updates(
             include_labels=include_labels,
             exclude_labels=exclude_labels,
             max_index_chars=max_index_chars,
+            index_level=index_level,
         )
     )
 
@@ -406,6 +483,7 @@ def index_vectors(
     conn,
     cfg: AppConfig,
     *,
+    index_level: str = INDEX_LEVEL_REDACTED,
     account_email: str | None = None,
     limit: int | None = None,
     force: bool = False,
@@ -421,15 +499,15 @@ def index_vectors(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     commit_every_messages: int = 1,
 ) -> dict[str, int | str]:
+    chosen_index_level = (index_level or INDEX_LEVEL_REDACTED).strip().lower()
+    if chosen_index_level not in {INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL}:
+        raise ValueError(f"Unsupported index_level: {index_level}")
+
     lancedb_enabled = False
     lancedb_status = "disabled"
     if cfg.retrieval.vector_backend == "lancedb":
-        lancedb_enabled, lancedb_status = _lancedb_available()
-        if not lancedb_enabled:
-            LOG.warning(
-                "LanceDB backend requested but unavailable (%s); using sqlite-only vectors",
-                lancedb_status,
-            )
+        lancedb_status = "disabled:v2-index-levels"
+        LOG.warning("LanceDB backend is temporarily disabled for v2 index-level storage; using sqlite-only vectors")
 
     stats: dict[str, int | str] = {
         "scanned": 0,
@@ -444,6 +522,8 @@ def index_vectors(
         "lock_retries": 0,
         "lock_errors": 0,
         "redaction_entries_added": 0,
+        "redaction_entries_pruned": 0,
+        "index_level": chosen_index_level,
     }
     if pending_only and not force:
         pending_ids = _pending_message_ids_for_index(
@@ -454,6 +534,7 @@ def index_vectors(
             exclude_labels=exclude_labels,
             max_index_chars=max_index_chars,
             limit=limit,
+            index_level=chosen_index_level,
         )
         pending_id_set = set(pending_ids)
         source_rows = vector_index_source_rows(conn, account_email=account_email, limit=None)
@@ -485,6 +566,7 @@ def index_vectors(
     )
 
     redaction_maps_by_account: dict[str, PersistentRedactionMap] = {}
+    pruned_accounts: set[str] = set()
 
     for row_idx, (msg_id, acct, thread_id, subject, snippet, body_text, labels_json) in enumerate(
         rows, start=1
@@ -548,9 +630,14 @@ def index_vectors(
             max_chars=effective_max_chars,
         )
         source_text = _compose_source_text(normalized_subject, normalized_snippet, normalized_body)
-        fingerprint = _content_hash(source_text)
-        prior = get_vector_row(conn, msg_id)
-        if prior and prior[0] == fingerprint and not force:
+        fingerprint = _vector_content_hash(source_text=source_text, index_level=chosen_index_level)
+        prior = get_vector_state_v2(conn, msg_id, index_level=chosen_index_level)
+        if (
+            prior
+            and str(prior[0]) == fingerprint
+            and str(prior[1] or "") == REDACTION_POLICY_VERSION
+            and not force
+        ):
             stats["unchanged"] += 1
             if progress_callback:
                 progress_callback(
@@ -590,12 +677,20 @@ def index_vectors(
 
         redaction_map = redaction_maps_by_account.get(acct)
         if redaction_map is None:
+            if acct not in pruned_accounts:
+                stats["redaction_entries_pruned"] += prune_invalid_redaction_entries(
+                    conn,
+                    scope_type="account",
+                    scope_id=acct,
+                    lock_max_retries=lock_max_retries,
+                    lock_backoff_base_seconds=lock_backoff_base_seconds,
+                )
+                pruned_accounts.add(acct)
             scope_rows = fetch_redaction_entries(conn, scope_type="account", scope_id=acct)
             redaction_map = PersistentRedactionMap.from_rows(scope_rows)
             redaction_maps_by_account[acct] = redaction_map
 
         try:
-            message_embedding = embedding_vector(cfg.embeddings, source_text)
             if progress_callback:
                 progress_callback(
                     {
@@ -618,6 +713,10 @@ def index_vectors(
                 table=redaction_map,
             )
             source_text_redacted = redaction_result.source_text_redacted
+            embed_source_text = (
+                source_text_redacted if chosen_index_level == INDEX_LEVEL_REDACTED else source_text
+            )
+            message_embedding = embedding_vector(cfg.embeddings, embed_source_text)
         except Exception:
             LOG.exception("Vector/redaction generation failed for message_id=%s", msg_id)
             stats["failed"] += 1
@@ -675,9 +774,10 @@ def index_vectors(
                 continue
 
         try:
-            stats["lock_retries"] += upsert_message_vector(
+            stats["lock_retries"] += upsert_message_vector_v2(
                 conn,
                 msg_id=msg_id,
+                index_level=chosen_index_level,
                 account_email=acct,
                 thread_id=thread_id,
                 labels=labels,
@@ -686,6 +786,24 @@ def index_vectors(
                 embedding=message_embedding,
                 embedding_model=cfg.embeddings.model,
                 content_hash=fingerprint,
+                redaction_policy_version=REDACTION_POLICY_VERSION,
+                lock_max_retries=lock_max_retries,
+                lock_backoff_base_seconds=lock_backoff_base_seconds,
+            )
+            upsert_message_fts_redacted(
+                conn,
+                msg_id=msg_id,
+                account_email=acct,
+                thread_id=thread_id,
+                labels=labels,
+                redacted_content=source_text_redacted,
+            )
+            stats["lock_retries"] += upsert_vector_state_v2(
+                conn,
+                msg_id=msg_id,
+                index_level=chosen_index_level,
+                content_hash=fingerprint,
+                redaction_policy_version=REDACTION_POLICY_VERSION,
                 lock_max_retries=lock_max_retries,
                 lock_backoff_base_seconds=lock_backoff_base_seconds,
             )
@@ -710,9 +828,10 @@ def index_vectors(
                 )
             continue
         try:
-            stats["lock_retries"] += delete_message_chunk_vectors(
+            stats["lock_retries"] += delete_message_chunk_vectors_v2(
                 conn,
                 msg_id=msg_id,
+                index_level=chosen_index_level,
                 lock_max_retries=lock_max_retries,
                 lock_backoff_base_seconds=lock_backoff_base_seconds,
             )
@@ -752,7 +871,10 @@ def index_vectors(
 
         for chunk, chunk_redacted in zip(chunks, redaction_result.chunk_text_redacted):
             try:
-                chunk_embedding = embedding_vector(cfg.embeddings, chunk.text)
+                chunk_input = (
+                    chunk_redacted if chosen_index_level == INDEX_LEVEL_REDACTED else chunk.text
+                )
+                chunk_embedding = embedding_vector(cfg.embeddings, chunk_input)
             except Exception:
                 LOG.exception(
                     "Chunk vector/redaction generation failed for message_id=%s chunk_id=%s",
@@ -778,13 +900,15 @@ def index_vectors(
                     )
                 continue
 
-            chunk_fingerprint = _content_hash(
-                f"{msg_id}|{chunk.chunk_type}|{chunk.chunk_start}|{chunk.chunk_end}|{chunk.text}"
+            chunk_fingerprint = _vector_content_hash(
+                source_text=f"{msg_id}|{chunk.chunk_type}|{chunk.chunk_start}|{chunk.chunk_end}|{chunk_input}",
+                index_level=chosen_index_level,
             )
             try:
-                stats["lock_retries"] += upsert_message_chunk_vector(
+                stats["lock_retries"] += upsert_message_chunk_vector_v2(
                     conn,
                     chunk_id=chunk.chunk_id,
+                    index_level=chosen_index_level,
                     msg_id=msg_id,
                     account_email=acct,
                     thread_id=thread_id,
@@ -798,6 +922,7 @@ def index_vectors(
                     embedding=chunk_embedding,
                     embedding_model=cfg.embeddings.model,
                     content_hash=chunk_fingerprint,
+                    redaction_policy_version=REDACTION_POLICY_VERSION,
                     lock_max_retries=lock_max_retries,
                     lock_backoff_base_seconds=lock_backoff_base_seconds,
                 )
@@ -952,6 +1077,7 @@ def _aggregate_chunk_candidates(
     conn,
     chunks: list[_ChunkCandidate],
     *,
+    index_level: str,
     top_messages: int,
     from_ts_ms: int | None,
     to_ts_ms: int | None,
@@ -959,7 +1085,7 @@ def _aggregate_chunk_candidates(
     if not chunks:
         return []
 
-    msg_rows = fetch_messages_by_ids(conn, [item.msg_id for item in chunks])
+    msg_rows = fetch_messages_by_ids_v2(conn, [item.msg_id for item in chunks], index_level=index_level)
     buckets: dict[str, dict[str, Any]] = {}
 
     for rank, chunk in enumerate(chunks, start=1):
@@ -1026,6 +1152,7 @@ def _dense_candidates(
     cfg: AppConfig,
     query: str,
     *,
+    index_level: str,
     account_email: str | None,
     label: str | None,
     from_ts_ms: int | None,
@@ -1035,29 +1162,9 @@ def _dense_candidates(
 
     chunk_limit = max(1, int(cfg.retrieval.dense_candidate_k))
 
-    if cfg.retrieval.vector_backend == "lancedb":
-        available, status = _lancedb_available()
-        if not available:
-            LOG.info("LanceDB unavailable during search (%s); falling back to sqlite", status)
-        else:
-            chunk_rows = _search_lancedb_chunks(
-                cfg,
-                qvec,
-                account_email=account_email,
-                label=label,
-                limit=chunk_limit,
-            )
-            if chunk_rows:
-                return _aggregate_chunk_candidates(
-                    conn,
-                    chunk_rows,
-                    top_messages=chunk_limit,
-                    from_ts_ms=from_ts_ms,
-                    to_ts_ms=to_ts_ms,
-                )
-
-    chunk_rows = fetch_chunk_vectors_for_search(
+    chunk_rows = fetch_chunk_vectors_for_search_v2(
         conn,
+        index_level=index_level,
         account_email=account_email,
         label=label,
         from_ts_ms=from_ts_ms,
@@ -1103,20 +1210,49 @@ def _dense_candidates(
         return _aggregate_chunk_candidates(
             conn,
             ranked_chunks,
+            index_level=index_level,
             top_messages=chunk_limit,
             from_ts_ms=from_ts_ms,
             to_ts_ms=to_ts_ms,
         )
-
-    return _dense_candidates_legacy_messages(
+    rows = fetch_vectors_for_search_v2(
         conn,
-        cfg,
-        query,
+        index_level=index_level,
         account_email=account_email,
         label=label,
         from_ts_ms=from_ts_ms,
         to_ts_ms=to_ts_ms,
     )
+    ranked: list[_Candidate] = []
+    for (
+        msg_id,
+        acct,
+        thread_id,
+        labels_json,
+        source_text,
+        source_text_redacted,
+        emb_json,
+        _model,
+    ) in rows:
+        emb = [float(v) for v in json.loads(emb_json)]
+        score = _cosine_similarity(qvec, emb)
+        if score < 0:
+            continue
+        ranked.append(
+            _Candidate(
+                msg_id=msg_id,
+                thread_id=thread_id,
+                account_email=acct,
+                labels=json.loads(labels_json or "[]"),
+                source_text=source_text,
+                source_text_redacted=source_text_redacted,
+                score=score,
+                chunk_hits=1,
+                first_chunk_rank=1,
+            )
+        )
+    ranked.sort(key=lambda r: (-r.score, r.msg_id))
+    return ranked[: max(1, int(cfg.retrieval.dense_candidate_k))]
 
 
 def _lexical_candidates(
@@ -1124,6 +1260,7 @@ def _lexical_candidates(
     cfg: AppConfig,
     query: str,
     *,
+    index_level: str,
     account_email: str | None,
     label: str | None,
     from_ts_ms: int | None,
@@ -1133,7 +1270,8 @@ def _lexical_candidates(
         return []
 
     try:
-        rows = lexical_search_rows(
+        lexical_fn = lexical_search_rows if index_level == INDEX_LEVEL_FULL else lexical_search_rows_redacted
+        rows = lexical_fn(
             conn,
             query=query,
             account_email=account_email,
@@ -1145,7 +1283,7 @@ def _lexical_candidates(
     except Exception:
         sanitized = query.replace('"', "")
         quoted = f'"{sanitized}"'
-        rows = lexical_search_rows(
+        rows = lexical_fn(
             conn,
             query=quoted,
             account_email=account_email,
@@ -1262,19 +1400,27 @@ def search_vectors(
     label: str | None = None,
     top_k: int = 5,
     clearance: str = "redacted",
+    search_level: str = INDEX_LEVEL_AUTO,
     strategy: str | None = None,
     from_ts_ms: int | None = None,
     to_ts_ms: int | None = None,
-) -> list[SearchResult]:
+    include_diagnostics: bool = False,
+) -> list[SearchResult] | tuple[list[SearchResult], SearchDiagnostics]:
     chosen = (strategy or cfg.retrieval.search_strategy).strip().lower()
     if chosen not in {"dense", "lexical", "hybrid"}:
         chosen = "hybrid"
+    diagnostics = _resolve_effective_search_level(
+        conn,
+        clearance=clearance,
+        search_level=search_level,
+    )
 
     dense = (
         _dense_candidates(
             conn,
             cfg,
             query,
+            index_level=diagnostics.used_level,
             account_email=account_email,
             label=label,
             from_ts_ms=from_ts_ms,
@@ -1288,6 +1434,7 @@ def search_vectors(
             conn,
             cfg,
             query,
+            index_level=diagnostics.used_level,
             account_email=account_email,
             label=label,
             from_ts_ms=from_ts_ms,
@@ -1319,4 +1466,6 @@ def search_vectors(
                 content=content,
             )
         )
+    if include_diagnostics:
+        return out, diagnostics
     return out

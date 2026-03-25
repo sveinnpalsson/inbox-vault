@@ -29,6 +29,25 @@ password_env = "TEST_DB_PASSWORD"
     (path.parent / "fake-creds.json").write_text("{}")
 
 
+def _search_diag(
+    *,
+    requested: str = "auto",
+    used: str = "redacted",
+    fallback: str | None = None,
+    full_available: bool = False,
+):
+    return type(
+        "Diag",
+        (),
+        {
+            "requested_level": requested,
+            "used_level": used,
+            "fallback_from_level": fallback,
+            "full_level_available": full_available,
+        },
+    )()
+
+
 def test_validate_command_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
     cfg = tmp_path / "config.toml"
     _write_config(cfg)
@@ -121,23 +140,34 @@ def test_validate_command_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         (
             ["search", "project status", "--top-k", "1", "--strategy", "hybrid"],
             {
-                "search_vectors": lambda *_args, **_kwargs: [
-                    type(
-                        "R",
-                        (),
-                        {
-                            "score": 0.99,
-                            "msg_id": "m1",
-                            "thread_id": "t1",
-                            "account_email": "acct@example.com",
-                            "labels": ["INBOX"],
-                            "content": "Subject: Project",
-                        },
-                    )(),
-                ]
+                "search_vectors": lambda *_args, **_kwargs: (
+                    [
+                        type(
+                            "R",
+                            (),
+                            {
+                                "score": 0.99,
+                                "msg_id": "m1",
+                                "thread_id": "t1",
+                                "account_email": "acct@example.com",
+                                "labels": ["INBOX"],
+                                "content": "Subject: Project",
+                            },
+                        )(),
+                    ],
+                    _search_diag(),
+                )
             },
             {
+                "query": "project status",
                 "count": 1,
+                "clearance": "redacted",
+                "diagnostics": {
+                    "search_level_requested": "auto",
+                    "search_level_used": "redacted",
+                    "search_level_fallback": None,
+                    "full_level_available": False,
+                },
                 "results": [
                     {
                         "score": 0.99,
@@ -427,7 +457,7 @@ def test_search_strategy_passthrough(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     def fake_search_vectors(*_args, **kwargs):
         captured.update(kwargs)
-        return []
+        return [], _search_diag()
 
     monkeypatch.setattr(cli, "search_vectors", fake_search_vectors)
 
@@ -436,6 +466,39 @@ def test_search_strategy_passthrough(tmp_path: Path, monkeypatch: pytest.MonkeyP
     out = json.loads(capsys.readouterr().out)
     assert out["count"] == 0
     assert captured["strategy"] == "lexical"
+    assert captured["include_diagnostics"] is True
+
+
+def test_search_level_passthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    cfg = tmp_path / "config.toml"
+    _write_config(cfg)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+
+    captured: dict[str, object] = {}
+
+    def fake_search_vectors(*_args, **kwargs):
+        captured.update(kwargs)
+        return [], _search_diag(requested="full", used="full", full_available=True)
+
+    monkeypatch.setattr(cli, "search_vectors", fake_search_vectors)
+
+    cli.main(
+        [
+            "--config",
+            str(cfg),
+            "search",
+            "query text",
+            "--clearance",
+            "full",
+            "--search-level",
+            "full",
+        ]
+    )
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["diagnostics"]["search_level_used"] == "full"
+    assert captured["search_level"] == "full"
 
 
 def test_search_date_range_passthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
@@ -448,7 +511,7 @@ def test_search_date_range_passthrough(tmp_path: Path, monkeypatch: pytest.Monke
 
     def fake_search_vectors(*_args, **kwargs):
         captured.update(kwargs)
-        return []
+        return [], _search_diag()
 
     monkeypatch.setattr(cli, "search_vectors", fake_search_vectors)
 
@@ -668,6 +731,8 @@ def test_index_vectors_redaction_flags_passthrough(
             str(cfg),
             "index-vectors",
             "--pending-only",
+            "--index-level",
+            "full",
             "--redaction-mode",
             "model",
             "--redaction-profile",
@@ -688,6 +753,7 @@ def test_index_vectors_redaction_flags_passthrough(
     out = json.loads(capsys.readouterr().out)
     assert out["indexed"] == 1
     assert captured["pending_only"] is True
+    assert captured["index_level"] == "full"
     assert captured["redaction_mode"] == "model"
     assert captured["redaction_profile"] == "confidential"
     assert captured["redaction_instruction"] == "Mask names and project codenames"
@@ -746,9 +812,10 @@ def _seed_retrieval_data(tmp_path: Path):
             ),
         )
         conn.execute(
-            "INSERT INTO message_vectors (msg_id, account_email, thread_id, labels_json, source_text, source_text_redacted, embedding_json, embedding_dim, embedding_model, content_hash, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO message_vectors_v2 (msg_id, index_level, account_email, thread_id, labels_json, source_text, source_text_redacted, embedding_json, embedding_dim, embedding_model, content_hash, redaction_policy_version, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "m-new",
+                "redacted",
                 "acct@example.com",
                 "t1",
                 json.dumps(["INBOX"]),
@@ -758,13 +825,15 @@ def _seed_retrieval_data(tmp_path: Path):
                 2,
                 "test-model",
                 "hash-1",
+                "2026-03-22-precision-1",
                 "2026-03-10T10:02:00+00:00",
             ),
         )
         conn.execute(
-            "INSERT INTO message_chunk_vectors (chunk_id, msg_id, account_email, thread_id, labels_json, chunk_index, chunk_type, chunk_start, chunk_end, chunk_text, chunk_text_redacted, embedding_json, embedding_dim, embedding_model, content_hash, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO message_chunk_vectors_v2 (chunk_id, index_level, msg_id, account_email, thread_id, labels_json, chunk_index, chunk_type, chunk_start, chunk_end, chunk_text, chunk_text_redacted, embedding_json, embedding_dim, embedding_model, content_hash, redaction_policy_version, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "c1",
+                "redacted",
                 "m-new",
                 "acct@example.com",
                 "t1",
@@ -779,6 +848,17 @@ def _seed_retrieval_data(tmp_path: Path):
                 2,
                 "test-model",
                 "chunk-hash-1",
+                "2026-03-22-precision-1",
+                "2026-03-10T10:02:00+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO vector_index_state_v2 (msg_id, index_level, content_hash, redaction_policy_version, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                "m-new",
+                "redacted",
+                "hash-1",
+                "2026-03-22-precision-1",
                 "2026-03-10T10:02:00+00:00",
             ),
         )
@@ -825,21 +905,88 @@ def test_status_command_reports_counts_and_latest(
     monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
     _seed_retrieval_data(tmp_path)
 
-    monkeypatch.setattr(cli, "count_pending_vector_updates", lambda *_args, **_kwargs: 4)
+    monkeypatch.setattr(
+        cli,
+        "count_pending_vector_updates",
+        lambda *_args, **kwargs: 4 if kwargs.get("index_level") == "redacted" else 0,
+    )
 
     cli.main(["--config", str(cfg), "status", "--json"])
     out = json.loads(capsys.readouterr().out)
 
     assert out["counts"] == {
         "messages": 2,
-        "vectors": 1,
-        "chunk_vectors": 1,
+        "message_vectors_v2": 1,
+        "chunk_vectors_v2": 1,
         "enrichments": 1,
         "profiles": 1,
+        "active_redaction_entries": 0,
+        "rejected_redaction_entries": 0,
     }
-    assert out["pending_vectors"] == 4
+    assert out["redaction_policy_version"] == "2026-03-22-precision-1"
+    assert out["available_index_levels"] == ["redacted"]
+    assert out["full_search_available"] is False
+    assert out["vector_level_counts"] == {"redacted": {"messages": 1, "chunks": 1}}
+    assert out["pending_vectors"] == {"redacted": 4, "full": None}
+    assert out["policy_drift_vectors"] == {"redacted": 0}
+    assert out["upgrade_needed"] is False
     assert out["latest_message"]["msg_id"] == "m-new"
     assert out["latest_message"]["freshness_seconds"] is not None
+
+
+def test_upgrade_command_dry_run_reports_selected_levels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    cfg = tmp_path / "config.toml"
+    _write_config(cfg)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+    _seed_retrieval_data(tmp_path)
+
+    monkeypatch.setattr(
+        cli,
+        "count_pending_vector_updates",
+        lambda *_args, **kwargs: 3 if kwargs.get("index_level") == "redacted" else 2,
+    )
+
+    cli.main(["--config", str(cfg), "upgrade", "--index-level", "all"])
+    out = json.loads(capsys.readouterr().out)
+
+    assert out["mode"] == "dry-run"
+    assert out["selected_levels"] == ["redacted", "full"]
+    assert out["actions"]["will_build_full_index"] is True
+    assert out["pre_upgrade"]["levels"]["redacted"]["pending_vectors"] == 3
+    assert out["pre_upgrade"]["levels"]["full"]["pending_vectors"] == 2
+    assert "action_required" in out
+
+
+def test_upgrade_command_apply_prunes_and_indexes_selected_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    cfg = tmp_path / "config.toml"
+    _write_config(cfg)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+
+    monkeypatch.setattr(cli, "count_pending_vector_updates", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(cli, "prune_invalid_redaction_entries", lambda *_args, **_kwargs: 2)
+
+    captured: dict[str, object] = {}
+
+    def fake_index_vectors(*_args, **kwargs):
+        captured["index_level"] = kwargs["index_level"]
+        captured["pending_only"] = kwargs["pending_only"]
+        return {"indexed": 1, "failed": 0, "index_level": kwargs["index_level"]}
+
+    monkeypatch.setattr(cli, "index_vectors", fake_index_vectors)
+
+    cli.main(["--config", str(cfg), "upgrade", "--index-level", "full", "--yes"])
+    out = json.loads(capsys.readouterr().out)
+
+    assert out["mode"] == "apply"
+    assert out["executed"]["redaction_entries_pruned"] == 2
+    assert out["executed"]["levels"]["full"]["indexed"] == 1
+    assert captured == {"index_level": "full", "pending_only": True}
 
 
 def test_latest_command_uses_safe_truncated_previews(
@@ -1011,20 +1158,23 @@ def test_search_includes_sender_fields_with_clearance(
     _seed_retrieval_data(tmp_path)
 
     def fake_search_vectors(*_args, **_kwargs):
-        return [
-            type(
-                "R",
-                (),
-                {
-                    "score": 0.99,
-                    "msg_id": "m-new",
-                    "thread_id": "t1",
-                    "account_email": "acct@example.com",
-                    "labels": ["INBOX"],
-                    "content": "Subject: Project updates",
-                },
-            )(),
-        ]
+        return (
+            [
+                type(
+                    "R",
+                    (),
+                    {
+                        "score": 0.99,
+                        "msg_id": "m-new",
+                        "thread_id": "t1",
+                        "account_email": "acct@example.com",
+                        "labels": ["INBOX"],
+                        "content": "Subject: Project updates",
+                    },
+                )(),
+            ],
+            _search_diag(requested="auto", used="redacted", fallback="full", full_available=False),
+        )
 
     monkeypatch.setattr(cli, "search_vectors", fake_search_vectors)
 
