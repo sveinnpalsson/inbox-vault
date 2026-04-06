@@ -45,9 +45,12 @@ The wrapper keeps day-to-day usage simple, but you can pass any advanced `inbox-
 
 ## Local checks before completion
 
+- `command -v inbox-vault && inbox-vault --help`
 - `ruff check .`
 - targeted `pytest` first, then broader subsets as needed.
 
 ## References
 
 - For release-pass checks, read `references/local-release-checklist.md`.
+- For using Inbox Vault as the mail source behind `llm-vault`, read `../../docs/llm-vault-bridge.md`.
+- If you mirror the unified cross-vault skill locally, treat the copy in `llm-vault` as canonical.

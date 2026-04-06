@@ -96,6 +96,13 @@ Set your database encryption key:
 export INBOX_VAULT_DB_PASSWORD='choose-a-strong-passphrase'
 ```
 
+Confirm the installed CLI is available from the current virtualenv:
+
+```bash
+command -v inbox-vault
+inbox-vault --help
+```
+
 ### 4. Set up a local LLM / embedding endpoint (optional)
 
 Enrichment (classification, summaries) and vector indexing (semantic search) require a local LLM and embedding model. The default config points to `http://localhost:8080` for both.
@@ -201,12 +208,35 @@ Cron-ready scripts in `scripts/`:
 
 Scripts auto-resolve the repo path from their location. Override with `INBOX_VAULT_REPO_DIR` if needed.
 
-## Unified cross-vault skill
+## Using Inbox Vault with llm-vault
 
-Inbox Vault is designed to participate in a shared operator surface across Gmail + docs + photos.
+Inbox Vault is the **mail ingestion and encrypted storage layer**. `llm-vault` can consume mail through a **read-only bridge** to the Inbox Vault database; Inbox Vault itself does **not** currently ship a separate OpenClaw plugin/tool package for autonomous agent use.
+
+Straight-line flow:
+1. install Inbox Vault and run a first successful `inbox-vault update`
+2. confirm local mail retrieval works (`inbox-vault status --json`, `inbox-vault search ...`)
+3. point `llm-vault` at the Inbox Vault DB via its `[mail_bridge]` config
+4. keep `INBOX_VAULT_DB_PASSWORD` available to the `llm-vault` runtime as well
+5. run the normal `llm-vault` status/update flow on the `llm-vault` side
+
+On the `llm-vault` side, the bridge config typically needs these fields:
+
+```toml
+[mail_bridge]
+db_path = "/absolute/path/to/inbox_vault.db"
+password_env = "INBOX_VAULT_DB_PASSWORD"
+include_accounts = ["you@gmail.com"]
+import_summary = true
+```
+
+For the exact operator flow, see [`docs/llm-vault-bridge.md`](docs/llm-vault-bridge.md).
+
+## Unified cross-vault skill (optional local mirror)
+
+Inbox Vault can participate in a shared operator surface across Gmail + docs + photos.
 
 Current boundary:
-- the canonical unified skill currently lives in the `docs-vault` repo
+- the canonical unified skill currently lives in the `llm-vault` repo
 - some local/operator deployments mirror that skill into `inbox-vault`
 - a clean `inbox-vault` clone should not assume the mirror is present unless you add it intentionally
 
@@ -223,7 +253,7 @@ Default behavior:
 - redacted clearance by default
 - weighted RRF fusion over backend results
 
-If you mirror the skill into this repo, keep it aligned with the canonical copy before release.
+If you mirror the skill into this repo, keep it aligned with the canonical copy in `llm-vault` before release.
 
 ## Privacy and safety defaults
 

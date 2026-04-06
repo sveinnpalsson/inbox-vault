@@ -8,12 +8,18 @@ Use this checklist for local-only readiness passes.
 - Avoid tracking account-specific secrets/tokens.
 - Keep examples sanitized (`config.example.toml`).
 
-## 2) Skill smoke check
+## 2) Install + skill smoke check
 
+- Smoke check editable install surface:
+  ```bash
+  command -v inbox-vault
+  inbox-vault --help
+  ```
 - Smoke check local wrapper:
   ```bash
   skills/inbox-vault-local/scripts/iv-cli.sh --config config.toml status --json
   ```
+- If this deployment feeds `llm-vault`, verify the bridge contract in `docs/llm-vault-bridge.md` still matches current config/examples.
 
 ## 3) Quality gate
 
