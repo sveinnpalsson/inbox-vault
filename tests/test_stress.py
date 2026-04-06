@@ -15,7 +15,7 @@ def test_run_isolated_stress_smoke(tmp_path: Path, app_cfg, monkeypatch):
     monkeypatch.setattr("inbox_vault.stress.build_profiles", lambda *_a, **_k: 2)
     monkeypatch.setattr(
         "inbox_vault.stress.index_vectors",
-        lambda *_a, **_k: {"indexed": 3, "failed": 0, "lancedb_status": "disabled"},
+        lambda *_a, **_k: {"indexed": 3, "failed": 0},
     )
 
     class _Result:

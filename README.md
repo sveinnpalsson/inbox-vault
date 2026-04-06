@@ -62,7 +62,7 @@ python -m pip install -e .[dev]
 
 # optional extras
 python -m pip install -e .[redaction]   # scrubadub-based NER detection
-python -m pip install -e .[retrieval]   # LanceDB + sentence-transformers
+python -m pip install -e .[retrieval]   # sentence-transformers support
 ```
 
 If `python3` on your machine still points to Python 3.10 (common on Ubuntu/WSL), use
@@ -166,7 +166,7 @@ The two primary commands are `update` and `repair`. Everything else is available
 | `validate` | Schema and data integrity checks |
 | `eval-retrieval` | Run retrieval quality evaluation (nDCG, MRR, Recall) |
 | `eval-bootstrap` | Generate starter eval set from current DB |
-| `backfill` | Legacy: standalone full import (prefer `update --backfill N`) |
+| `backfill` | Standalone full import (prefer `update --backfill N` for most local workflows) |
 
 ### Date filters
 
@@ -177,7 +177,7 @@ The two primary commands are `update` and `repair`. Everything else is available
 
 ## Design decisions worth noting
 
-**Graceful degradation.** LLM unavailable? Enrichment falls back to keyword-based heuristics. `update` checks endpoint reachability before each step and warns if something is down. LanceDB not installed? SQLite path handles it. FTS query syntax error? Auto-retries with quoted terms.
+**Graceful degradation.** LLM unavailable? Enrichment falls back to keyword-based heuristics. `update` checks endpoint reachability before each step and warns if something is down. FTS query syntax error? Auto-retries with quoted terms.
 
 **Evaluation infrastructure.** Built-in retrieval evaluation with Recall@K, MRR@K, and nDCG@K metrics. Slice-based reporting by label, scope, or account. A bootstrap command generates starter eval sets from your actual data using safe metadata only.
 
@@ -267,10 +267,10 @@ If you mirror the skill into this repo, keep it aligned with the canonical copy 
 
 The current operator model adds:
 
-- `upgrade --index-level redacted|full`
+- `index-vectors --index-level redacted|full`
 - `search --search-level auto|redacted|full`
 
-Default behavior still prefers redacted retrieval. The optional `full` dense index is only created through an explicit `upgrade` run.
+Default behavior still prefers redacted retrieval. The optional `full` dense index is only created through an explicit `index-vectors --index-level full` run.
 
 ## Tests
 

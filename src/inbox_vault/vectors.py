@@ -7,7 +7,6 @@ import math
 import re
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 
 from .config import AppConfig
@@ -17,7 +16,6 @@ from .db import (
     fetch_chunk_vectors_for_search_v2,
     fetch_messages_by_ids_v2,
     fetch_redaction_entries,
-    fetch_vectors_for_search,
     fetch_vectors_for_search_v2,
     get_vector_state_v2,
     lexical_search_rows,
@@ -181,7 +179,9 @@ def _resolve_effective_search_level(
     full_available = INDEX_LEVEL_FULL in available
     if requested == INDEX_LEVEL_FULL:
         if not full_available:
-            raise ValueError("full search level is unavailable; run upgrade to build the full index.")
+            raise ValueError(
+                "full search level is unavailable; run `index-vectors --index-level full` first."
+            )
         return SearchDiagnostics(
             requested_level=INDEX_LEVEL_FULL,
             used_level=INDEX_LEVEL_FULL,
@@ -286,110 +286,6 @@ def _build_chunks(
         )
 
     return chunks
-
-
-def _lancedb_available() -> tuple[bool, str]:
-    try:
-        import lancedb  # noqa: F401
-
-        return True, "enabled"
-    except Exception as exc:
-        return False, f"unavailable:{exc.__class__.__name__}"
-
-
-def _upsert_lancedb_chunk_record(cfg: AppConfig, record: dict[str, Any]) -> bool:
-    available, _status = _lancedb_available()
-    if not available:
-        return False
-
-    import lancedb
-
-    db_path = Path(cfg.retrieval.lancedb_path)
-    db_path.mkdir(parents=True, exist_ok=True)
-
-    db = lancedb.connect(str(db_path))
-    table_name = cfg.retrieval.lancedb_table
-
-    try:
-        table = db.open_table(table_name)
-    except Exception:
-        db.create_table(table_name, data=[record], mode="overwrite")
-        return True
-
-    try:
-        escaped_chunk_id = str(record["chunk_id"]).replace("'", "''")
-        table.delete(f"chunk_id = '{escaped_chunk_id}'")
-    except Exception:
-        LOG.debug("Unable to delete existing LanceDB row for chunk_id=%s", record["chunk_id"])
-    table.add([record])
-    return True
-
-
-def _search_lancedb_chunks(
-    cfg: AppConfig,
-    query_embedding: list[float],
-    *,
-    account_email: str | None,
-    label: str | None,
-    limit: int,
-) -> list[_ChunkCandidate]:
-    available, _status = _lancedb_available()
-    if not available:
-        return []
-
-    import lancedb
-
-    db = lancedb.connect(cfg.retrieval.lancedb_path)
-    try:
-        table = db.open_table(cfg.retrieval.lancedb_table)
-    except Exception:
-        return []
-
-    try:
-        rows = table.search(query_embedding).limit(max(1, int(limit))).to_list()
-    except Exception:
-        LOG.exception("LanceDB search failed; falling back to sqlite vector scan")
-        return []
-
-    wanted_label = (label or "").strip().upper()
-    out: list[_ChunkCandidate] = []
-    for row in rows:
-        msg_id = str(row.get("msg_id", ""))
-        if not msg_id:
-            continue
-
-        acct = str(row.get("account_email", ""))
-        if account_email and acct != account_email:
-            continue
-
-        labels = [str(v).upper() for v in row.get("labels", [])]
-        if wanted_label and wanted_label not in labels:
-            continue
-
-        distance = row.get("_distance")
-        try:
-            score = 1.0 - float(distance)
-        except (TypeError, ValueError):
-            score = 0.0
-
-        chunk_id = str(row.get("chunk_id") or f"{msg_id}::legacy")
-        chunk_index = int(row.get("chunk_index") or 0)
-        out.append(
-            _ChunkCandidate(
-                chunk_id=chunk_id,
-                msg_id=msg_id,
-                thread_id=str(row.get("thread_id")) if row.get("thread_id") else None,
-                account_email=acct,
-                labels=labels,
-                chunk_index=chunk_index,
-                chunk_text=str(row.get("chunk_text", "")),
-                chunk_text_redacted=str(row.get("chunk_text_redacted", "")),
-                score=score,
-            )
-        )
-
-    out.sort(key=lambda r: (-r.score, r.msg_id, r.chunk_index, r.chunk_id))
-    return out
 
 
 def _pending_message_ids_for_index(
@@ -503,12 +399,6 @@ def index_vectors(
     if chosen_index_level not in {INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL}:
         raise ValueError(f"Unsupported index_level: {index_level}")
 
-    lancedb_enabled = False
-    lancedb_status = "disabled"
-    if cfg.retrieval.vector_backend == "lancedb":
-        lancedb_status = "disabled:v2-index-levels"
-        LOG.warning("LanceDB backend is temporarily disabled for v2 index-level storage; using sqlite-only vectors")
-
     stats: dict[str, int | str] = {
         "scanned": 0,
         "indexed": 0,
@@ -516,9 +406,6 @@ def index_vectors(
         "skipped_filtered": 0,
         "failed": 0,
         "chunks_indexed": 0,
-        "lancedb_indexed": 0,
-        "lancedb_failed": 0,
-        "lancedb_status": lancedb_status,
         "lock_retries": 0,
         "lock_errors": 0,
         "redaction_entries_added": 0,
@@ -954,35 +841,6 @@ def index_vectors(
                 continue
             stats["chunks_indexed"] += 1
 
-            if cfg.retrieval.vector_backend == "lancedb" and lancedb_enabled:
-                lance_record = {
-                    "chunk_id": chunk.chunk_id,
-                    "msg_id": msg_id,
-                    "account_email": acct,
-                    "thread_id": thread_id,
-                    "labels": labels,
-                    "chunk_index": chunk.chunk_index,
-                    "chunk_type": chunk.chunk_type,
-                    "chunk_start": chunk.chunk_start,
-                    "chunk_end": chunk.chunk_end,
-                    "chunk_text": chunk.text,
-                    "chunk_text_redacted": chunk_redacted,
-                    "content_hash": chunk_fingerprint,
-                    "embedding": chunk_embedding,
-                }
-                try:
-                    if _upsert_lancedb_chunk_record(cfg, lance_record):
-                        stats["lancedb_indexed"] += 1
-                    else:
-                        stats["lancedb_failed"] += 1
-                except Exception:
-                    LOG.exception(
-                        "LanceDB upsert failed for message_id=%s chunk_id=%s",
-                        msg_id,
-                        chunk.chunk_id,
-                    )
-                    stats["lancedb_failed"] += 1
-
         stats["indexed"] += 1
         if progress_callback:
             elapsed_s = max(0.0001, time.perf_counter() - message_started)
@@ -1020,57 +878,6 @@ def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return -1.0
     return dot / (norm_a * norm_b)
-
-
-def _dense_candidates_legacy_messages(
-    conn,
-    cfg: AppConfig,
-    query: str,
-    *,
-    account_email: str | None,
-    label: str | None,
-    from_ts_ms: int | None,
-    to_ts_ms: int | None,
-) -> list[_Candidate]:
-    qvec = embedding_vector(cfg.embeddings, query)
-
-    rows = fetch_vectors_for_search(
-        conn,
-        account_email=account_email,
-        label=label,
-        from_ts_ms=from_ts_ms,
-        to_ts_ms=to_ts_ms,
-    )
-    ranked: list[_Candidate] = []
-    for (
-        msg_id,
-        acct,
-        thread_id,
-        labels_json,
-        source_text,
-        source_text_redacted,
-        emb_json,
-        _model,
-    ) in rows:
-        emb = [float(v) for v in json.loads(emb_json)]
-        score = _cosine_similarity(qvec, emb)
-        if score < 0:
-            continue
-        ranked.append(
-            _Candidate(
-                msg_id=msg_id,
-                thread_id=thread_id,
-                account_email=acct,
-                labels=json.loads(labels_json or "[]"),
-                source_text=source_text,
-                source_text_redacted=source_text_redacted,
-                score=score,
-                chunk_hits=1,
-                first_chunk_rank=1,
-            )
-        )
-    ranked.sort(key=lambda r: (-r.score, r.msg_id))
-    return ranked[: max(1, int(cfg.retrieval.dense_candidate_k))]
 
 
 def _aggregate_chunk_candidates(

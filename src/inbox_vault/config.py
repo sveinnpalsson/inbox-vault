@@ -53,10 +53,7 @@ class RedactionConfig:
 @dataclass(slots=True)
 class RetrievalConfig:
     search_strategy: str = "hybrid"
-    vector_backend: str = "sqlite"
     lexical_backend: str = "fts5"
-    lancedb_path: str = "data/lancedb"
-    lancedb_table: str = "message_chunk_vectors"
     rrf_k: int = 60
     dense_candidate_k: int = 100
     lexical_candidate_k: int = 100
@@ -357,16 +354,9 @@ def load_config(path: str | None = None) -> AppConfig:
     if retrieval_strategy not in {"dense", "lexical", "hybrid"}:
         raise ValueError("Invalid retrieval.search_strategy: expected one of dense|lexical|hybrid")
 
-    vector_backend = str(retrieval_raw.get("vector_backend", "sqlite")).strip().lower()
-    if vector_backend not in {"sqlite", "lancedb"}:
-        raise ValueError("Invalid retrieval.vector_backend: expected one of sqlite|lancedb")
-
     lexical_backend = str(retrieval_raw.get("lexical_backend", "fts5")).strip().lower()
     if lexical_backend not in {"fts5", "none"}:
         raise ValueError("Invalid retrieval.lexical_backend: expected one of fts5|none")
-
-    lancedb_path = str(retrieval_raw.get("lancedb_path", "data/lancedb")).strip()
-    lancedb_table = str(retrieval_raw.get("lancedb_table", "message_chunk_vectors")).strip()
 
     rrf_k = _parse_positive_int(retrieval_raw.get("rrf_k", 60), key="retrieval.rrf_k")
     dense_candidate_k = _parse_positive_int(
@@ -489,10 +479,6 @@ def load_config(path: str | None = None) -> AppConfig:
         raise ValueError("Invalid database.path: expected non-empty string")
     if not db_password_env:
         raise ValueError("Invalid database.password_env: expected non-empty string")
-    if vector_backend == "lancedb" and not lancedb_path:
-        raise ValueError("Invalid retrieval.lancedb_path: expected non-empty string")
-    if vector_backend == "lancedb" and not lancedb_table:
-        raise ValueError("Invalid retrieval.lancedb_table: expected non-empty string")
     if rerank_enabled and not rerank_model:
         raise ValueError("Invalid rerank.model: expected non-empty string")
     if gog_history_enabled and not gog_history_command:
@@ -531,10 +517,7 @@ def load_config(path: str | None = None) -> AppConfig:
         ),
         retrieval=RetrievalConfig(
             search_strategy=retrieval_strategy,
-            vector_backend=vector_backend,
             lexical_backend=lexical_backend,
-            lancedb_path=lancedb_path,
-            lancedb_table=lancedb_table,
             rrf_k=rrf_k,
             dense_candidate_k=dense_candidate_k,
             lexical_candidate_k=lexical_candidate_k,

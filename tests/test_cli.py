@@ -994,64 +994,9 @@ endpoint = "http://embedding.test:11434"
     assert out["vector_level_counts"] == {"redacted": {"messages": 1, "chunks": 1}}
     assert out["pending_vectors"] == {"redacted": 4, "full": None}
     assert out["policy_drift_vectors"] == {"redacted": 0}
-    assert out["upgrade_needed"] is False
+    assert out["action_needed"] is False
     assert out["latest_message"]["msg_id"] == "m-new"
     assert out["latest_message"]["freshness_seconds"] is not None
-
-
-def test_upgrade_command_dry_run_reports_selected_levels(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
-):
-    cfg = tmp_path / "config.toml"
-    _write_config(cfg)
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
-    _seed_retrieval_data(tmp_path)
-
-    monkeypatch.setattr(
-        cli,
-        "count_pending_vector_updates",
-        lambda *_args, **kwargs: 3 if kwargs.get("index_level") == "redacted" else 2,
-    )
-
-    cli.main(["--config", str(cfg), "upgrade", "--index-level", "all"])
-    out = json.loads(capsys.readouterr().out)
-
-    assert out["mode"] == "dry-run"
-    assert out["selected_levels"] == ["redacted", "full"]
-    assert out["actions"]["will_build_full_index"] is True
-    assert out["pre_upgrade"]["levels"]["redacted"]["pending_vectors"] == 3
-    assert out["pre_upgrade"]["levels"]["full"]["pending_vectors"] == 2
-    assert "action_required" in out
-
-
-def test_upgrade_command_apply_prunes_and_indexes_selected_level(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
-):
-    cfg = tmp_path / "config.toml"
-    _write_config(cfg)
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
-
-    monkeypatch.setattr(cli, "count_pending_vector_updates", lambda *_args, **_kwargs: 1)
-    monkeypatch.setattr(cli, "prune_invalid_redaction_entries", lambda *_args, **_kwargs: 2)
-
-    captured: dict[str, object] = {}
-
-    def fake_index_vectors(*_args, **kwargs):
-        captured["index_level"] = kwargs["index_level"]
-        captured["pending_only"] = kwargs["pending_only"]
-        return {"indexed": 1, "failed": 0, "index_level": kwargs["index_level"]}
-
-    monkeypatch.setattr(cli, "index_vectors", fake_index_vectors)
-
-    cli.main(["--config", str(cfg), "upgrade", "--index-level", "full", "--yes"])
-    out = json.loads(capsys.readouterr().out)
-
-    assert out["mode"] == "apply"
-    assert out["executed"]["redaction_entries_pruned"] == 2
-    assert out["executed"]["levels"]["full"]["indexed"] == 1
-    assert captured == {"index_level": "full", "pending_only": True}
 
 
 def test_latest_command_uses_safe_truncated_previews(

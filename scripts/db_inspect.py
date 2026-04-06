@@ -15,9 +15,11 @@ DEFAULT_TABLES = [
     "message_enrichment",
     "contact_stats",
     "contact_profiles",
-    "message_vectors",
-    "message_chunk_vectors",
+    "message_vectors_v2",
+    "message_chunk_vectors_v2",
+    "vector_index_state_v2",
     "message_fts",
+    "message_fts_redacted",
     "sync_cursors",
 ]
 
@@ -160,47 +162,47 @@ def _print_profiles(conn, *, limit: int) -> None:
 def _print_redaction_comparison(conn, *, limit: int) -> None:
     _print_heading("Vector/chunk redaction comparisons")
 
-    if _table_exists(conn, "message_vectors"):
+    if _table_exists(conn, "message_vectors_v2"):
         rows = conn.execute(
             """
-            SELECT msg_id, source_text, source_text_redacted
-            FROM message_vectors
+            SELECT msg_id, index_level, source_text, source_text_redacted
+            FROM message_vectors_v2
             WHERE COALESCE(source_text, '') != COALESCE(source_text_redacted, '')
             ORDER BY updated_at DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
-        print(f"message_vectors differing rows={len(rows)}")
+        print(f"message_vectors_v2 differing rows={len(rows)}")
         if not rows:
             print("- no differing message-level rows found")
-        for i, (msg_id, raw, redacted) in enumerate(rows, start=1):
-            print(f"  {i}. msg_id={msg_id}")
+        for i, (msg_id, index_level, raw, redacted) in enumerate(rows, start=1):
+            print(f"  {i}. msg_id={msg_id} index_level={index_level}")
             print(f"     raw:      {_truncate(raw, 180)}")
             print(f"     redacted: {_truncate(redacted, 180)}")
     else:
-        print("message_vectors table missing")
+        print("message_vectors_v2 table missing")
 
-    if _table_exists(conn, "message_chunk_vectors"):
+    if _table_exists(conn, "message_chunk_vectors_v2"):
         rows = conn.execute(
             """
-            SELECT chunk_id, msg_id, chunk_text, chunk_text_redacted
-            FROM message_chunk_vectors
+            SELECT chunk_id, index_level, msg_id, chunk_text, chunk_text_redacted
+            FROM message_chunk_vectors_v2
             WHERE COALESCE(chunk_text, '') != COALESCE(chunk_text_redacted, '')
             ORDER BY updated_at DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
-        print(f"message_chunk_vectors differing rows={len(rows)}")
+        print(f"message_chunk_vectors_v2 differing rows={len(rows)}")
         if not rows:
             print("- no differing chunk-level rows found")
-        for i, (chunk_id, msg_id, raw, redacted) in enumerate(rows, start=1):
-            print(f"  {i}. chunk_id={chunk_id} msg_id={msg_id}")
+        for i, (chunk_id, index_level, msg_id, raw, redacted) in enumerate(rows, start=1):
+            print(f"  {i}. chunk_id={chunk_id} index_level={index_level} msg_id={msg_id}")
             print(f"     raw:      {_truncate(raw, 180)}")
             print(f"     redacted: {_truncate(redacted, 180)}")
     else:
-        print("message_chunk_vectors table missing")
+        print("message_chunk_vectors_v2 table missing")
 
 
 def _print_lexical_preview(conn, query: str, *, limit: int) -> None:

@@ -74,7 +74,6 @@ def _clone_target_cfg(base_cfg: AppConfig, target_dir: Path, *, copy_tokens: boo
         base_cfg,
         accounts=cloned_accounts,
         db=replace(base_cfg.db, path=str(target_dir / "inbox_vault.db")),
-        retrieval=replace(base_cfg.retrieval, lancedb_path=str(target_dir / "lancedb")),
     )
 
 
@@ -105,9 +104,11 @@ def _build_inspect_summary(conn, *, sample_limit: int = 10) -> dict:
             conn.execute("SELECT count(*) FROM message_enrichment").fetchone()[0]
         ),
         "profiles": int(conn.execute("SELECT count(*) FROM contact_profiles").fetchone()[0]),
-        "message_vectors": int(conn.execute("SELECT count(*) FROM message_vectors").fetchone()[0]),
-        "chunk_vectors": int(
-            conn.execute("SELECT count(*) FROM message_chunk_vectors").fetchone()[0]
+        "message_vectors_v2": int(
+            conn.execute("SELECT count(*) FROM message_vectors_v2").fetchone()[0]
+        ),
+        "chunk_vectors_v2": int(
+            conn.execute("SELECT count(*) FROM message_chunk_vectors_v2").fetchone()[0]
         ),
     }
 
@@ -162,7 +163,6 @@ def run_consolidation(
         "target_root": str(target_dir),
         "source_db_path": str(Path(base_cfg.db.path).expanduser().resolve()),
         "target_db_path": str(Path(cfg.db.path).resolve()),
-        "target_lancedb_path": str(Path(cfg.retrieval.lancedb_path).resolve()),
     }
 
     lock_path = target_dir / ".index-writer.lock"

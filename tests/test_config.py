@@ -40,7 +40,6 @@ query = "label:inbox"
     assert cfg.embeddings.fallback == "none"
     assert cfg.redaction.mode == "hybrid"
     assert cfg.retrieval.search_strategy == "hybrid"
-    assert cfg.retrieval.vector_backend == "sqlite"
     assert cfg.retrieval.chunk_chars == 900
     assert cfg.retrieval.chunk_overlap_chars == 150
     assert cfg.indexing.include_labels == ["INBOX", "SENT"]
@@ -167,10 +166,7 @@ token_file = "token.json"
 
 [retrieval]
 search_strategy = "lexical"
-vector_backend = "lancedb"
 lexical_backend = "fts5"
-lancedb_path = "data/custom_lancedb"
-lancedb_table = "emails"
 rrf_k = 75
 chunk_chars = 1200
 chunk_overlap_chars = 200
@@ -184,8 +180,6 @@ top_n = 15
 
     cfg = load_config(str(cfg_path))
     assert cfg.retrieval.search_strategy == "lexical"
-    assert cfg.retrieval.vector_backend == "lancedb"
-    assert cfg.retrieval.lancedb_table == "emails"
     assert cfg.retrieval.rrf_k == 75
     assert cfg.retrieval.chunk_chars == 1200
     assert cfg.retrieval.chunk_overlap_chars == 200

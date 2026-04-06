@@ -167,7 +167,6 @@ text = src
 text = set_value(text, "embeddings", "fallback", '"none"')
 text = set_value(text, "embeddings", "max_retries", "0")
 text = set_value(text, "embeddings", "timeout_seconds", "4")
-text = set_value(text, "retrieval", "vector_backend", '"sqlite"')
 out_path.write_text(text, encoding="utf-8")
 PY
 }
@@ -320,6 +319,5 @@ else:
 print("- embeddings.fallback: none (diagnostic mode only)")
 print("- embeddings.max_retries: 0 (diagnostic mode only)")
 print("- embeddings.timeout_seconds: 4 (diagnostic mode only)")
-print("- retrieval.vector_backend: sqlite (diagnostic mode only)")
 print(f"\nDetailed logs: {path.parent}")
 PY

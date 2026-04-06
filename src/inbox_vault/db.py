@@ -129,39 +129,6 @@ def get_conn(db_path: str, password: str):
           PRIMARY KEY (account_email, scope)
         );
 
-        CREATE TABLE IF NOT EXISTS message_vectors (
-          msg_id TEXT PRIMARY KEY REFERENCES messages(msg_id) ON DELETE CASCADE,
-          account_email TEXT NOT NULL,
-          thread_id TEXT,
-          labels_json TEXT NOT NULL,
-          source_text TEXT NOT NULL,
-          source_text_redacted TEXT NOT NULL,
-          embedding_json TEXT NOT NULL,
-          embedding_dim INTEGER NOT NULL,
-          embedding_model TEXT NOT NULL,
-          content_hash TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS message_chunk_vectors (
-          chunk_id TEXT PRIMARY KEY,
-          msg_id TEXT NOT NULL REFERENCES messages(msg_id) ON DELETE CASCADE,
-          account_email TEXT NOT NULL,
-          thread_id TEXT,
-          labels_json TEXT NOT NULL,
-          chunk_index INTEGER NOT NULL,
-          chunk_type TEXT NOT NULL,
-          chunk_start INTEGER NOT NULL,
-          chunk_end INTEGER NOT NULL,
-          chunk_text TEXT NOT NULL,
-          chunk_text_redacted TEXT NOT NULL,
-          embedding_json TEXT NOT NULL,
-          embedding_dim INTEGER NOT NULL,
-          embedding_model TEXT NOT NULL,
-          content_hash TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-
         CREATE TABLE IF NOT EXISTS redaction_entries (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           scope_type TEXT NOT NULL,
@@ -251,9 +218,6 @@ def get_conn(db_path: str, password: str):
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_email);
-        CREATE INDEX IF NOT EXISTS idx_vectors_account ON message_vectors(account_email);
-        CREATE INDEX IF NOT EXISTS idx_chunk_vectors_msg ON message_chunk_vectors(msg_id);
-        CREATE INDEX IF NOT EXISTS idx_chunk_vectors_account ON message_chunk_vectors(account_email);
         CREATE INDEX IF NOT EXISTS idx_redaction_scope ON redaction_entries(scope_type, scope_id);
         CREATE INDEX IF NOT EXISTS idx_redaction_placeholder ON redaction_entries(scope_type, scope_id, placeholder);
         CREATE INDEX IF NOT EXISTS idx_vectors_v2_account ON message_vectors_v2(account_email, index_level);
@@ -262,10 +226,6 @@ def get_conn(db_path: str, password: str):
         CREATE INDEX IF NOT EXISTS idx_vector_state_v2_level ON vector_index_state_v2(index_level);
         """
     )
-
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(message_vectors)").fetchall()}
-    if cols and "thread_id" not in cols:
-        conn.execute("ALTER TABLE message_vectors ADD COLUMN thread_id TEXT")
 
     redaction_cols = {row[1] for row in conn.execute("PRAGMA table_info(redaction_entries)").fetchall()}
     for column, column_type, default in [
@@ -633,13 +593,6 @@ def vector_index_source_rows(conn, *, account_email: str | None = None, limit: i
     return conn.execute(sql, params).fetchall()
 
 
-def get_vector_row(conn, msg_id: str):
-    return conn.execute(
-        "SELECT content_hash FROM message_vectors WHERE msg_id = ?",
-        (msg_id,),
-    ).fetchone()
-
-
 def get_vector_state_v2(conn, msg_id: str, *, index_level: str):
     return conn.execute(
         """
@@ -649,62 +602,6 @@ def get_vector_state_v2(conn, msg_id: str, *, index_level: str):
         """,
         (msg_id, index_level),
     ).fetchone()
-
-
-def upsert_message_vector(
-    conn,
-    *,
-    msg_id: str,
-    account_email: str,
-    thread_id: str | None,
-    labels: list[str],
-    source_text: str,
-    source_text_redacted: str,
-    embedding: list[float],
-    embedding_model: str,
-    content_hash: str,
-    lock_max_retries: int = 0,
-    lock_backoff_base_seconds: float = 0.05,
-) -> int:
-    _, retries_used = _run_with_lock_retry(
-        lambda: conn.execute(
-            """
-            INSERT INTO message_vectors (
-              msg_id, account_email, thread_id, labels_json, source_text, source_text_redacted,
-              embedding_json, embedding_dim, embedding_model, content_hash, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(msg_id) DO UPDATE SET
-              account_email=excluded.account_email,
-              thread_id=excluded.thread_id,
-              labels_json=excluded.labels_json,
-              source_text=excluded.source_text,
-              source_text_redacted=excluded.source_text_redacted,
-              embedding_json=excluded.embedding_json,
-              embedding_dim=excluded.embedding_dim,
-              embedding_model=excluded.embedding_model,
-              content_hash=excluded.content_hash,
-              updated_at=excluded.updated_at
-            """,
-            (
-                msg_id,
-                account_email,
-                thread_id,
-                json.dumps(labels),
-                source_text,
-                source_text_redacted,
-                json.dumps(embedding),
-                len(embedding),
-                embedding_model,
-                content_hash,
-                utc_now(),
-            ),
-        ),
-        op_name="upsert_message_vector",
-        max_retries=lock_max_retries,
-        backoff_base_seconds=lock_backoff_base_seconds,
-    )
-    return retries_used
 
 
 def upsert_message_vector_v2(
@@ -768,22 +665,6 @@ def upsert_message_vector_v2(
     return retries_used
 
 
-def delete_message_chunk_vectors(
-    conn,
-    *,
-    msg_id: str,
-    lock_max_retries: int = 0,
-    lock_backoff_base_seconds: float = 0.05,
-) -> int:
-    _, retries_used = _run_with_lock_retry(
-        lambda: conn.execute("DELETE FROM message_chunk_vectors WHERE msg_id = ?", (msg_id,)),
-        op_name="delete_message_chunk_vectors",
-        max_retries=lock_max_retries,
-        backoff_base_seconds=lock_backoff_base_seconds,
-    )
-    return retries_used
-
-
 def delete_message_chunk_vectors_v2(
     conn,
     *,
@@ -798,79 +679,6 @@ def delete_message_chunk_vectors_v2(
             (msg_id, index_level),
         ),
         op_name="delete_message_chunk_vectors_v2",
-        max_retries=lock_max_retries,
-        backoff_base_seconds=lock_backoff_base_seconds,
-    )
-    return retries_used
-
-
-def upsert_message_chunk_vector(
-    conn,
-    *,
-    chunk_id: str,
-    msg_id: str,
-    account_email: str,
-    thread_id: str | None,
-    labels: list[str],
-    chunk_index: int,
-    chunk_type: str,
-    chunk_start: int,
-    chunk_end: int,
-    chunk_text: str,
-    chunk_text_redacted: str,
-    embedding: list[float],
-    embedding_model: str,
-    content_hash: str,
-    lock_max_retries: int = 0,
-    lock_backoff_base_seconds: float = 0.05,
-) -> int:
-    _, retries_used = _run_with_lock_retry(
-        lambda: conn.execute(
-            """
-            INSERT INTO message_chunk_vectors (
-              chunk_id, msg_id, account_email, thread_id, labels_json,
-              chunk_index, chunk_type, chunk_start, chunk_end,
-              chunk_text, chunk_text_redacted,
-              embedding_json, embedding_dim, embedding_model, content_hash, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(chunk_id) DO UPDATE SET
-              msg_id=excluded.msg_id,
-              account_email=excluded.account_email,
-              thread_id=excluded.thread_id,
-              labels_json=excluded.labels_json,
-              chunk_index=excluded.chunk_index,
-              chunk_type=excluded.chunk_type,
-              chunk_start=excluded.chunk_start,
-              chunk_end=excluded.chunk_end,
-              chunk_text=excluded.chunk_text,
-              chunk_text_redacted=excluded.chunk_text_redacted,
-              embedding_json=excluded.embedding_json,
-              embedding_dim=excluded.embedding_dim,
-              embedding_model=excluded.embedding_model,
-              content_hash=excluded.content_hash,
-              updated_at=excluded.updated_at
-            """,
-            (
-                chunk_id,
-                msg_id,
-                account_email,
-                thread_id,
-                json.dumps(labels),
-                chunk_index,
-                chunk_type,
-                chunk_start,
-                chunk_end,
-                chunk_text,
-                chunk_text_redacted,
-                json.dumps(embedding),
-                len(embedding),
-                embedding_model,
-                content_hash,
-                utc_now(),
-            ),
-        ),
-        op_name="upsert_message_chunk_vector",
         max_retries=lock_max_retries,
         backoff_base_seconds=lock_backoff_base_seconds,
     )
@@ -1196,87 +1004,6 @@ def fetch_chunk_vectors_for_search_v2(
     return filtered
 
 
-def fetch_chunk_vectors_for_search(
-    conn,
-    *,
-    account_email: str | None = None,
-    label: str | None = None,
-    from_ts_ms: int | None = None,
-    to_ts_ms: int | None = None,
-):
-    sql = (
-        "SELECT c.chunk_id, c.msg_id, c.account_email, c.thread_id, c.labels_json, c.chunk_index, "
-        "c.chunk_type, c.chunk_start, c.chunk_end, c.chunk_text, c.chunk_text_redacted, c.embedding_json, "
-        "c.embedding_model FROM message_chunk_vectors c "
-        "JOIN messages m ON m.msg_id = c.msg_id"
-    )
-    params: list[Any] = []
-    clauses: list[str] = []
-    if account_email:
-        clauses.append("c.account_email = ?")
-        params.append(account_email)
-    if from_ts_ms is not None:
-        clauses.append("COALESCE(m.internal_ts, 0) >= ?")
-        params.append(int(from_ts_ms))
-    if to_ts_ms is not None:
-        clauses.append("COALESCE(m.internal_ts, 0) < ?")
-        params.append(int(to_ts_ms))
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
-    rows = conn.execute(sql, params).fetchall()
-
-    if not label:
-        return rows
-
-    filtered = []
-    wanted = label.strip().upper()
-    for row in rows:
-        labels = [v.upper() for v in json.loads(row[4] or "[]")]
-        if wanted in labels:
-            filtered.append(row)
-    return filtered
-
-
-def fetch_vectors_for_search(
-    conn,
-    *,
-    account_email: str | None = None,
-    label: str | None = None,
-    from_ts_ms: int | None = None,
-    to_ts_ms: int | None = None,
-):
-    sql = (
-        "SELECT v.msg_id, v.account_email, v.thread_id, v.labels_json, v.source_text, v.source_text_redacted, "
-        "v.embedding_json, v.embedding_model FROM message_vectors v "
-        "JOIN messages m ON m.msg_id = v.msg_id"
-    )
-    params: list[Any] = []
-    clauses: list[str] = []
-    if account_email:
-        clauses.append("v.account_email = ?")
-        params.append(account_email)
-    if from_ts_ms is not None:
-        clauses.append("COALESCE(m.internal_ts, 0) >= ?")
-        params.append(int(from_ts_ms))
-    if to_ts_ms is not None:
-        clauses.append("COALESCE(m.internal_ts, 0) < ?")
-        params.append(int(to_ts_ms))
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
-    rows = conn.execute(sql, params).fetchall()
-
-    if not label:
-        return rows
-
-    filtered = []
-    wanted = label.strip().upper()
-    for row in rows:
-        labels = [v.upper() for v in json.loads(row[3] or "[]")]
-        if wanted in labels:
-            filtered.append(row)
-    return filtered
-
-
 def fetch_vectors_for_search_v2(
     conn,
     *,
@@ -1315,32 +1042,6 @@ def fetch_vectors_for_search_v2(
         if wanted in labels:
             filtered.append(row)
     return filtered
-
-
-def fetch_messages_by_ids(conn, msg_ids: list[str]):
-    if not msg_ids:
-        return {}
-    placeholders = ",".join("?" for _ in msg_ids)
-    rows = conn.execute(
-        f"""
-        SELECT
-          m.msg_id,
-          m.account_email,
-          m.thread_id,
-          m.labels_json,
-          m.internal_ts,
-          m.subject,
-          m.snippet,
-          m.body_text,
-          v.source_text,
-          v.source_text_redacted
-        FROM messages m
-        LEFT JOIN message_vectors v ON v.msg_id = m.msg_id
-        WHERE m.msg_id IN ({placeholders})
-        """,
-        msg_ids,
-    ).fetchall()
-    return {row[0]: row for row in rows}
 
 
 def fetch_messages_by_ids_v2(conn, msg_ids: list[str], *, index_level: str):

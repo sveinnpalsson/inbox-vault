@@ -2,9 +2,7 @@
 
 ## Current priorities
 
-- Add migration helper command to rebuild chunk vectors + LanceDB table from existing encrypted DB in one step.
 - Add optional weighted hybrid knobs (dense/lexical channel weighting) while preserving deterministic ordering.
-- Strengthen integration tests for LanceDB-path hydration/filter behavior.
 
 ## Up next
 

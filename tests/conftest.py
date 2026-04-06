@@ -49,9 +49,7 @@ def app_cfg(tmp_path: Path) -> AppConfig:
         redaction=RedactionConfig(
             mode="regex", profile="standard", instruction="", chunk_chars=600
         ),
-        retrieval=RetrievalConfig(
-            search_strategy="hybrid", vector_backend="sqlite", lexical_backend="fts5"
-        ),
+        retrieval=RetrievalConfig(search_strategy="hybrid", lexical_backend="fts5"),
         rerank=RerankConfig(enabled=False),
         gmail_query="label:inbox OR label:sent",
     )

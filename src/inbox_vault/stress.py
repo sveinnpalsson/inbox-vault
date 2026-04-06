@@ -33,12 +33,12 @@ def _run_validate(conn) -> dict:
             "SELECT name FROM sqlite_master WHERE name='sync_cursors'"
         ).fetchone()
         is not None,
-        "message_vectors_table": conn.execute(
-            "SELECT name FROM sqlite_master WHERE name='message_vectors'"
+        "message_vectors_v2_table": conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='message_vectors_v2'"
         ).fetchone()
         is not None,
-        "message_chunk_vectors_table": conn.execute(
-            "SELECT name FROM sqlite_master WHERE name='message_chunk_vectors'"
+        "message_chunk_vectors_v2_table": conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='message_chunk_vectors_v2'"
         ).fetchone()
         is not None,
         "message_fts_table": conn.execute(
@@ -91,16 +91,10 @@ def _clone_isolated_cfg(base_cfg: AppConfig, isolated_dir: Path, *, copy_tokens:
             )
         )
 
-    retrieval_cfg = replace(
-        base_cfg.retrieval,
-        lancedb_path=str(isolated_dir / "lancedb"),
-    )
-
     return replace(
         base_cfg,
         accounts=cloned_accounts,
         db=replace(base_cfg.db, path=str(isolated_dir / "inbox_vault.db")),
-        retrieval=retrieval_cfg,
     )
 
 
@@ -112,9 +106,11 @@ def _db_counts(conn) -> dict[str, int]:
             conn.execute("SELECT count(*) FROM message_enrichment").fetchone()[0]
         ),
         "profiles": int(conn.execute("SELECT count(*) FROM contact_profiles").fetchone()[0]),
-        "message_vectors": int(conn.execute("SELECT count(*) FROM message_vectors").fetchone()[0]),
-        "chunk_vectors": int(
-            conn.execute("SELECT count(*) FROM message_chunk_vectors").fetchone()[0]
+        "message_vectors_v2": int(
+            conn.execute("SELECT count(*) FROM message_vectors_v2").fetchone()[0]
+        ),
+        "chunk_vectors_v2": int(
+            conn.execute("SELECT count(*) FROM message_chunk_vectors_v2").fetchone()[0]
         ),
     }
 
@@ -248,7 +244,6 @@ def run_isolated_stress(
             "ok": ok,
             "isolated_run_dir": str(run_dir),
             "db_path": str(Path(cfg.db.path).resolve()),
-            "lancedb_path": str(Path(cfg.retrieval.lancedb_path).resolve()),
             "redaction_mode": redaction_mode or cfg.redaction.mode,
             "strategy": strategy,
             "steps": steps,

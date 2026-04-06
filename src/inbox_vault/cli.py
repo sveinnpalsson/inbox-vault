@@ -12,7 +12,6 @@ from .consolidation import run_consolidation
 from .db import (
     clear_contact_profiles,
     get_conn,
-    prune_invalid_redaction_entries,
     vector_level_counts,
 )
 from .enrich import enrich_pending
@@ -345,33 +344,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit JSON output (default behavior; provided for explicit machine workflows).",
     )
 
-    p_upgrade = sub.add_parser(
-        "upgrade",
-        help="Preview or apply redaction-policy/vector upgrades, including optional full-index builds",
-    )
-    p_upgrade.add_argument(
-        "--index-level",
-        choices=[INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL, "all"],
-        default=INDEX_LEVEL_REDACTED,
-        help="Which index level(s) to upgrade or build.",
-    )
-    p_upgrade.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Optional cap on messages to reindex per selected level during execution.",
-    )
-    p_upgrade.add_argument(
-        "--yes",
-        action="store_true",
-        help="Apply the upgrade work. Without this flag, the command only prints a dry-run summary.",
-    )
-    p_upgrade.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit JSON output (default behavior; provided for explicit machine workflows).",
-    )
-
     p_latest = sub.add_parser("latest", help="Show latest messages with safe previews")
     p_latest.add_argument(
         "--limit", type=int, default=10, help="Number of newest messages to return"
@@ -694,7 +666,7 @@ def run_status(conn, cfg) -> dict[str, object]:
             INDEX_LEVEL_FULL: pending_full,
         },
         "policy_drift_vectors": policy_drift,
-        "upgrade_needed": any(int(value or 0) > 0 for value in policy_drift.values()),
+        "action_needed": any(int(value or 0) > 0 for value in policy_drift.values()),
         "latest_message": _latest_message_status(conn),
     }
 
@@ -912,16 +884,8 @@ def run_validate(conn) -> dict:
             "SELECT name FROM sqlite_master WHERE name='sync_cursors'"
         ).fetchone()
         is not None,
-        "message_vectors_table": conn.execute(
-            "SELECT name FROM sqlite_master WHERE name='message_vectors'"
-        ).fetchone()
-        is not None,
         "message_vectors_v2_table": conn.execute(
             "SELECT name FROM sqlite_master WHERE name='message_vectors_v2'"
-        ).fetchone()
-        is not None,
-        "message_chunk_vectors_table": conn.execute(
-            "SELECT name FROM sqlite_master WHERE name='message_chunk_vectors'"
         ).fetchone()
         is not None,
         "message_chunk_vectors_v2_table": conn.execute(
@@ -947,95 +911,6 @@ def run_validate(conn) -> dict:
     }
     checks["ok"] = all(checks.values())
     return checks
-
-
-def _upgrade_levels_selected(raw_level: str) -> list[str]:
-    choice = (raw_level or INDEX_LEVEL_REDACTED).strip().lower()
-    if choice == "all":
-        return [INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL]
-    if choice in {INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL}:
-        return [choice]
-    raise ValueError(f"Unsupported --index-level value: {raw_level}")
-
-
-def _vector_policy_drift_count(conn, *, index_level: str) -> int:
-    return int(
-        conn.execute(
-            """
-            SELECT count(*) FROM vector_index_state_v2
-            WHERE index_level = ? AND COALESCE(redaction_policy_version, '') != ?
-            """,
-            (index_level, REDACTION_POLICY_VERSION),
-        ).fetchone()[0]
-    )
-
-
-def run_upgrade(conn, cfg, *, index_level: str, limit: int | None, apply: bool) -> dict[str, object]:
-    levels = _upgrade_levels_selected(index_level)
-    pre_counts = vector_level_counts(conn)
-    summary_levels: dict[str, dict[str, object]] = {}
-    for level in levels:
-        existing = pre_counts.get(level, {})
-        summary_levels[level] = {
-            "available": level in pre_counts,
-            "message_vectors": int(existing.get("messages", 0)),
-            "chunk_vectors": int(existing.get("chunks", 0)),
-            "pending_vectors": count_pending_vector_updates(conn, cfg, index_level=level),
-            "policy_drift_vectors": _vector_policy_drift_count(conn, index_level=level),
-        }
-
-    dry_run = {
-        "mode": "apply" if apply else "dry-run",
-        "redaction_policy_version": REDACTION_POLICY_VERSION,
-        "selected_levels": levels,
-        "pre_upgrade": {
-            "vector_levels": pre_counts,
-            "levels": summary_levels,
-            "rejected_redaction_entries": int(
-                conn.execute(
-                    "SELECT count(*) FROM redaction_entries WHERE COALESCE(status, 'active') = 'rejected'"
-                ).fetchone()[0]
-            ),
-        },
-        "actions": {
-            "will_prune_invalid_redactions": True,
-            "will_build_full_index": INDEX_LEVEL_FULL in levels,
-            "limit": limit,
-        },
-    }
-    if not apply:
-        dry_run["action_required"] = "Re-run with `upgrade --yes` to apply these changes."
-        return dry_run
-
-    pruned = prune_invalid_redaction_entries(conn)
-    executed: dict[str, object] = {
-        "redaction_entries_pruned": pruned,
-        "levels": {},
-    }
-    for level in levels:
-        executed["levels"][level] = index_vectors(
-            conn,
-            cfg,
-            index_level=level,
-            pending_only=True,
-            limit=limit,
-            progress_callback=_emit_index_progress,
-        )
-
-    return {
-        **dry_run,
-        "executed": executed,
-        "post_upgrade": {
-            "vector_levels": vector_level_counts(conn),
-            "levels": {
-                level: {
-                    "pending_vectors": count_pending_vector_updates(conn, cfg, index_level=level),
-                    "policy_drift_vectors": _vector_policy_drift_count(conn, index_level=level),
-                }
-                for level in levels
-            },
-        },
-    }
 
 
 def _emit_ingest_progress(event: dict) -> None:
@@ -1608,21 +1483,6 @@ def main(argv: list[str] | None = None) -> None:
                         conn,
                         output_file=args.output_file,
                         limit=args.limit,
-                    ),
-                    indent=2,
-                )
-            )
-            return
-
-        if args.command == "upgrade":
-            print(
-                json.dumps(
-                    run_upgrade(
-                        conn,
-                        cfg,
-                        index_level=args.index_level,
-                        limit=args.limit,
-                        apply=bool(args.yes),
                     ),
                     indent=2,
                 )

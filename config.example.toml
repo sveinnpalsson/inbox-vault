@@ -51,12 +51,8 @@ chunk_chars = 1200
 [retrieval]
 # dense | lexical | hybrid
 search_strategy = "hybrid"
-# sqlite | lancedb
-vector_backend = "lancedb"
 # fts5 | none
 lexical_backend = "fts5"
-lancedb_path = "data/lancedb"
-lancedb_table = "message_chunk_vectors"
 rrf_k = 60
 dense_candidate_k = 100
 lexical_candidate_k = 100

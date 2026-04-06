@@ -729,24 +729,3 @@ def test_index_vectors_normalizes_and_trims_text(conn, app_cfg, monkeypatch):
     body_segment = source_text.split("Body: ", 1)[1]
     assert len(body_segment) <= app_cfg.indexing.max_index_chars
 
-
-def test_lancedb_missing_dependency_degrades_cleanly(conn, app_cfg, monkeypatch):
-    app_cfg.retrieval.vector_backend = "lancedb"
-
-    _insert_msg(
-        conn,
-        msg_id="m-lancedb",
-        account="acct@example.com",
-        labels=["INBOX"],
-        subject="alpha",
-        body="body",
-    )
-    conn.commit()
-
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
-    )
-    stats = index_vectors(conn, app_cfg)
-    assert stats["indexed"] == 1
-    assert stats["lancedb_status"] == "disabled:v2-index-levels"
-    assert stats["lancedb_failed"] == 0

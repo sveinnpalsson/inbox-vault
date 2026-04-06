@@ -29,9 +29,11 @@ def test_schema_and_crud_paths(conn):
         "contact_stats",
         "contact_profiles",
         "sync_cursors",
-        "message_vectors",
-        "message_chunk_vectors",
+        "message_vectors_v2",
+        "message_chunk_vectors_v2",
+        "vector_index_state_v2",
         "message_fts",
+        "message_fts_redacted",
     }
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     names = {r[0] for r in rows}

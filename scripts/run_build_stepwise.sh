@@ -260,14 +260,10 @@ categorize_stderr_hint() {
     printf "embedding-call"
   elif [[ "$line" == *"redact"* ]]; then
     printf "redaction"
-  elif [[ "$line" == *"upsert"* || "$line" == *"insert into"* || "$line" == *"delete from message_chunk_vectors"* ]]; then
+  elif [[ "$line" == *"upsert"* || "$line" == *"insert into"* || "$line" == *"delete from message_chunk_vectors_v2"* ]]; then
     printf "db-upsert"
   elif [[ "$line" == *"lock"* || "$line" == *"busy"* || "$line" == *"retry"* ]]; then
     printf "lock-retry"
-  elif [[ "$line" == *"lancedb"* && ( "$line" == *"unavailable"* || "$line" == *"sqlite-only"* || "$line" == *"fallback"* ) ]]; then
-    printf "lancedb-fallback"
-  elif [[ "$line" == *"lancedb"* && "$line" == *"failed"* ]]; then
-    printf "lancedb-upsert-failed"
   elif [[ "$line" == *"parse"* && "$line" == *"failed"* ]]; then
     printf "parse-failure"
   elif [[ "$line" == *"http"* || "$line" == *"status"* || "$line" == *"timeout"* ]]; then
@@ -363,16 +359,15 @@ print_index_batch_summary() {
   local chunks_indexed="$8"
   local lock_retries="$9"
   local lock_errors="${10}"
-  local lancedb_status="${11}"
-  local remaining_pending="${12}"
-  local cumulative_completed="${13}"
+  local remaining_pending="${11}"
+  local cumulative_completed="${12}"
 
   local rate
   local eta
   rate="$(rate_per_min "$cumulative_completed" "$cumulative_elapsed")"
   eta="$(eta_from_progress "$cumulative_completed" "$remaining_pending" "$cumulative_elapsed")"
 
-  emit_progress_line "[index_vectors][batch ${batch_number}] elapsed_batch=$(format_duration "$batch_elapsed") elapsed_total=$(format_duration "$cumulative_elapsed") scanned=${scanned} indexed=${indexed} unchanged=${unchanged} failed=${failed} chunks_indexed=${chunks_indexed} lock_retries=${lock_retries} lock_errors=${lock_errors} lancedb_status=$(truncate_line "$lancedb_status" 60) remaining_pending=${remaining_pending} rate=${rate}/min eta=${eta}"
+  emit_progress_line "[index_vectors][batch ${batch_number}] elapsed_batch=$(format_duration "$batch_elapsed") elapsed_total=$(format_duration "$cumulative_elapsed") scanned=${scanned} indexed=${indexed} unchanged=${unchanged} failed=${failed} chunks_indexed=${chunks_indexed} lock_retries=${lock_retries} lock_errors=${lock_errors} remaining_pending=${remaining_pending} rate=${rate}/min eta=${eta}"
 
   if [[ "$PROGRESS_VERBOSITY" == "detailed" ]]; then
     emit_progress_line "[index_vectors][batch ${batch_number}] last_op=${LAST_CHUNK_OP_HINT} last_hint=$(truncate_line "$LAST_CHUNK_ERR_LINE" 140)"
@@ -1119,19 +1114,18 @@ run_index_vectors_stage() {
     local chunk_chunks_indexed=0
     local chunk_lock_retries=0
     local chunk_lock_errors=0
-    local chunk_lancedb_status="unknown"
-    IFS=$'\t' read -r chunk_scanned chunk_indexed chunk_unchanged chunk_failed chunk_chunks_indexed chunk_lock_retries chunk_lock_errors chunk_lancedb_status < <(python3 - "$chunk_json" <<'PY'
+    IFS=$'\t' read -r chunk_scanned chunk_indexed chunk_unchanged chunk_failed chunk_chunks_indexed chunk_lock_retries chunk_lock_errors < <(python3 - "$chunk_json" <<'PY'
 import json
 import sys
 
 raw = sys.argv[1].strip()
 if not raw:
-    print("0\t0\t0\t0\t0\t0\t0\tunknown")
+    print("0\t0\t0\t0\t0\t0\t0")
     raise SystemExit(0)
 try:
     payload = json.loads(raw)
 except Exception:
-    print("0\t0\t0\t0\t0\t0\t0\tunknown")
+    print("0\t0\t0\t0\t0\t0\t0")
     raise SystemExit(0)
 vals = [
     int(payload.get("scanned", 0) or 0),
@@ -1141,7 +1135,6 @@ vals = [
     int(payload.get("chunks_indexed", 0) or 0),
     int(payload.get("lock_retries", 0) or 0),
     int(payload.get("lock_errors", 0) or 0),
-    str(payload.get("lancedb_status", "unknown") or "unknown").replace("\t", " "),
 ]
 print("\t".join(str(v) for v in vals))
 PY
@@ -1158,7 +1151,7 @@ PY
     local elapsed_seconds=$((now_epoch - stage_started_epoch))
 
     render_progress "$stage" "index vectors (chunk $iteration, limit=$chunk_limit)" "$completed" "$initial_pending" "$elapsed_seconds"
-    print_index_batch_summary "$iteration" "$LAST_CHUNK_ELAPSED" "$elapsed_seconds" "$chunk_scanned" "$chunk_indexed" "$chunk_unchanged" "$chunk_failed" "$chunk_chunks_indexed" "$chunk_lock_retries" "$chunk_lock_errors" "$chunk_lancedb_status" "$current_pending" "$completed"
+    print_index_batch_summary "$iteration" "$LAST_CHUNK_ELAPSED" "$elapsed_seconds" "$chunk_scanned" "$chunk_indexed" "$chunk_unchanged" "$chunk_failed" "$chunk_chunks_indexed" "$chunk_lock_retries" "$chunk_lock_errors" "$current_pending" "$completed"
 
     chunks_json="$(python3 - "$chunks_json" "$iteration" "$chunk_limit" "$chunk_status" "$chunk_indexed" "$current_pending" "$chunk_json" <<'PY'
 import json
@@ -1306,8 +1299,8 @@ summary = {
         "raw_messages": count("SELECT COUNT(*) FROM raw_messages"),
         "message_enrichment": count("SELECT COUNT(*) FROM message_enrichment"),
         "contact_profiles": count("SELECT COUNT(*) FROM contact_profiles"),
-        "message_vectors": count("SELECT COUNT(*) FROM message_vectors"),
-        "message_chunk_vectors": count("SELECT COUNT(*) FROM message_chunk_vectors"),
+        "message_vectors_v2": count("SELECT COUNT(*) FROM message_vectors_v2"),
+        "message_chunk_vectors_v2": count("SELECT COUNT(*) FROM message_chunk_vectors_v2"),
     },
 }
 
@@ -1316,7 +1309,7 @@ out_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 print(
     f"[inspect_summary] messages={summary['counts']['messages']} "
     f"enrichments={summary['counts']['message_enrichment']} "
-    f"vectors={summary['counts']['message_vectors']} chunks={summary['counts']['message_chunk_vectors']}"
+    f"vectors={summary['counts']['message_vectors_v2']} chunks={summary['counts']['message_chunk_vectors_v2']}"
 )
 print(f"[inspect_summary] machine_log={out_path}")
 PY
@@ -1412,7 +1405,7 @@ lines = [
     enrich_status_line,
     "rerun_note: reruns resume from pending-only enrich/index work; no full recompute",
     f"messages={inspect_counts.get('messages', 'n/a')} enrichments={inspect_counts.get('message_enrichment', 'n/a')}",
-    f"vectors={inspect_counts.get('message_vectors', 'n/a')} chunks={inspect_counts.get('message_chunk_vectors', 'n/a')}",
+    f"vectors={inspect_counts.get('message_vectors_v2', 'n/a')} chunks={inspect_counts.get('message_chunk_vectors_v2', 'n/a')}",
     f"logs: {log_dir}",
     f"summary_json: {summary_json}",
 ]
