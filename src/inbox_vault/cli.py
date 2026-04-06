@@ -380,8 +380,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_latest.add_argument(
         "--clearance",
         choices=["redacted", "full"],
-        default="full",
-        help="Return raw previews (full) or regex-redacted previews.",
+        default="redacted",
+        help="Return regex-redacted previews by default; use full for raw previews.",
     )
     p_latest.add_argument(
         "--from-date",

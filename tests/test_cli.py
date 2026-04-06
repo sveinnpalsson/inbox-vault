@@ -1010,7 +1010,7 @@ def test_latest_command_uses_safe_truncated_previews(
             "--max-snippet-chars",
             "14",
             "--max-body-chars",
-            "20",
+            "80",
             "--json",
         ]
     )
@@ -1021,6 +1021,8 @@ def test_latest_command_uses_safe_truncated_previews(
     assert out["messages"][0]["subject"].endswith("...")
     assert out["messages"][0]["snippet"].endswith("...")
     assert out["messages"][0]["body_preview"].endswith("...")
+    assert "alice@example.com" not in out["messages"][0]["body_preview"]
+    assert "[REDACTED_EMAIL]" in out["messages"][0]["body_preview"]
 
 
 def test_latest_supports_date_range_and_clearance_modes(

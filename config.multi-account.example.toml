@@ -7,8 +7,13 @@ password_env = "INBOX_VAULT_DB_PASSWORD"
 
 [gmail]
 query = "newer_than:30d (label:inbox OR label:sent)"
-idle_backfill_query = "label:inbox OR label:sent"
-idle_backfill_limit = 10
+# optional override used by `repair --backfill-limit` historical walk;
+# defaults to gmail.query with time filters (newer_than/after/before/older_than)
+# stripped automatically.
+# idle_backfill_query = "label:inbox OR label:sent"
+# legacy setting retained for compatibility; update no longer performs idle
+# backfill. Prefer explicit `repair --backfill-limit N` runs.
+# idle_backfill_limit = 10
 
 [llm]
 enabled = true

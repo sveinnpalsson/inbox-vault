@@ -58,3 +58,12 @@ def test_editable_install_creates_console_script(tmp_path: Path) -> None:
     )
 
     assert script_path.exists(), f"editable install did not create {script_name}"
+
+    help_result = subprocess.run(
+        [str(script_path), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "privacy-safe defaults" in help_result.stdout
+    assert "update" in help_result.stdout
