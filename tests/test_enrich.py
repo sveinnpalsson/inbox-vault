@@ -259,3 +259,55 @@ def test_enrich_pending_uses_fallback_fill_when_repair_fails(
     assert diagnostics["repair_attempted"] == 2
     assert diagnostics["repair_succeeded"] == 0
     assert diagnostics["fallback_used"] == 1
+
+
+def test_enrich_pending_include_degraded_retries_heuristic_fallback(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    _seed_message(
+        conn,
+        "fallback-repair",
+        subject="Lease renewal",
+        snippet="Please sign and return",
+    )
+    conn.execute(
+        """
+        INSERT INTO message_enrichment (msg_id, category, importance, action, summary, model, enriched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "fallback-repair",
+            "housing",
+            9,
+            "reply",
+            "heuristic summary",
+            "heuristic-fallback",
+            "2026-04-06T20:00:00+00:00",
+        ),
+    )
+    conn.commit()
+
+    monkeypatch.setattr(
+        "inbox_vault.enrich.chat_json",
+        lambda *_args, **_kwargs: {
+            "category": "housing",
+            "importance": 10,
+            "action": "reply",
+            "summary": "LLM repair succeeded",
+        },
+    )
+
+    diagnostics: dict[str, int] = {}
+    updated = enrich_pending(conn, app_cfg, diagnostics=diagnostics, include_degraded=True)
+
+    assert updated == 1
+    row = conn.execute(
+        """
+        SELECT importance, summary, model
+        FROM message_enrichment
+        WHERE msg_id='fallback-repair'
+        """
+    ).fetchone()
+    assert row == (10, "LLM repair succeeded", app_cfg.llm.model)
+    assert diagnostics["attempted"] == 1
+    assert diagnostics["fallback_used"] == 0

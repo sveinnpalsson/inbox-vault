@@ -387,9 +387,11 @@ def test_repair_defaults_run_enrich_and_index(tmp_path: Path, monkeypatch: pytes
     )
 
     enrich_calls = {"count": 0}
+    enrich_kwargs: dict[str, object] = {}
 
-    def fake_enrich(*_args, **_kwargs):
+    def fake_enrich(*_args, **kwargs):
         enrich_calls["count"] += 1
+        enrich_kwargs.update(kwargs)
         return 3
 
     monkeypatch.setattr(cli, "enrich_pending", fake_enrich)
@@ -408,8 +410,10 @@ def test_repair_defaults_run_enrich_and_index(tmp_path: Path, monkeypatch: pytes
     out = json.loads(capsys.readouterr().out)
     assert out["ingest"]["backfill_ingested"] == 1
     assert out["enrich"]["updated"] == 3
+    assert out["enrich"]["repair_scope"] == "pending+heuristic-fallback"
     assert out["index_vectors"]["indexed"] == 2
     assert enrich_calls["count"] == 1
+    assert enrich_kwargs["include_degraded"] is True
     assert captured["pending_only"] is True
 
 
@@ -901,9 +905,53 @@ def test_status_command_reports_counts_and_latest(
 ):
     cfg = tmp_path / "config.toml"
     _write_config(cfg)
+    cfg.write_text(
+        cfg.read_text()
+        + """
+
+[llm]
+enabled = true
+endpoint = "http://llm.test:11434"
+
+[embeddings]
+endpoint = "http://embedding.test:11434"
+""",
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
     _seed_retrieval_data(tmp_path)
+    monkeypatch.setattr(cli, "_endpoint_reachable", lambda url: "embedding" not in url)
+
+    db_path = tmp_path / "test.db"
+    from inbox_vault.db import get_conn
+
+    conn = get_conn(str(db_path), "pw")
+    try:
+        conn.execute(
+            """
+            INSERT INTO message_enrichment (msg_id, category, importance, action, summary, model, enriched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(msg_id) DO UPDATE SET
+              category=excluded.category,
+              importance=excluded.importance,
+              action=excluded.action,
+              summary=excluded.summary,
+              model=excluded.model,
+              enriched_at=excluded.enriched_at
+            """,
+            (
+                "m-old",
+                "billing",
+                4,
+                "review",
+                "heuristic summary",
+                "heuristic-fallback",
+                "2026-04-06T20:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
     monkeypatch.setattr(
         cli,
@@ -918,12 +966,29 @@ def test_status_command_reports_counts_and_latest(
         "messages": 2,
         "message_vectors_v2": 1,
         "chunk_vectors_v2": 1,
-        "enrichments": 1,
+        "enrichments": 2,
         "profiles": 1,
         "active_redaction_entries": 0,
         "rejected_redaction_entries": 0,
     }
     assert out["redaction_policy_version"] == "2026-03-22-precision-1"
+    assert out["endpoint_health"] == {
+        "llm": {
+            "enabled": True,
+            "endpoint": "http://llm.test:11434",
+            "reachable": True,
+        },
+        "embeddings": {
+            "endpoint": "http://embedding.test:11434",
+            "reachable": False,
+        },
+    }
+    assert out["enrichment_status"] == {
+        "pending": 0,
+        "heuristic_fallback": 1,
+        "repairable": 1,
+        "degraded": True,
+    }
     assert out["available_index_levels"] == ["redacted"]
     assert out["full_search_available"] is False
     assert out["vector_level_counts"] == {"redacted": {"messages": 1, "chunks": 1}}

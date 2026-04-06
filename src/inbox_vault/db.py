@@ -491,8 +491,25 @@ def upsert_enrichment(conn, msg_id: str, data: dict[str, Any], model: str):
     )
 
 
-def unenriched_messages(conn, limit: int = 1000):
+def enrichment_repair_candidates(
+    conn,
+    *,
+    limit: int = 1000,
+    include_degraded: bool = False,
+):
     safe_limit = max(1, int(limit))
+    if include_degraded:
+        return conn.execute(
+            """
+            SELECT m.msg_id, m.subject, m.snippet, m.body_text, m.from_addr, m.to_addr, m.date_iso
+            FROM messages m
+            LEFT JOIN message_enrichment e ON e.msg_id = m.msg_id
+            WHERE e.msg_id IS NULL OR COALESCE(e.model, '') = 'heuristic-fallback'
+            ORDER BY COALESCE(m.internal_ts, 0) DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
     return conn.execute(
         """
         SELECT m.msg_id, m.subject, m.snippet, m.body_text, m.from_addr, m.to_addr, m.date_iso
@@ -504,6 +521,10 @@ def unenriched_messages(conn, limit: int = 1000):
         """,
         (safe_limit,),
     ).fetchall()
+
+
+def unenriched_messages(conn, limit: int = 1000):
+    return enrichment_repair_candidates(conn, limit=limit, include_degraded=False)
 
 
 def profile_candidates(conn):

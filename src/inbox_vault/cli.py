@@ -645,9 +645,47 @@ def run_status(conn, cfg) -> dict[str, object]:
         "active_redaction_entries": active_redactions,
         "rejected_redaction_entries": rejected_redactions,
     }
+    pending_enrichments = int(
+        conn.execute(
+            """
+            SELECT count(*)
+            FROM messages m
+            LEFT JOIN message_enrichment e ON e.msg_id = m.msg_id
+            WHERE e.msg_id IS NULL
+            """
+        ).fetchone()[0]
+    )
+    heuristic_fallback_enrichments = int(
+        conn.execute(
+            """
+            SELECT count(*)
+            FROM message_enrichment
+            WHERE COALESCE(model, '') = 'heuristic-fallback'
+            """
+        ).fetchone()[0]
+    )
+    llm_endpoint_reachable = _endpoint_reachable(cfg.llm.endpoint) if cfg.llm.enabled else None
+    embeddings_endpoint_reachable = _endpoint_reachable(cfg.embeddings.endpoint)
     return {
         "counts": counts,
         "redaction_policy_version": REDACTION_POLICY_VERSION,
+        "endpoint_health": {
+            "llm": {
+                "enabled": bool(cfg.llm.enabled),
+                "endpoint": cfg.llm.endpoint,
+                "reachable": llm_endpoint_reachable,
+            },
+            "embeddings": {
+                "endpoint": cfg.embeddings.endpoint,
+                "reachable": embeddings_endpoint_reachable,
+            },
+        },
+        "enrichment_status": {
+            "pending": pending_enrichments,
+            "heuristic_fallback": heuristic_fallback_enrichments,
+            "repairable": pending_enrichments + heuristic_fallback_enrichments,
+            "degraded": heuristic_fallback_enrichments > 0,
+        },
         "available_index_levels": available_levels,
         "full_search_available": full_available,
         "vector_level_counts": level_counts,
@@ -1394,7 +1432,13 @@ def main(argv: list[str] | None = None) -> None:
             if args.enrich:
                 enrich_diag: dict[str, int] = {}
                 out["enrich"] = {
-                    "updated": enrich_pending(conn, cfg, diagnostics=enrich_diag),
+                    "updated": enrich_pending(
+                        conn,
+                        cfg,
+                        diagnostics=enrich_diag,
+                        include_degraded=True,
+                    ),
+                    "repair_scope": "pending+heuristic-fallback",
                     "diagnostics": enrich_diag,
                 }
 

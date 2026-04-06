@@ -7,7 +7,7 @@ from typing import Any
 import requests
 
 from .config import AppConfig
-from .db import unenriched_messages, upsert_enrichment
+from .db import enrichment_repair_candidates, upsert_enrichment
 from .json_contracts import enrich_contract_text, fill_enrich_defaults, validate_enrich_contract
 from .llm import chat_json
 from .prompts import build_enrichment_messages
@@ -166,7 +166,12 @@ def _repair_enrichment_json(
 
 
 def enrich_pending(
-    conn, cfg: AppConfig, limit: int = 200, diagnostics: LLMDiagnostics | None = None
+    conn,
+    cfg: AppConfig,
+    limit: int = 200,
+    diagnostics: LLMDiagnostics | None = None,
+    *,
+    include_degraded: bool = False,
 ) -> int:
     stats = _empty_diag()
     if not cfg.llm.enabled:
@@ -174,7 +179,7 @@ def enrich_pending(
             diagnostics.update(stats)
         return 0
 
-    rows = unenriched_messages(conn, limit=limit)
+    rows = enrichment_repair_candidates(conn, limit=limit, include_degraded=include_degraded)
     count = 0
     for msg_id, subject, snippet, body_text, from_addr, to_addr, date_iso in rows:
         stats["attempted"] += 1
