@@ -75,11 +75,13 @@ Use Inbox Vault directly when you need:
 - first sync / repair / backfill
 - mailbox-specific validation
 - operator-clearance mail inspection
+- concrete mail-side failure examples to feed back into the canonical `llm-vault` benchmark later
 
 Use `llm-vault` when you need:
 - unified retrieval across docs + photos + mail
 - the current OpenClaw-facing safe search/tool surface
 - one redacted-first retrieval layer across sources
+- the canonical redaction benchmark story and quality bar
 
 ## Unified skill note
 
