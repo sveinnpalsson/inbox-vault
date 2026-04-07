@@ -29,9 +29,9 @@ def test_schema_and_crud_paths(conn):
         "contact_stats",
         "contact_profiles",
         "sync_cursors",
-        "message_vectors_v2",
-        "message_chunk_vectors_v2",
-        "vector_index_state_v2",
+        "message_vectors",
+        "message_chunk_vectors",
+        "vector_index_state",
         "message_fts",
         "message_fts_redacted",
     }

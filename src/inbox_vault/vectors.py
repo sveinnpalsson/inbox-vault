@@ -12,20 +12,20 @@ from typing import Any, Callable
 from .config import AppConfig
 from .db import (
     DBLockRetryExhausted,
-    delete_message_chunk_vectors_v2,
-    fetch_chunk_vectors_for_search_v2,
-    fetch_messages_by_ids_v2,
+    delete_message_chunk_vectors,
+    fetch_chunk_vectors_for_search,
+    fetch_messages_by_ids,
     fetch_redaction_entries,
-    fetch_vectors_for_search_v2,
-    get_vector_state_v2,
+    fetch_vectors_for_search,
+    get_vector_state,
     lexical_search_rows,
     lexical_search_rows_redacted,
     prune_invalid_redaction_entries,
-    upsert_message_chunk_vector_v2,
+    upsert_message_chunk_vector,
     upsert_message_fts_redacted,
-    upsert_message_vector_v2,
+    upsert_message_vector,
     upsert_redaction_entries,
-    upsert_vector_state_v2,
+    upsert_vector_state,
     vector_index_source_rows,
     vector_level_counts,
 )
@@ -343,7 +343,7 @@ def _pending_message_ids_for_index(
         )
         source = _compose_source_text(normalized_subject, normalized_snippet, normalized_body)
         expected_hash = _vector_content_hash(source_text=source, index_level=index_level)
-        prior = get_vector_state_v2(conn, msg_id, index_level=index_level)
+        prior = get_vector_state(conn, msg_id, index_level=index_level)
         if not prior or str(prior[0]) != expected_hash or str(prior[1] or "") != REDACTION_POLICY_VERSION:
             pending_msg_ids.append(msg_id)
             if safe_limit is not None and len(pending_msg_ids) >= safe_limit:
@@ -518,7 +518,7 @@ def index_vectors(
         )
         source_text = _compose_source_text(normalized_subject, normalized_snippet, normalized_body)
         fingerprint = _vector_content_hash(source_text=source_text, index_level=chosen_index_level)
-        prior = get_vector_state_v2(conn, msg_id, index_level=chosen_index_level)
+        prior = get_vector_state(conn, msg_id, index_level=chosen_index_level)
         if (
             prior
             and str(prior[0]) == fingerprint
@@ -661,7 +661,7 @@ def index_vectors(
                 continue
 
         try:
-            stats["lock_retries"] += upsert_message_vector_v2(
+            stats["lock_retries"] += upsert_message_vector(
                 conn,
                 msg_id=msg_id,
                 index_level=chosen_index_level,
@@ -685,7 +685,7 @@ def index_vectors(
                 labels=labels,
                 redacted_content=source_text_redacted,
             )
-            stats["lock_retries"] += upsert_vector_state_v2(
+            stats["lock_retries"] += upsert_vector_state(
                 conn,
                 msg_id=msg_id,
                 index_level=chosen_index_level,
@@ -715,7 +715,7 @@ def index_vectors(
                 )
             continue
         try:
-            stats["lock_retries"] += delete_message_chunk_vectors_v2(
+            stats["lock_retries"] += delete_message_chunk_vectors(
                 conn,
                 msg_id=msg_id,
                 index_level=chosen_index_level,
@@ -792,7 +792,7 @@ def index_vectors(
                 index_level=chosen_index_level,
             )
             try:
-                stats["lock_retries"] += upsert_message_chunk_vector_v2(
+                stats["lock_retries"] += upsert_message_chunk_vector(
                     conn,
                     chunk_id=chunk.chunk_id,
                     index_level=chosen_index_level,
@@ -892,7 +892,7 @@ def _aggregate_chunk_candidates(
     if not chunks:
         return []
 
-    msg_rows = fetch_messages_by_ids_v2(conn, [item.msg_id for item in chunks], index_level=index_level)
+    msg_rows = fetch_messages_by_ids(conn, [item.msg_id for item in chunks], index_level=index_level)
     buckets: dict[str, dict[str, Any]] = {}
 
     for rank, chunk in enumerate(chunks, start=1):
@@ -969,7 +969,7 @@ def _dense_candidates(
 
     chunk_limit = max(1, int(cfg.retrieval.dense_candidate_k))
 
-    chunk_rows = fetch_chunk_vectors_for_search_v2(
+    chunk_rows = fetch_chunk_vectors_for_search(
         conn,
         index_level=index_level,
         account_email=account_email,
@@ -1022,7 +1022,7 @@ def _dense_candidates(
             from_ts_ms=from_ts_ms,
             to_ts_ms=to_ts_ms,
         )
-    rows = fetch_vectors_for_search_v2(
+    rows = fetch_vectors_for_search(
         conn,
         index_level=index_level,
         account_email=account_email,

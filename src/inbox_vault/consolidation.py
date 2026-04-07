@@ -104,11 +104,11 @@ def _build_inspect_summary(conn, *, sample_limit: int = 10) -> dict:
             conn.execute("SELECT count(*) FROM message_enrichment").fetchone()[0]
         ),
         "profiles": int(conn.execute("SELECT count(*) FROM contact_profiles").fetchone()[0]),
-        "message_vectors_v2": int(
-            conn.execute("SELECT count(*) FROM message_vectors_v2").fetchone()[0]
+        "message_vectors": int(
+            conn.execute("SELECT count(*) FROM message_vectors").fetchone()[0]
         ),
-        "chunk_vectors_v2": int(
-            conn.execute("SELECT count(*) FROM message_chunk_vectors_v2").fetchone()[0]
+        "message_chunk_vectors": int(
+            conn.execute("SELECT count(*) FROM message_chunk_vectors").fetchone()[0]
         ),
     }
 

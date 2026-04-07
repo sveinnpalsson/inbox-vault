@@ -816,7 +816,7 @@ def _seed_retrieval_data(tmp_path: Path):
             ),
         )
         conn.execute(
-            "INSERT INTO message_vectors_v2 (msg_id, index_level, account_email, thread_id, labels_json, source_text, source_text_redacted, embedding_json, embedding_dim, embedding_model, content_hash, redaction_policy_version, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO message_vectors (msg_id, index_level, account_email, thread_id, labels_json, source_text, source_text_redacted, embedding_json, embedding_dim, embedding_model, content_hash, redaction_policy_version, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "m-new",
                 "redacted",
@@ -834,7 +834,7 @@ def _seed_retrieval_data(tmp_path: Path):
             ),
         )
         conn.execute(
-            "INSERT INTO message_chunk_vectors_v2 (chunk_id, index_level, msg_id, account_email, thread_id, labels_json, chunk_index, chunk_type, chunk_start, chunk_end, chunk_text, chunk_text_redacted, embedding_json, embedding_dim, embedding_model, content_hash, redaction_policy_version, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO message_chunk_vectors (chunk_id, index_level, msg_id, account_email, thread_id, labels_json, chunk_index, chunk_type, chunk_start, chunk_end, chunk_text, chunk_text_redacted, embedding_json, embedding_dim, embedding_model, content_hash, redaction_policy_version, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "c1",
                 "redacted",
@@ -857,7 +857,7 @@ def _seed_retrieval_data(tmp_path: Path):
             ),
         )
         conn.execute(
-            "INSERT INTO vector_index_state_v2 (msg_id, index_level, content_hash, redaction_policy_version, updated_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO vector_index_state (msg_id, index_level, content_hash, redaction_policy_version, updated_at) VALUES (?, ?, ?, ?, ?)",
             (
                 "m-new",
                 "redacted",
@@ -964,8 +964,8 @@ endpoint = "http://embedding.test:11434"
 
     assert out["counts"] == {
         "messages": 2,
-        "message_vectors_v2": 1,
-        "chunk_vectors_v2": 1,
+        "message_vectors": 1,
+        "message_chunk_vectors": 1,
         "enrichments": 2,
         "profiles": 1,
         "active_redaction_entries": 0,

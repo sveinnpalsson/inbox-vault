@@ -14,7 +14,6 @@ from .redaction import REDACTION_POLICY_VERSION, is_redaction_value_allowed
 class DBLockRetryExhausted(RuntimeError):
     """Raised when sqlite lock retries are exhausted for a write operation."""
 
-
 def _is_lock_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "locked" in message or "busy" in message
@@ -160,7 +159,7 @@ def get_conn(db_path: str, password: str):
           tokenize='unicode61 remove_diacritics 2'
         );
 
-        CREATE TABLE IF NOT EXISTS message_vectors_v2 (
+        CREATE TABLE IF NOT EXISTS message_vectors (
           msg_id TEXT NOT NULL REFERENCES messages(msg_id) ON DELETE CASCADE,
           index_level TEXT NOT NULL,
           account_email TEXT NOT NULL,
@@ -177,7 +176,7 @@ def get_conn(db_path: str, password: str):
           PRIMARY KEY (msg_id, index_level)
         );
 
-        CREATE TABLE IF NOT EXISTS message_chunk_vectors_v2 (
+        CREATE TABLE IF NOT EXISTS message_chunk_vectors (
           chunk_id TEXT NOT NULL,
           index_level TEXT NOT NULL,
           msg_id TEXT NOT NULL REFERENCES messages(msg_id) ON DELETE CASCADE,
@@ -199,7 +198,7 @@ def get_conn(db_path: str, password: str):
           PRIMARY KEY (chunk_id, index_level)
         );
 
-        CREATE TABLE IF NOT EXISTS vector_index_state_v2 (
+        CREATE TABLE IF NOT EXISTS vector_index_state (
           msg_id TEXT NOT NULL REFERENCES messages(msg_id) ON DELETE CASCADE,
           index_level TEXT NOT NULL,
           content_hash TEXT NOT NULL,
@@ -220,10 +219,10 @@ def get_conn(db_path: str, password: str):
         CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_email);
         CREATE INDEX IF NOT EXISTS idx_redaction_scope ON redaction_entries(scope_type, scope_id);
         CREATE INDEX IF NOT EXISTS idx_redaction_placeholder ON redaction_entries(scope_type, scope_id, placeholder);
-        CREATE INDEX IF NOT EXISTS idx_vectors_v2_account ON message_vectors_v2(account_email, index_level);
-        CREATE INDEX IF NOT EXISTS idx_chunk_vectors_v2_msg ON message_chunk_vectors_v2(msg_id, index_level);
-        CREATE INDEX IF NOT EXISTS idx_chunk_vectors_v2_account ON message_chunk_vectors_v2(account_email, index_level);
-        CREATE INDEX IF NOT EXISTS idx_vector_state_v2_level ON vector_index_state_v2(index_level);
+        CREATE INDEX IF NOT EXISTS idx_vectors_account ON message_vectors(account_email, index_level);
+        CREATE INDEX IF NOT EXISTS idx_chunk_vectors_msg ON message_chunk_vectors(msg_id, index_level);
+        CREATE INDEX IF NOT EXISTS idx_chunk_vectors_account ON message_chunk_vectors(account_email, index_level);
+        CREATE INDEX IF NOT EXISTS idx_vector_state_level ON vector_index_state(index_level);
         """
     )
 
@@ -593,18 +592,18 @@ def vector_index_source_rows(conn, *, account_email: str | None = None, limit: i
     return conn.execute(sql, params).fetchall()
 
 
-def get_vector_state_v2(conn, msg_id: str, *, index_level: str):
+def get_vector_state(conn, msg_id: str, *, index_level: str):
     return conn.execute(
         """
         SELECT content_hash, redaction_policy_version
-        FROM vector_index_state_v2
+        FROM vector_index_state
         WHERE msg_id = ? AND index_level = ?
         """,
         (msg_id, index_level),
     ).fetchone()
 
 
-def upsert_message_vector_v2(
+def upsert_message_vector(
     conn,
     *,
     msg_id: str,
@@ -624,7 +623,7 @@ def upsert_message_vector_v2(
     _, retries_used = _run_with_lock_retry(
         lambda: conn.execute(
             """
-            INSERT INTO message_vectors_v2 (
+            INSERT INTO message_vectors (
               msg_id, index_level, account_email, thread_id, labels_json, source_text, source_text_redacted,
               embedding_json, embedding_dim, embedding_model, content_hash, redaction_policy_version, updated_at
             )
@@ -658,14 +657,14 @@ def upsert_message_vector_v2(
                 utc_now(),
             ),
         ),
-        op_name="upsert_message_vector_v2",
+        op_name="upsert_message_vector",
         max_retries=lock_max_retries,
         backoff_base_seconds=lock_backoff_base_seconds,
     )
     return retries_used
 
 
-def delete_message_chunk_vectors_v2(
+def delete_message_chunk_vectors(
     conn,
     *,
     msg_id: str,
@@ -675,17 +674,17 @@ def delete_message_chunk_vectors_v2(
 ) -> int:
     _, retries_used = _run_with_lock_retry(
         lambda: conn.execute(
-            "DELETE FROM message_chunk_vectors_v2 WHERE msg_id = ? AND index_level = ?",
+            "DELETE FROM message_chunk_vectors WHERE msg_id = ? AND index_level = ?",
             (msg_id, index_level),
         ),
-        op_name="delete_message_chunk_vectors_v2",
+        op_name="delete_message_chunk_vectors",
         max_retries=lock_max_retries,
         backoff_base_seconds=lock_backoff_base_seconds,
     )
     return retries_used
 
 
-def upsert_message_chunk_vector_v2(
+def upsert_message_chunk_vector(
     conn,
     *,
     chunk_id: str,
@@ -710,7 +709,7 @@ def upsert_message_chunk_vector_v2(
     _, retries_used = _run_with_lock_retry(
         lambda: conn.execute(
             """
-            INSERT INTO message_chunk_vectors_v2 (
+            INSERT INTO message_chunk_vectors (
               chunk_id, index_level, msg_id, account_email, thread_id, labels_json,
               chunk_index, chunk_type, chunk_start, chunk_end,
               chunk_text, chunk_text_redacted,
@@ -756,14 +755,14 @@ def upsert_message_chunk_vector_v2(
                 utc_now(),
             ),
         ),
-        op_name="upsert_message_chunk_vector_v2",
+        op_name="upsert_message_chunk_vector",
         max_retries=lock_max_retries,
         backoff_base_seconds=lock_backoff_base_seconds,
     )
     return retries_used
 
 
-def upsert_vector_state_v2(
+def upsert_vector_state(
     conn,
     *,
     msg_id: str,
@@ -776,7 +775,7 @@ def upsert_vector_state_v2(
     _, retries_used = _run_with_lock_retry(
         lambda: conn.execute(
             """
-            INSERT INTO vector_index_state_v2 (
+            INSERT INTO vector_index_state (
               msg_id, index_level, content_hash, redaction_policy_version, updated_at
             )
             VALUES (?, ?, ?, ?, ?)
@@ -787,7 +786,7 @@ def upsert_vector_state_v2(
             """,
             (msg_id, index_level, content_hash, redaction_policy_version, utc_now()),
         ),
-        op_name="upsert_vector_state_v2",
+        op_name="upsert_vector_state",
         max_retries=lock_max_retries,
         backoff_base_seconds=lock_backoff_base_seconds,
     )
@@ -963,7 +962,7 @@ def unredact_with_scope(
     return out
 
 
-def fetch_chunk_vectors_for_search_v2(
+def fetch_chunk_vectors_for_search(
     conn,
     *,
     index_level: str,
@@ -975,7 +974,7 @@ def fetch_chunk_vectors_for_search_v2(
     sql = (
         "SELECT c.chunk_id, c.msg_id, c.account_email, c.thread_id, c.labels_json, c.chunk_index, "
         "c.chunk_type, c.chunk_start, c.chunk_end, c.chunk_text, c.chunk_text_redacted, c.embedding_json, "
-        "c.embedding_model FROM message_chunk_vectors_v2 c "
+        "c.embedding_model FROM message_chunk_vectors c "
         "JOIN messages m ON m.msg_id = c.msg_id"
     )
     params: list[Any] = []
@@ -1004,7 +1003,7 @@ def fetch_chunk_vectors_for_search_v2(
     return filtered
 
 
-def fetch_vectors_for_search_v2(
+def fetch_vectors_for_search(
     conn,
     *,
     index_level: str,
@@ -1015,7 +1014,7 @@ def fetch_vectors_for_search_v2(
 ):
     sql = (
         "SELECT v.msg_id, v.account_email, v.thread_id, v.labels_json, v.source_text, v.source_text_redacted, "
-        "v.embedding_json, v.embedding_model FROM message_vectors_v2 v "
+        "v.embedding_json, v.embedding_model FROM message_vectors v "
         "JOIN messages m ON m.msg_id = v.msg_id"
     )
     params: list[Any] = []
@@ -1044,7 +1043,7 @@ def fetch_vectors_for_search_v2(
     return filtered
 
 
-def fetch_messages_by_ids_v2(conn, msg_ids: list[str], *, index_level: str):
+def fetch_messages_by_ids(conn, msg_ids: list[str], *, index_level: str):
     if not msg_ids:
         return {}
     placeholders = ",".join("?" for _ in msg_ids)
@@ -1062,7 +1061,7 @@ def fetch_messages_by_ids_v2(conn, msg_ids: list[str], *, index_level: str):
           v.source_text,
           v.source_text_redacted
         FROM messages m
-        LEFT JOIN message_vectors_v2 v ON v.msg_id = m.msg_id AND v.index_level = ?
+        LEFT JOIN message_vectors v ON v.msg_id = m.msg_id AND v.index_level = ?
         WHERE m.msg_id IN ({placeholders})
         """,
         [index_level, *msg_ids],
@@ -1073,11 +1072,11 @@ def fetch_messages_by_ids_v2(conn, msg_ids: list[str], *, index_level: str):
 def vector_level_counts(conn) -> dict[str, dict[str, int]]:
     counts: dict[str, dict[str, int]] = {}
     for level, n in conn.execute(
-        "SELECT index_level, COUNT(*) FROM message_vectors_v2 GROUP BY index_level ORDER BY index_level"
+        "SELECT index_level, COUNT(*) FROM message_vectors GROUP BY index_level ORDER BY index_level"
     ).fetchall():
         counts.setdefault(str(level), {})["messages"] = int(n)
     for level, n in conn.execute(
-        "SELECT index_level, COUNT(*) FROM message_chunk_vectors_v2 GROUP BY index_level ORDER BY index_level"
+        "SELECT index_level, COUNT(*) FROM message_chunk_vectors GROUP BY index_level ORDER BY index_level"
     ).fetchall():
         counts.setdefault(str(level), {})["chunks"] = int(n)
     return counts

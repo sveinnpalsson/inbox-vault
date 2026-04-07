@@ -354,7 +354,7 @@ def test_index_vectors_lock_exhaustion_marks_failed(conn, app_cfg, monkeypatch):
         "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
     )
     monkeypatch.setattr(
-        "inbox_vault.vectors.upsert_message_vector_v2",
+        "inbox_vault.vectors.upsert_message_vector",
         lambda *_a, **_k: (_ for _ in ()).throw(DBLockRetryExhausted("forced")),
     )
 
@@ -389,7 +389,7 @@ def test_index_vectors_commits_incrementally_by_default(conn, app_cfg, monkeypat
 
     from inbox_vault import vectors as vectors_mod
 
-    original_upsert = vectors_mod.upsert_message_vector_v2
+    original_upsert = vectors_mod.upsert_message_vector
     seen_msg_ids: list[str] = []
 
     def interrupt_on_second(*args, **kwargs):
@@ -399,7 +399,7 @@ def test_index_vectors_commits_incrementally_by_default(conn, app_cfg, monkeypat
             raise KeyboardInterrupt("simulated interruption")
         return original_upsert(*args, **kwargs)
 
-    monkeypatch.setattr("inbox_vault.vectors.upsert_message_vector_v2", interrupt_on_second)
+    monkeypatch.setattr("inbox_vault.vectors.upsert_message_vector", interrupt_on_second)
 
     try:
         index_vectors(conn, app_cfg)
@@ -412,7 +412,7 @@ def test_index_vectors_commits_incrementally_by_default(conn, app_cfg, monkeypat
     committed_ids = {
         row[0]
         for row in conn.execute(
-            "SELECT msg_id FROM message_vectors_v2 WHERE index_level = ? AND msg_id LIKE 'm-commit-%'",
+            "SELECT msg_id FROM message_vectors WHERE index_level = ? AND msg_id LIKE 'm-commit-%'",
             (INDEX_LEVEL_REDACTED,),
         ).fetchall()
     }
@@ -637,7 +637,7 @@ def test_chunk_indexing_with_overlap_and_message_aggregation(conn, app_cfg, monk
     rows = conn.execute(
         """
         SELECT chunk_index, chunk_start, chunk_end, chunk_type
-        FROM message_chunk_vectors_v2
+        FROM message_chunk_vectors
         WHERE msg_id = 'm-chunks' AND index_level = ?
         ORDER BY chunk_index
         """,
@@ -719,7 +719,7 @@ def test_index_vectors_normalizes_and_trims_text(conn, app_cfg, monkeypatch):
     assert stats["indexed"] == 1
 
     source_text = conn.execute(
-        "SELECT source_text FROM message_vectors_v2 WHERE msg_id = ? AND index_level = ?",
+        "SELECT source_text FROM message_vectors WHERE msg_id = ? AND index_level = ?",
         ("m-normalize", INDEX_LEVEL_REDACTED),
     ).fetchone()[0]
     assert "\u200b" not in source_text
@@ -728,4 +728,3 @@ def test_index_vectors_normalizes_and_trims_text(conn, app_cfg, monkeypatch):
 
     body_segment = source_text.split("Body: ", 1)[1]
     assert len(body_segment) <= app_cfg.indexing.max_index_chars
-

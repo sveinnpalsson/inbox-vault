@@ -260,7 +260,7 @@ categorize_stderr_hint() {
     printf "embedding-call"
   elif [[ "$line" == *"redact"* ]]; then
     printf "redaction"
-  elif [[ "$line" == *"upsert"* || "$line" == *"insert into"* || "$line" == *"delete from message_chunk_vectors_v2"* ]]; then
+  elif [[ "$line" == *"upsert"* || "$line" == *"insert into"* || "$line" == *"delete from message_chunk_vectors"* ]]; then
     printf "db-upsert"
   elif [[ "$line" == *"lock"* || "$line" == *"busy"* || "$line" == *"retry"* ]]; then
     printf "lock-retry"
@@ -1299,8 +1299,8 @@ summary = {
         "raw_messages": count("SELECT COUNT(*) FROM raw_messages"),
         "message_enrichment": count("SELECT COUNT(*) FROM message_enrichment"),
         "contact_profiles": count("SELECT COUNT(*) FROM contact_profiles"),
-        "message_vectors_v2": count("SELECT COUNT(*) FROM message_vectors_v2"),
-        "message_chunk_vectors_v2": count("SELECT COUNT(*) FROM message_chunk_vectors_v2"),
+        "message_vectors": count("SELECT COUNT(*) FROM message_vectors"),
+        "message_chunk_vectors": count("SELECT COUNT(*) FROM message_chunk_vectors"),
     },
 }
 
@@ -1309,7 +1309,7 @@ out_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 print(
     f"[inspect_summary] messages={summary['counts']['messages']} "
     f"enrichments={summary['counts']['message_enrichment']} "
-    f"vectors={summary['counts']['message_vectors_v2']} chunks={summary['counts']['message_chunk_vectors_v2']}"
+    f"vectors={summary['counts']['message_vectors']} chunks={summary['counts']['message_chunk_vectors']}"
 )
 print(f"[inspect_summary] machine_log={out_path}")
 PY
@@ -1405,7 +1405,7 @@ lines = [
     enrich_status_line,
     "rerun_note: reruns resume from pending-only enrich/index work; no full recompute",
     f"messages={inspect_counts.get('messages', 'n/a')} enrichments={inspect_counts.get('message_enrichment', 'n/a')}",
-    f"vectors={inspect_counts.get('message_vectors_v2', 'n/a')} chunks={inspect_counts.get('message_chunk_vectors_v2', 'n/a')}",
+    f"vectors={inspect_counts.get('message_vectors', 'n/a')} chunks={inspect_counts.get('message_chunk_vectors', 'n/a')}",
     f"logs: {log_dir}",
     f"summary_json: {summary_json}",
 ]

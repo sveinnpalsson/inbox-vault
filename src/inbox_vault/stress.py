@@ -33,12 +33,12 @@ def _run_validate(conn) -> dict:
             "SELECT name FROM sqlite_master WHERE name='sync_cursors'"
         ).fetchone()
         is not None,
-        "message_vectors_v2_table": conn.execute(
-            "SELECT name FROM sqlite_master WHERE name='message_vectors_v2'"
+        "message_vectors_table": conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='message_vectors'"
         ).fetchone()
         is not None,
-        "message_chunk_vectors_v2_table": conn.execute(
-            "SELECT name FROM sqlite_master WHERE name='message_chunk_vectors_v2'"
+        "message_chunk_vectors_table": conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='message_chunk_vectors'"
         ).fetchone()
         is not None,
         "message_fts_table": conn.execute(
@@ -106,11 +106,11 @@ def _db_counts(conn) -> dict[str, int]:
             conn.execute("SELECT count(*) FROM message_enrichment").fetchone()[0]
         ),
         "profiles": int(conn.execute("SELECT count(*) FROM contact_profiles").fetchone()[0]),
-        "message_vectors_v2": int(
-            conn.execute("SELECT count(*) FROM message_vectors_v2").fetchone()[0]
+        "message_vectors": int(
+            conn.execute("SELECT count(*) FROM message_vectors").fetchone()[0]
         ),
-        "chunk_vectors_v2": int(
-            conn.execute("SELECT count(*) FROM message_chunk_vectors_v2").fetchone()[0]
+        "message_chunk_vectors": int(
+            conn.execute("SELECT count(*) FROM message_chunk_vectors").fetchone()[0]
         ),
     }
 
