@@ -212,10 +212,10 @@ Scripts auto-resolve the repo path from their location. Override with `INBOX_VAU
 
 Inbox Vault is the **mail ingestion and encrypted storage layer**. `llm-vault` can consume mail through a **read-only bridge** to the Inbox Vault database; Inbox Vault itself does **not** currently ship a separate OpenClaw plugin/tool package for autonomous agent use.
 
-Redaction/evaluation ownership for the combined stack is intentionally split like this:
+Redaction/evaluation ownership for the combined stack is split like this:
 
-- `llm-vault` owns the canonical redaction contract, benchmark harness, and reportable quality claims
-- Inbox Vault applies that contract to mail data and can keep mail-specific validation, but should not grow a second competing benchmark story
+- `llm-vault` owns the canonical redaction contract, benchmark harness, and published quality claims
+- Inbox Vault applies that contract to mail data and can keep mail-specific validation, but should not grow a second competing benchmark track
 
 Straight-line flow:
 1. install Inbox Vault and run a first successful `inbox-vault update`
@@ -242,8 +242,8 @@ Inbox Vault can participate in a shared operator surface across Gmail + docs + p
 
 Current boundary:
 - the canonical unified skill currently lives in the `llm-vault` repo
-- some local/operator deployments mirror that skill into `inbox-vault`
-- a clean `inbox-vault` clone should not assume the mirror is present unless you add it intentionally
+- some deployments mirror that skill into `inbox-vault`
+- a fresh `inbox-vault` clone should assume the mirror is absent unless you install it intentionally
 
 Examples:
 
