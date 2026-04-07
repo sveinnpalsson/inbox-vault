@@ -212,6 +212,11 @@ Scripts auto-resolve the repo path from their location. Override with `INBOX_VAU
 
 Inbox Vault is the **mail ingestion and encrypted storage layer**. `llm-vault` can consume mail through a **read-only bridge** to the Inbox Vault database; Inbox Vault itself does **not** currently ship a separate OpenClaw plugin/tool package for autonomous agent use.
 
+Redaction/evaluation ownership for the combined stack is intentionally split like this:
+
+- `llm-vault` owns the canonical redaction contract, benchmark harness, and reportable quality claims
+- Inbox Vault applies that contract to mail data and can keep mail-specific validation, but should not grow a second competing benchmark story
+
 Straight-line flow:
 1. install Inbox Vault and run a first successful `inbox-vault update`
 2. confirm local mail retrieval works (`inbox-vault status --json`, `inbox-vault search ...`)

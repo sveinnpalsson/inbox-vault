@@ -7,6 +7,7 @@ Use Inbox Vault when you want Gmail sync, encrypted local mail storage, and mail
 - **Inbox Vault** owns Gmail auth, sync, repair, local enrichment, and the encrypted mail database.
 - **`llm-vault`** reads from Inbox Vault through a **read-only mail bridge**.
 - Inbox Vault does **not** currently ship its own OpenClaw plugin/tool surface for autonomous agents. For agent-facing mail retrieval, prefer the safe surface exposed by `llm-vault`.
+- **`llm-vault`** is also the canonical owner of the shared redaction contract and benchmark story. Inbox Vault should keep mail-specific validation, but not a separate competing benchmark track.
 
 ## Straight-line setup
 

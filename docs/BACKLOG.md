@@ -7,6 +7,6 @@
 ## Up next
 
 - Add offline prompt-eval fixtures (gold JSON outputs + adversarial malformed outputs) and regression scoring for enrichment/profile contracts.
-- Evaluate redaction leakage/over-redaction tradeoff with labeled test set across regex/model/hybrid modes.
+- Validate mail-specific leakage/over-redaction tradeoff against the canonical `llm-vault` redaction contract and benchmark harness instead of creating a separate benchmark program here.
 - Add optional chunk-level lexical index for long-message phrase recall beyond message-level FTS.
 - Consider storing chunk-level provenance in search output when `--clearance full` is requested.
