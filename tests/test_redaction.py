@@ -73,7 +73,11 @@ def test_redaction_value_validator_rejects_common_false_positives():
 
 def test_redaction_value_validator_rejects_custom_and_accepts_valid_entities():
     assert is_redaction_value_allowed("CUSTOM", "Project Delta") is False
+    assert is_redaction_value_allowed("CUSTOM", "amy_doe") is True
+    assert is_redaction_value_allowed("CUSTOM", "neo-43CU") is True
+    assert is_redaction_value_allowed("CUSTOM", "Agent1") is False
     assert is_redaction_value_allowed("EMAIL", "alice@example.com") is True
     assert is_redaction_value_allowed("PHONE", "+1 (617) 555-1212") is True
     assert is_redaction_value_allowed("PERSON", "Alice Johnson") is True
+    assert is_redaction_value_allowed("PERSON", "Tempobono", source_text='Last Name: "Tempobono"') is True
     assert is_redaction_value_allowed("ADDRESS", "123 Main Street") is True

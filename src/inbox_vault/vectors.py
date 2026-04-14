@@ -624,17 +624,17 @@ def index_vectors(
                 )
             continue
 
-        if redaction_result.inserted_entries:
+        if redaction_result.persisted_entries:
             try:
                 stats["lock_retries"] += upsert_redaction_entries(
                     conn,
                     scope_type="account",
                     scope_id=acct,
-                    entries=redaction_result.inserted_entries,
+                    entries=redaction_result.persisted_entries,
                     lock_max_retries=lock_max_retries,
                     lock_backoff_base_seconds=lock_backoff_base_seconds,
                 )
-                stats["redaction_entries_added"] += len(redaction_result.inserted_entries)
+                stats["redaction_entries_added"] += len(redaction_result.persisted_entries)
             except DBLockRetryExhausted as exc:
                 LOG.error(
                     "Redaction table write lock retries exhausted for message_id=%s: %s",

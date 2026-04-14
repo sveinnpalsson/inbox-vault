@@ -33,12 +33,12 @@ The pipeline has clear stages: **sync** (Gmail API to encrypted DB), **process**
 
 ![Redaction pipeline](docs/assets/redaction-architecture.png)
 
-The redaction system uses a **persistent map** that assigns stable placeholders to detected entities. The same email address always maps to the same `<REDACTED_EMAIL_A>` token across chunks and documents (coreference preservation). The map is stored in the encrypted database and supports authorized reverse lookup for operators who need full clearance.
+The redaction system uses a **persistent map** that assigns stable placeholders to detected entities. The same email address always maps to the same `<REDACTED_EMAIL_A>` token across chunks and documents (coreference preservation). The encrypted database stores only the stricter persistable subset of detections; runtime redaction can still apply narrower context-backed values without promoting every one of them into the long-lived map.
 
 Three detection modes are configurable per deployment:
 - **Regex** -- fast, deterministic pattern matching for emails, phones, URLs, account numbers
 - **LLM** -- contextual detection via local model, catches PII that patterns miss
-- **Hybrid** -- runs LLM first, then regex as a safety net
+- **Hybrid** -- combines contextual model detection with regex coverage and keeps regex as a final safety net
 
 ## Who is this for
 

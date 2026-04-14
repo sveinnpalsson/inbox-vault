@@ -8,7 +8,10 @@ from typing import Any
 
 from sqlcipher3 import dbapi2 as sqlite
 
-from .redaction import REDACTION_POLICY_VERSION, is_redaction_value_allowed
+from .redaction import (
+    REDACTION_POLICY_VERSION,
+    is_persistent_redaction_value_allowed,
+)
 
 
 class DBLockRetryExhausted(RuntimeError):
@@ -814,7 +817,7 @@ def fetch_redaction_entries(
         placeholder = str(row[1])
         value_norm = str(row[2])
         original_value = str(row[3])
-        if not is_redaction_value_allowed(key_name, original_value):
+        if not is_persistent_redaction_value_allowed(key_name, original_value):
             continue
         out.append((key_name, placeholder, value_norm, original_value))
     return out
@@ -839,7 +842,7 @@ def prune_invalid_redaction_entries(
     invalid_ids = [
         int(row[0])
         for row in rows
-        if not is_redaction_value_allowed(str(row[1]), str(row[2]))
+        if not is_persistent_redaction_value_allowed(str(row[1]), str(row[2]))
     ]
     if not invalid_ids:
         return 0
@@ -875,7 +878,7 @@ def upsert_redaction_entries(
     sanitized_entries = [
         entry
         for entry in entries
-        if is_redaction_value_allowed(
+        if is_persistent_redaction_value_allowed(
             str(entry.get("key_name") or ""),
             str(entry.get("original_value") or ""),
         )
@@ -956,7 +959,7 @@ def unredact_with_scope(
     ).fetchall()
     out = text
     for key_name, placeholder, original_value in rows:
-        if not is_redaction_value_allowed(str(key_name), str(original_value)):
+        if not is_persistent_redaction_value_allowed(str(key_name), str(original_value)):
             continue
         out = out.replace(str(placeholder), str(original_value))
     return out
