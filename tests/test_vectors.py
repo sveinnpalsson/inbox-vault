@@ -537,6 +537,7 @@ def test_index_vectors_model_mode_uses_redaction_overrides(conn, app_cfg, monkey
         source_text_redacted = "MODEL_REDACTED::source"
         chunk_text_redacted = ["MODEL_REDACTED::chunk"]
         inserted_entries = []
+        persisted_entries = []
 
     def fake_redact_pipeline(source_text: str, **kwargs):
         captured["mode"] = kwargs["mode"]
@@ -588,6 +589,7 @@ def test_index_vectors_uses_single_combined_redaction_pass_per_message(conn, app
         def __init__(self, chunk_count: int):
             self.chunk_text_redacted = ["REDACTED"] * chunk_count
             self.inserted_entries = []
+            self.persisted_entries = []
 
     def fake_pipeline(_source_text: str, **kwargs):
         calls["count"] += 1

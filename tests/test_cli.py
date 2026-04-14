@@ -971,7 +971,7 @@ endpoint = "http://embedding.test:11434"
         "active_redaction_entries": 0,
         "rejected_redaction_entries": 0,
     }
-    assert out["redaction_policy_version"] == "2026-03-22-precision-1"
+    assert out["redaction_policy_version"] == "2026-03-22-precision-2"
     assert out["endpoint_health"] == {
         "llm": {
             "enabled": True,
@@ -993,8 +993,8 @@ endpoint = "http://embedding.test:11434"
     assert out["full_search_available"] is False
     assert out["vector_level_counts"] == {"redacted": {"messages": 1, "chunks": 1}}
     assert out["pending_vectors"] == {"redacted": 4, "full": None}
-    assert out["policy_drift_vectors"] == {"redacted": 0}
-    assert out["action_needed"] is False
+    assert out["policy_drift_vectors"] == {"redacted": 1}
+    assert out["action_needed"] is True
     assert out["latest_message"]["msg_id"] == "m-new"
     assert out["latest_message"]["freshness_seconds"] is not None
 
