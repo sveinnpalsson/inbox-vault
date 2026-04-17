@@ -85,29 +85,35 @@ def _persist_observe_only_triage(
     rec: dict[str, Any],
     raw_payload: dict[str, Any],
 ) -> None:
-    if not cfg.ingest_triage.enabled or cfg.ingest_triage.mode != "observe":
+    if not cfg.ingest_triage.enabled:
         return
     provisional = derive_ingest_triage(rec, raw_payload=raw_payload)
-    triage = derive_ingest_triage(
+    proposal = derive_ingest_triage(
         rec,
         raw_payload=raw_payload,
         prior_observation_count=get_stream_observation_count(conn, provisional.stream_id),
     )
+    applied_tier = "full"
+    if cfg.ingest_triage.mode == "enforce" and proposal.triage_tier != "full":
+        applied_tier = "light"
     upsert_message_ingest_triage(
         conn,
         {
-            "msg_id": triage.msg_id,
-            "account_email": triage.account_email,
-            "stream_id": triage.stream_id,
-            "stream_kind": triage.stream_kind,
-            "subject_family": triage.subject_family,
-            "sender_domain": triage.sender_domain,
-            "triage_tier": triage.triage_tier,
-            "decision_source": triage.decision_source,
-            "bulk_score": triage.bulk_score,
-            "importance_score": triage.importance_score,
-            "novelty_score": triage.novelty_score,
-            "signals_json": triage.signals_json,
+            "msg_id": proposal.msg_id,
+            "account_email": proposal.account_email,
+            "stream_id": proposal.stream_id,
+            "stream_kind": proposal.stream_kind,
+            "subject_family": proposal.subject_family,
+            "sender_domain": proposal.sender_domain,
+            "triage_tier": proposal.triage_tier,
+            "proposed_tier": proposal.triage_tier,
+            "applied_tier": applied_tier,
+            "enforcement_mode": cfg.ingest_triage.mode,
+            "decision_source": proposal.decision_source,
+            "bulk_score": proposal.bulk_score,
+            "importance_score": proposal.importance_score,
+            "novelty_score": proposal.novelty_score,
+            "signals_json": proposal.signals_json,
         },
     )
 

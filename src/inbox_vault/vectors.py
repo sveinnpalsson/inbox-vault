@@ -13,6 +13,7 @@ from .config import AppConfig
 from .db import (
     DBLockRetryExhausted,
     delete_message_chunk_vectors,
+    fetch_applied_light_message_ids,
     fetch_chunk_vectors_for_search,
     fetch_messages_by_ids,
     fetch_redaction_entries,
@@ -298,6 +299,7 @@ def _pending_message_ids_for_index(
     max_index_chars: int | None = None,
     limit: int | None = None,
     index_level: str = INDEX_LEVEL_REDACTED,
+    skip_applied_light: bool = False,
 ) -> list[str]:
     rows = vector_index_source_rows(conn, account_email=account_email, limit=None)
     effective_include_labels = _normalized_label_set(
@@ -312,9 +314,12 @@ def _pending_message_ids_for_index(
         else cfg.indexing.max_index_chars
     )
     safe_limit = max(1, int(limit)) if limit is not None else None
+    applied_light_ids = fetch_applied_light_message_ids(conn) if skip_applied_light else set()
 
     pending_msg_ids: list[str] = []
     for msg_id, _acct, _thread_id, subject, snippet, body_text, labels_json in rows:
+        if msg_id in applied_light_ids:
+            continue
         labels = json.loads(labels_json or "[]")
         if _should_filter_message(
             labels,
@@ -361,6 +366,7 @@ def count_pending_vector_updates(
     exclude_labels: list[str] | None = None,
     max_index_chars: int | None = None,
     index_level: str = INDEX_LEVEL_REDACTED,
+    skip_applied_light: bool = False,
 ) -> int:
     return len(
         _pending_message_ids_for_index(
@@ -371,6 +377,7 @@ def count_pending_vector_updates(
             exclude_labels=exclude_labels,
             max_index_chars=max_index_chars,
             index_level=index_level,
+            skip_applied_light=skip_applied_light,
         )
     )
 
@@ -394,6 +401,7 @@ def index_vectors(
     lock_backoff_base_seconds: float = 0.05,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     commit_every_messages: int = 1,
+    skip_applied_light: bool = False,
 ) -> dict[str, int | str]:
     chosen_index_level = (index_level or INDEX_LEVEL_REDACTED).strip().lower()
     if chosen_index_level not in {INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL}:
@@ -404,6 +412,7 @@ def index_vectors(
         "indexed": 0,
         "unchanged": 0,
         "skipped_filtered": 0,
+        "skipped_triage_light": 0,
         "failed": 0,
         "chunks_indexed": 0,
         "lock_retries": 0,
@@ -422,6 +431,7 @@ def index_vectors(
             max_index_chars=max_index_chars,
             limit=limit,
             index_level=chosen_index_level,
+            skip_applied_light=skip_applied_light,
         )
         pending_id_set = set(pending_ids)
         source_rows = vector_index_source_rows(conn, account_email=account_email, limit=None)
@@ -451,6 +461,7 @@ def index_vectors(
         if max_index_chars is not None
         else cfg.indexing.max_index_chars
     )
+    applied_light_ids = fetch_applied_light_message_ids(conn) if skip_applied_light else set()
 
     redaction_maps_by_account: dict[str, PersistentRedactionMap] = {}
     pruned_accounts: set[str] = set()
@@ -459,6 +470,9 @@ def index_vectors(
         rows, start=1
     ):
         message_started = time.perf_counter()
+        if msg_id in applied_light_ids:
+            stats["skipped_triage_light"] += 1
+            continue
         stats["scanned"] += 1
         labels = json.loads(labels_json or "[]")
         if progress_callback:

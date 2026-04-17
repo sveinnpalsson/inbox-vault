@@ -88,19 +88,20 @@ def test_validate_command_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                     "failed": 0,
                 },
             },
-            {
-                "ingest": {"ingested": 1, "new_ids": 1},
-                "enrich": {"updated": 1, "diagnostics": {}},
-                "index_vectors": {
-                    "scanned": 0,
-                    "indexed": 0,
-                    "unchanged": 0,
-                    "failed": 0,
-                    "pending_before": 0,
-                    "pending_after": 0,
+                {
+                    "ingest": {"ingested": 1, "new_ids": 1},
+                    "enrich": {"updated": 1, "diagnostics": {}},
+                    "index_vectors": {
+                        "scanned": 0,
+                        "indexed": 0,
+                        "unchanged": 0,
+                        "failed": 0,
+                        "pending_before": 0,
+                        "pending_after": 0,
+                        "skip_applied_light": False,
+                    },
                 },
-            },
-        ),
+            ),
         (
             ["repair", "--no-enrich", "--no-index-vectors"],
             {
@@ -326,10 +327,12 @@ def test_update_index_vectors_flag_runs_single_index_pass_and_emits_stats(
         "failed": 0,
         "pending_before": 5,
         "pending_after": 1,
+        "skip_applied_light": False,
     }
     assert captured["calls"] == 1
     assert captured["pending_only"] is True
     assert captured["limit"] == 25
+    assert captured["skip_applied_light"] is False
 
 
 def test_update_indexes_by_default_and_can_be_disabled_per_run(
@@ -366,6 +369,7 @@ def test_update_indexes_by_default_and_can_be_disabled_per_run(
     assert call_counter["count"] == 1
     assert captured["pending_only"] is True
     assert captured["limit"] == 7
+    assert captured["skip_applied_light"] is False
 
     cli.main(["--config", str(cfg), "update", "--no-index-vectors", "--no-enrich"])
     out_disabled = json.loads(capsys.readouterr().out)
@@ -415,6 +419,7 @@ def test_repair_defaults_run_enrich_and_index(tmp_path: Path, monkeypatch: pytes
     assert enrich_calls["count"] == 1
     assert enrich_kwargs["include_degraded"] is True
     assert captured["pending_only"] is True
+    assert captured["skip_applied_light"] is False
 
 
 def test_repair_interrupted_skips_post_processing(
@@ -682,6 +687,53 @@ def test_backfill_auto_index_uses_config_defaults(
     assert out["index_vectors"]["indexed"] == 2
     assert captured["pending_only"] is False
     assert captured["limit"] == 11
+    assert captured["skip_applied_light"] is False
+
+
+def test_update_auto_index_skips_applied_light_when_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    cfg = tmp_path / "config.toml"
+    _write_config(cfg)
+    cfg.write_text(
+        cfg.read_text()
+        + "\n\n[indexing]\nauto_index_after_ingest = true\nauto_index_pending_only = true\n"
+        + "\n[ingest_triage]\nenabled = true\nmode = \"enforce\"\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+
+    monkeypatch.setattr(cli, "update", lambda *_args, **_kwargs: {"ingested": 1, "new_ids": 1})
+    monkeypatch.setattr(cli, "enrich_pending", lambda *_args, **_kwargs: 0)
+
+    seen_pending_kwargs: list[dict[str, object]] = []
+
+    def fake_pending(*_args, **kwargs):
+        seen_pending_kwargs.append(dict(kwargs))
+        return 0
+
+    monkeypatch.setattr(cli, "count_pending_vector_updates", fake_pending)
+
+    captured: dict[str, object] = {}
+
+    def fake_index_vectors(*_args, **kwargs):
+        captured.update(kwargs)
+        return {
+            "scanned": 0,
+            "indexed": 0,
+            "unchanged": 0,
+            "failed": 0,
+            "skipped_triage_light": 1,
+        }
+
+    monkeypatch.setattr(cli, "index_vectors", fake_index_vectors)
+
+    cli.main(["--config", str(cfg), "update"])
+    out = json.loads(capsys.readouterr().out)
+
+    assert out["index_vectors"]["skip_applied_light"] is True
+    assert captured["skip_applied_light"] is True
+    assert all(kwargs["skip_applied_light"] is True for kwargs in seen_pending_kwargs)
 
 
 def test_backfill_max_messages_passthrough_and_help_text(
@@ -997,7 +1049,13 @@ endpoint = "http://embedding.test:11434"
     assert out["ingest_triage"] == {
         "enabled": False,
         "mode": "observe",
-        "summary": {"messages": 0, "streams": 0, "tiers": {}},
+        "summary": {
+            "messages": 0,
+            "streams": 0,
+            "proposed_tiers": {},
+            "applied_tiers": {},
+            "applied_light_messages": 0,
+        },
     }
     assert out["action_needed"] is True
     assert out["latest_message"]["msg_id"] == "m-new"

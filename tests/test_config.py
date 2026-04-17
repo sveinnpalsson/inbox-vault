@@ -303,13 +303,13 @@ token_file = "token.json"
 
 [ingest_triage]
 enabled = true
-mode = "observe"
+mode = "enforce"
 """.strip()
     )
 
     cfg = load_config(str(cfg_path))
     assert cfg.ingest_triage.enabled is True
-    assert cfg.ingest_triage.mode == "observe"
+    assert cfg.ingest_triage.mode == "enforce"
 
 
 def test_load_config_rejects_invalid_ingest_triage_mode(tmp_path: Path):

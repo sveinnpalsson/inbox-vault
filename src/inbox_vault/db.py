@@ -139,6 +139,9 @@ def get_conn(db_path: str, password: str):
           subject_family TEXT NOT NULL DEFAULT '',
           sender_domain TEXT NOT NULL DEFAULT '',
           triage_tier TEXT NOT NULL,
+          proposed_tier TEXT NOT NULL DEFAULT '',
+          applied_tier TEXT NOT NULL DEFAULT '',
+          enforcement_mode TEXT NOT NULL DEFAULT 'observe',
           decision_source TEXT NOT NULL DEFAULT 'rules',
           bulk_score INTEGER NOT NULL DEFAULT 0,
           importance_score INTEGER NOT NULL DEFAULT 0,
@@ -276,6 +279,17 @@ def get_conn(db_path: str, password: str):
         if redaction_cols and column not in redaction_cols:
             conn.execute(
                 f"ALTER TABLE redaction_entries ADD COLUMN {column} {column_type} NOT NULL DEFAULT {default}"
+            )
+
+    triage_cols = {row[1] for row in conn.execute("PRAGMA table_info(message_ingest_triage)").fetchall()}
+    for column, column_type, default in [
+        ("proposed_tier", "TEXT", "''"),
+        ("applied_tier", "TEXT", "''"),
+        ("enforcement_mode", "TEXT", "'observe'"),
+    ]:
+        if triage_cols and column not in triage_cols:
+            conn.execute(
+                f"ALTER TABLE message_ingest_triage ADD COLUMN {column} {column_type} NOT NULL DEFAULT {default}"
             )
 
     try:
@@ -444,6 +458,13 @@ def get_stream_observation_count(conn, stream_id: str) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
+def fetch_applied_light_message_ids(conn) -> set[str]:
+    rows = conn.execute(
+        "SELECT msg_id FROM message_ingest_triage WHERE COALESCE(applied_tier, '') = 'light'"
+    ).fetchall()
+    return {str(row[0]) for row in rows if row and row[0] is not None}
+
+
 def upsert_contact_seen(conn, email: str, display_name: str | None = None):
     now = utc_now()
     row = conn.execute(
@@ -482,10 +503,11 @@ def upsert_message_ingest_triage(conn, triage: dict[str, Any]) -> str | None:
         """
         INSERT INTO message_ingest_triage (
           msg_id, account_email, stream_id, stream_kind, subject_family, sender_domain,
-          triage_tier, decision_source, bulk_score, importance_score, novelty_score,
+          triage_tier, proposed_tier, applied_tier, enforcement_mode,
+          decision_source, bulk_score, importance_score, novelty_score,
           signals_json, evaluated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(msg_id) DO UPDATE SET
           account_email=excluded.account_email,
           stream_id=excluded.stream_id,
@@ -493,6 +515,9 @@ def upsert_message_ingest_triage(conn, triage: dict[str, Any]) -> str | None:
           subject_family=excluded.subject_family,
           sender_domain=excluded.sender_domain,
           triage_tier=excluded.triage_tier,
+          proposed_tier=excluded.proposed_tier,
+          applied_tier=excluded.applied_tier,
+          enforcement_mode=excluded.enforcement_mode,
           decision_source=excluded.decision_source,
           bulk_score=excluded.bulk_score,
           importance_score=excluded.importance_score,
@@ -507,7 +532,10 @@ def upsert_message_ingest_triage(conn, triage: dict[str, Any]) -> str | None:
             triage.get("stream_kind", ""),
             triage.get("subject_family", ""),
             triage.get("sender_domain", ""),
-            triage["triage_tier"],
+            triage.get("triage_tier", triage.get("proposed_tier", "full")),
+            triage.get("proposed_tier", triage.get("triage_tier", "full")),
+            triage.get("applied_tier", "full"),
+            triage.get("enforcement_mode", "observe"),
             triage.get("decision_source", "rules"),
             int(triage.get("bulk_score", 0)),
             int(triage.get("importance_score", 0)),
@@ -531,10 +559,10 @@ def _refresh_message_stream_reputation(conn, stream_id: str) -> None:
           sender_domain,
           subject_family,
           count(*) AS observation_count,
-          SUM(CASE WHEN triage_tier = 'full' THEN 1 ELSE 0 END) AS full_count,
-          SUM(CASE WHEN triage_tier = 'light' THEN 1 ELSE 0 END) AS light_count,
-          SUM(CASE WHEN triage_tier = 'minimal' THEN 1 ELSE 0 END) AS minimal_count,
-          SUM(CASE WHEN triage_tier = 'suppressed' THEN 1 ELSE 0 END) AS suppressed_count,
+          SUM(CASE WHEN COALESCE(applied_tier, triage_tier) = 'full' THEN 1 ELSE 0 END) AS full_count,
+          SUM(CASE WHEN COALESCE(applied_tier, triage_tier) = 'light' THEN 1 ELSE 0 END) AS light_count,
+          SUM(CASE WHEN COALESCE(applied_tier, triage_tier) = 'minimal' THEN 1 ELSE 0 END) AS minimal_count,
+          SUM(CASE WHEN COALESCE(applied_tier, triage_tier) = 'suppressed' THEN 1 ELSE 0 END) AS suppressed_count,
           MIN(evaluated_at) AS first_seen_at,
           MAX(evaluated_at) AS last_seen_at
         FROM message_ingest_triage
@@ -597,20 +625,40 @@ def _refresh_message_stream_reputation(conn, stream_id: str) -> None:
 
 
 def ingest_triage_summary(conn) -> dict[str, Any]:
-    tiers = {
+    proposed_tiers = {
         str(row[0]): int(row[1])
         for row in conn.execute(
             """
-            SELECT triage_tier, count(*)
+            SELECT COALESCE(proposed_tier, triage_tier), count(*)
             FROM message_ingest_triage
-            GROUP BY triage_tier
+            GROUP BY COALESCE(proposed_tier, triage_tier)
+            """
+        ).fetchall()
+    }
+    applied_tiers = {
+        str(row[0]): int(row[1])
+        for row in conn.execute(
+            """
+            SELECT COALESCE(applied_tier, triage_tier), count(*)
+            FROM message_ingest_triage
+            GROUP BY COALESCE(applied_tier, triage_tier)
             """
         ).fetchall()
     }
     return {
         "messages": int(conn.execute("SELECT count(*) FROM message_ingest_triage").fetchone()[0]),
         "streams": int(conn.execute("SELECT count(*) FROM message_stream_reputation").fetchone()[0]),
-        "tiers": tiers,
+        "proposed_tiers": proposed_tiers,
+        "applied_tiers": applied_tiers,
+        "applied_light_messages": int(
+            conn.execute(
+                """
+                SELECT count(*)
+                FROM message_ingest_triage
+                WHERE COALESCE(applied_tier, triage_tier) = 'light'
+                """
+            ).fetchone()[0]
+        ),
     }
 
 

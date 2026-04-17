@@ -1027,7 +1027,13 @@ def _run_index_vectors_for_ingest(
     limit: int | None,
     pending_only: bool,
 ) -> dict[str, int | str]:
-    pending_before = count_pending_vector_updates(conn, cfg, index_level=INDEX_LEVEL_REDACTED)
+    skip_applied_light = bool(cfg.ingest_triage.enabled and cfg.ingest_triage.mode == "enforce")
+    pending_before = count_pending_vector_updates(
+        conn,
+        cfg,
+        index_level=INDEX_LEVEL_REDACTED,
+        skip_applied_light=skip_applied_light,
+    )
     out = index_vectors(
         conn,
         cfg,
@@ -1035,10 +1041,17 @@ def _run_index_vectors_for_ingest(
         limit=limit,
         pending_only=pending_only,
         progress_callback=_emit_index_progress,
+        skip_applied_light=skip_applied_light,
     )
-    pending_after = count_pending_vector_updates(conn, cfg, index_level=INDEX_LEVEL_REDACTED)
+    pending_after = count_pending_vector_updates(
+        conn,
+        cfg,
+        index_level=INDEX_LEVEL_REDACTED,
+        skip_applied_light=skip_applied_light,
+    )
     out["pending_before"] = pending_before
     out["pending_after"] = pending_after
+    out["skip_applied_light"] = skip_applied_light
     return out
 
 

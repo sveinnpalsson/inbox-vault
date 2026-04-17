@@ -9,6 +9,7 @@ from googleapiclient.errors import HttpError
 from inbox_vault import ingest
 from inbox_vault.config import AccountConfig, IngestTriageConfig
 from inbox_vault.db import get_cursor, message_exists, upsert_message
+from inbox_vault.vectors import count_pending_vector_updates
 from tests.factories import gmail_message_payload
 
 
@@ -160,7 +161,7 @@ def test_update_persists_observe_only_ingest_triage(conn, app_cfg, monkeypatch: 
 
     triage_row = conn.execute(
         """
-        SELECT stream_kind, subject_family, sender_domain, triage_tier, novelty_score, signals_json
+        SELECT stream_kind, subject_family, sender_domain, proposed_tier, applied_tier, novelty_score, signals_json
         FROM message_ingest_triage
         WHERE msg_id = ?
         """,
@@ -171,8 +172,9 @@ def test_update_persists_observe_only_ingest_triage(conn, app_cfg, monkeypatch: 
     assert triage_row[1] == "weekly digest"
     assert triage_row[2] == "example.com"
     assert triage_row[3] in {"light", "minimal"}
-    assert float(triage_row[4]) == 1.0
-    assert json.loads(str(triage_row[5]))["list_id"] is True
+    assert triage_row[4] == "full"
+    assert float(triage_row[5]) == 1.0
+    assert json.loads(str(triage_row[6]))["list_id"] is True
 
     reputation_row = conn.execute(
         """
@@ -183,6 +185,64 @@ def test_update_persists_observe_only_ingest_triage(conn, app_cfg, monkeypatch: 
     assert reputation_row is not None
     assert int(reputation_row[0]) == 1
     assert int(reputation_row[1]) + int(reputation_row[2]) + int(reputation_row[3]) == 1
+
+
+def test_update_enforce_mode_applies_light_and_defers_auto_index_candidates(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    triage_cfg = replace(app_cfg, ingest_triage=IngestTriageConfig(enabled=True, mode="enforce"))
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+    monkeypatch.setattr(ingest, "get_profile_history_id", lambda *_: 400)
+    monkeypatch.setattr(
+        ingest, "list_incremental_added_ids", lambda *_args, **_kwargs: ({"m-light"}, 450)
+    )
+
+    payload = gmail_message_payload(
+        "m-light",
+        history_id=450,
+        from_addr="no-reply@example.com",
+        to_addr="acct@example.com",
+        subject="Weekly Digest 2026-04-17",
+        body_text="Top stories for you",
+        labels=["INBOX"],
+    )
+    payload["payload"]["headers"].extend(
+        [
+            {"name": "List-Id", "value": "digest.example.com"},
+            {"name": "List-Unsubscribe", "value": "<https://example.com/unsub>"},
+            {"name": "Precedence", "value": "bulk"},
+        ]
+    )
+    monkeypatch.setattr(ingest, "fetch_full_message_payload", lambda *_args, **_kwargs: payload)
+
+    out = ingest.update(conn, triage_cfg)
+    assert out["ingested"] == 1
+    assert message_exists(conn, "m-light") is True
+
+    triage_row = conn.execute(
+        """
+        SELECT proposed_tier, applied_tier, enforcement_mode
+        FROM message_ingest_triage
+        WHERE msg_id = ?
+        """,
+        ("m-light",),
+    ).fetchone()
+    assert triage_row is not None
+    assert triage_row[0] in {"light", "minimal"}
+    assert triage_row[1] == "light"
+    assert triage_row[2] == "enforce"
+
+    assert count_pending_vector_updates(conn, triage_cfg, index_level="redacted") == 1
+    assert (
+        count_pending_vector_updates(
+            conn,
+            triage_cfg,
+            index_level="redacted",
+            skip_applied_light=True,
+        )
+        == 0
+    )
 
 
 def test_update_does_not_trigger_idle_backfill(conn, app_cfg, monkeypatch: pytest.MonkeyPatch):

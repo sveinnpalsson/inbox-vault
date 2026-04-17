@@ -501,8 +501,8 @@ def load_config(path: str | None = None) -> AppConfig:
         key="ingest_triage.enabled",
     )
     ingest_triage_mode = str(ingest_triage_raw.get("mode", "observe")).strip().lower()
-    if ingest_triage_mode not in {"observe"}:
-        raise ValueError("Invalid ingest_triage.mode: expected one of observe")
+    if ingest_triage_mode not in {"observe", "enforce"}:
+        raise ValueError("Invalid ingest_triage.mode: expected one of observe|enforce")
 
     return AppConfig(
         accounts=accounts,

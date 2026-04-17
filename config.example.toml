@@ -95,9 +95,11 @@ gog_history_max_messages = 8
 gog_history_timeout_seconds = 15
 
 [ingest_triage]
-# observe-only phase 1 rollout; current ingest/fetch behavior remains unchanged
+# disabled (default) | observe | enforce
+# observe: store diagnostics only
+# enforce: only apply safe light downgrades; full fetch/storage still happens
 enabled = false
-# observe
+# observe | enforce
 mode = "observe"
 
 [[accounts]]
