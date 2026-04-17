@@ -12,6 +12,7 @@ from .consolidation import run_consolidation
 from .db import (
     clear_contact_profiles,
     get_conn,
+    ingest_triage_summary,
     vector_level_counts,
 )
 from .enrich import enrich_pending
@@ -666,6 +667,11 @@ def run_status(conn, cfg) -> dict[str, object]:
             INDEX_LEVEL_FULL: pending_full,
         },
         "policy_drift_vectors": policy_drift,
+        "ingest_triage": {
+            "enabled": bool(cfg.ingest_triage.enabled),
+            "mode": cfg.ingest_triage.mode,
+            "summary": ingest_triage_summary(conn),
+        },
         "action_needed": any(int(value or 0) > 0 for value in policy_drift.values()),
         "latest_message": _latest_message_status(conn),
     }

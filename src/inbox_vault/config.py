@@ -102,6 +102,12 @@ class ProfileContextConfig:
 
 
 @dataclass(slots=True)
+class IngestTriageConfig:
+    enabled: bool = False
+    mode: str = "observe"
+
+
+@dataclass(slots=True)
 class AppConfig:
     accounts: list[AccountConfig]
     llm: LLMConfig
@@ -112,6 +118,7 @@ class AppConfig:
     indexing: IndexingConfig = field(default_factory=IndexingConfig)
     rerank: RerankConfig = field(default_factory=RerankConfig)
     profiles: ProfileContextConfig = field(default_factory=ProfileContextConfig)
+    ingest_triage: IngestTriageConfig = field(default_factory=IngestTriageConfig)
     gmail_query: str = "label:inbox OR label:sent"
     gmail_idle_backfill_query: str | None = None
     gmail_idle_backfill_limit: int | None = None
@@ -216,6 +223,7 @@ def load_config(path: str | None = None) -> AppConfig:
     indexing_raw = raw.get("indexing", {})
     rerank_raw = raw.get("rerank", {})
     profiles_raw = raw.get("profiles", {})
+    ingest_triage_raw = raw.get("ingest_triage", {})
     gmail_raw = raw.get("gmail", {})
 
     if not isinstance(db_raw, dict):
@@ -234,6 +242,8 @@ def load_config(path: str | None = None) -> AppConfig:
         raise ValueError("Invalid [rerank] section: expected table/object")
     if not isinstance(profiles_raw, dict):
         raise ValueError("Invalid [profiles] section: expected table/object")
+    if not isinstance(ingest_triage_raw, dict):
+        raise ValueError("Invalid [ingest_triage] section: expected table/object")
     if not isinstance(gmail_raw, dict):
         raise ValueError("Invalid [gmail] section: expected table/object")
 
@@ -486,6 +496,14 @@ def load_config(path: str | None = None) -> AppConfig:
             "Invalid profiles.gog_history_command: expected non-empty string when enabled"
         )
 
+    ingest_triage_enabled = _parse_bool(
+        ingest_triage_raw.get("enabled", False),
+        key="ingest_triage.enabled",
+    )
+    ingest_triage_mode = str(ingest_triage_raw.get("mode", "observe")).strip().lower()
+    if ingest_triage_mode not in {"observe"}:
+        raise ValueError("Invalid ingest_triage.mode: expected one of observe")
+
     return AppConfig(
         accounts=accounts,
         llm=LLMConfig(
@@ -549,6 +567,10 @@ def load_config(path: str | None = None) -> AppConfig:
             gog_history_command=gog_history_command,
             gog_history_max_messages=gog_history_max_messages,
             gog_history_timeout_seconds=gog_history_timeout_seconds,
+        ),
+        ingest_triage=IngestTriageConfig(
+            enabled=ingest_triage_enabled,
+            mode=ingest_triage_mode,
         ),
         gmail_query=gmail_query.strip(),
         gmail_idle_backfill_query=gmail_idle_backfill_query,

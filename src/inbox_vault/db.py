@@ -131,6 +131,38 @@ def get_conn(db_path: str, password: str):
           PRIMARY KEY (account_email, scope)
         );
 
+        CREATE TABLE IF NOT EXISTS message_ingest_triage (
+          msg_id TEXT PRIMARY KEY REFERENCES messages(msg_id) ON DELETE CASCADE,
+          account_email TEXT NOT NULL,
+          stream_id TEXT NOT NULL,
+          stream_kind TEXT NOT NULL DEFAULT '',
+          subject_family TEXT NOT NULL DEFAULT '',
+          sender_domain TEXT NOT NULL DEFAULT '',
+          triage_tier TEXT NOT NULL,
+          decision_source TEXT NOT NULL DEFAULT 'rules',
+          bulk_score INTEGER NOT NULL DEFAULT 0,
+          importance_score INTEGER NOT NULL DEFAULT 0,
+          novelty_score REAL NOT NULL DEFAULT 0,
+          signals_json TEXT NOT NULL,
+          evaluated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS message_stream_reputation (
+          stream_id TEXT PRIMARY KEY,
+          account_email TEXT NOT NULL,
+          stream_kind TEXT NOT NULL DEFAULT '',
+          sender_domain TEXT NOT NULL DEFAULT '',
+          subject_family TEXT NOT NULL DEFAULT '',
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          observation_count INTEGER NOT NULL DEFAULT 0,
+          full_count INTEGER NOT NULL DEFAULT 0,
+          light_count INTEGER NOT NULL DEFAULT 0,
+          minimal_count INTEGER NOT NULL DEFAULT 0,
+          suppressed_count INTEGER NOT NULL DEFAULT 0,
+          reputation_score REAL NOT NULL DEFAULT 0
+        );
+
         CREATE TABLE IF NOT EXISTS redaction_entries (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           scope_type TEXT NOT NULL,
@@ -220,6 +252,9 @@ def get_conn(db_path: str, password: str):
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_email);
+        CREATE INDEX IF NOT EXISTS idx_ingest_triage_stream ON message_ingest_triage(stream_id);
+        CREATE INDEX IF NOT EXISTS idx_ingest_triage_tier ON message_ingest_triage(triage_tier);
+        CREATE INDEX IF NOT EXISTS idx_stream_reputation_account ON message_stream_reputation(account_email);
         CREATE INDEX IF NOT EXISTS idx_redaction_scope ON redaction_entries(scope_type, scope_id);
         CREATE INDEX IF NOT EXISTS idx_redaction_placeholder ON redaction_entries(scope_type, scope_id, placeholder);
         CREATE INDEX IF NOT EXISTS idx_vectors_account ON message_vectors(account_email, index_level);
@@ -401,6 +436,14 @@ def get_oldest_internal_ts(conn, account_email: str) -> int | None:
     return int(row[0])
 
 
+def get_stream_observation_count(conn, stream_id: str) -> int:
+    row = conn.execute(
+        "SELECT observation_count FROM message_stream_reputation WHERE stream_id = ?",
+        (stream_id,),
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def upsert_contact_seen(conn, email: str, display_name: str | None = None):
     now = utc_now()
     row = conn.execute(
@@ -426,6 +469,149 @@ def upsert_contact_seen(conn, email: str, display_name: str | None = None):
             """,
             (email, display_name, now, now),
         )
+
+
+def upsert_message_ingest_triage(conn, triage: dict[str, Any]) -> str | None:
+    previous = conn.execute(
+        "SELECT stream_id FROM message_ingest_triage WHERE msg_id = ?",
+        (triage["msg_id"],),
+    ).fetchone()
+    previous_stream_id = str(previous[0]) if previous and previous[0] is not None else None
+
+    conn.execute(
+        """
+        INSERT INTO message_ingest_triage (
+          msg_id, account_email, stream_id, stream_kind, subject_family, sender_domain,
+          triage_tier, decision_source, bulk_score, importance_score, novelty_score,
+          signals_json, evaluated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(msg_id) DO UPDATE SET
+          account_email=excluded.account_email,
+          stream_id=excluded.stream_id,
+          stream_kind=excluded.stream_kind,
+          subject_family=excluded.subject_family,
+          sender_domain=excluded.sender_domain,
+          triage_tier=excluded.triage_tier,
+          decision_source=excluded.decision_source,
+          bulk_score=excluded.bulk_score,
+          importance_score=excluded.importance_score,
+          novelty_score=excluded.novelty_score,
+          signals_json=excluded.signals_json,
+          evaluated_at=excluded.evaluated_at
+        """,
+        (
+            triage["msg_id"],
+            triage["account_email"],
+            triage["stream_id"],
+            triage.get("stream_kind", ""),
+            triage.get("subject_family", ""),
+            triage.get("sender_domain", ""),
+            triage["triage_tier"],
+            triage.get("decision_source", "rules"),
+            int(triage.get("bulk_score", 0)),
+            int(triage.get("importance_score", 0)),
+            float(triage.get("novelty_score", 0.0)),
+            triage.get("signals_json", "{}"),
+            utc_now(),
+        ),
+    )
+    _refresh_message_stream_reputation(conn, triage["stream_id"])
+    if previous_stream_id and previous_stream_id != triage["stream_id"]:
+        _refresh_message_stream_reputation(conn, previous_stream_id)
+    return previous_stream_id
+
+
+def _refresh_message_stream_reputation(conn, stream_id: str) -> None:
+    row = conn.execute(
+        """
+        SELECT
+          account_email,
+          stream_kind,
+          sender_domain,
+          subject_family,
+          count(*) AS observation_count,
+          SUM(CASE WHEN triage_tier = 'full' THEN 1 ELSE 0 END) AS full_count,
+          SUM(CASE WHEN triage_tier = 'light' THEN 1 ELSE 0 END) AS light_count,
+          SUM(CASE WHEN triage_tier = 'minimal' THEN 1 ELSE 0 END) AS minimal_count,
+          SUM(CASE WHEN triage_tier = 'suppressed' THEN 1 ELSE 0 END) AS suppressed_count,
+          MIN(evaluated_at) AS first_seen_at,
+          MAX(evaluated_at) AS last_seen_at
+        FROM message_ingest_triage
+        WHERE stream_id = ?
+        GROUP BY account_email, stream_kind, sender_domain, subject_family
+        ORDER BY observation_count DESC, last_seen_at DESC
+        LIMIT 1
+        """,
+        (stream_id,),
+    ).fetchone()
+    if not row:
+        conn.execute("DELETE FROM message_stream_reputation WHERE stream_id = ?", (stream_id,))
+        return
+
+    observation_count = int(row[4] or 0)
+    full_count = int(row[5] or 0)
+    light_count = int(row[6] or 0)
+    minimal_count = int(row[7] or 0)
+    suppressed_count = int(row[8] or 0)
+    reputation_score = float(full_count - minimal_count - (suppressed_count * 2))
+
+    conn.execute(
+        """
+        INSERT INTO message_stream_reputation (
+          stream_id, account_email, stream_kind, sender_domain, subject_family,
+          first_seen_at, last_seen_at, observation_count,
+          full_count, light_count, minimal_count, suppressed_count, reputation_score
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(stream_id) DO UPDATE SET
+          account_email=excluded.account_email,
+          stream_kind=excluded.stream_kind,
+          sender_domain=excluded.sender_domain,
+          subject_family=excluded.subject_family,
+          first_seen_at=excluded.first_seen_at,
+          last_seen_at=excluded.last_seen_at,
+          observation_count=excluded.observation_count,
+          full_count=excluded.full_count,
+          light_count=excluded.light_count,
+          minimal_count=excluded.minimal_count,
+          suppressed_count=excluded.suppressed_count,
+          reputation_score=excluded.reputation_score
+        """,
+        (
+            stream_id,
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[9],
+            row[10],
+            observation_count,
+            full_count,
+            light_count,
+            minimal_count,
+            suppressed_count,
+            reputation_score,
+        ),
+    )
+
+
+def ingest_triage_summary(conn) -> dict[str, Any]:
+    tiers = {
+        str(row[0]): int(row[1])
+        for row in conn.execute(
+            """
+            SELECT triage_tier, count(*)
+            FROM message_ingest_triage
+            GROUP BY triage_tier
+            """
+        ).fetchall()
+    }
+    return {
+        "messages": int(conn.execute("SELECT count(*) FROM message_ingest_triage").fetchone()[0]),
+        "streams": int(conn.execute("SELECT count(*) FROM message_stream_reputation").fetchone()[0]),
+        "tiers": tiers,
+    }
 
 
 def upsert_enrichment(conn, msg_id: str, data: dict[str, Any], model: str):

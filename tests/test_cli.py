@@ -994,6 +994,11 @@ endpoint = "http://embedding.test:11434"
     assert out["vector_level_counts"] == {"redacted": {"messages": 1, "chunks": 1}}
     assert out["pending_vectors"] == {"redacted": 4, "full": None}
     assert out["policy_drift_vectors"] == {"redacted": 1}
+    assert out["ingest_triage"] == {
+        "enabled": False,
+        "mode": "observe",
+        "summary": {"messages": 0, "streams": 0, "tiers": {}},
+    }
     assert out["action_needed"] is True
     assert out["latest_message"]["msg_id"] == "m-new"
     assert out["latest_message"]["freshness_seconds"] is not None

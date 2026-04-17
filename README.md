@@ -20,6 +20,10 @@ Inbox Vault is that layer. Originally built for a single real inbox, now package
 
 The pipeline has clear stages: **sync** (Gmail API to encrypted DB), **process** (enrichment, profiles, vector indexing), and **query** (hybrid search through a clearance gate). Each stage is idempotent and independently runnable.
 
+Design notes:
+- [Stream-aware ingestion triage](docs/ingestion-triage-stream-aware.md)
+- [Redaction architecture v2](docs/redaction-architecture-v2.md)
+
 ## What it does
 
 - **Syncs Gmail** into a local SQLCipher-encrypted database (`update`, `update --backfill`, `repair`)

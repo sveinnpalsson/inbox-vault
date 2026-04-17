@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 
 import pytest
 from googleapiclient.errors import HttpError
 
 from inbox_vault import ingest
-from inbox_vault.config import AccountConfig
+from inbox_vault.config import AccountConfig, IngestTriageConfig
 from inbox_vault.db import get_cursor, message_exists, upsert_message
 from tests.factories import gmail_message_payload
 
@@ -118,6 +119,70 @@ def test_update_counts_failed_ingest_and_continues(conn, app_cfg, monkeypatch: p
         "cursor_resets": 0,
         "failed": 1,
     }
+
+
+def test_update_persists_observe_only_ingest_triage(conn, app_cfg, monkeypatch: pytest.MonkeyPatch):
+    triage_cfg = replace(app_cfg, ingest_triage=IngestTriageConfig(enabled=True, mode="observe"))
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+    monkeypatch.setattr(ingest, "get_profile_history_id", lambda *_: 400)
+    monkeypatch.setattr(
+        ingest, "list_incremental_added_ids", lambda *_args, **_kwargs: ({"m-triage"}, 450)
+    )
+
+    payload = gmail_message_payload(
+        "m-triage",
+        history_id=450,
+        from_addr="no-reply@example.com",
+        to_addr="acct@example.com",
+        subject="Weekly Digest 2026-04-17",
+        body_text="Top stories for you",
+        labels=["INBOX", "CATEGORY_PROMOTIONS"],
+    )
+    payload["payload"]["headers"].extend(
+        [
+            {"name": "List-Id", "value": "digest.example.com"},
+            {"name": "List-Unsubscribe", "value": "<https://example.com/unsub>"},
+            {"name": "Precedence", "value": "bulk"},
+        ]
+    )
+    monkeypatch.setattr(ingest, "fetch_full_message_payload", lambda *_args, **_kwargs: payload)
+
+    out = ingest.update(conn, triage_cfg)
+
+    assert out == {
+        "accounts": 1,
+        "new_ids": 1,
+        "ingested": 1,
+        "cursor_resets": 0,
+        "failed": 0,
+    }
+
+    triage_row = conn.execute(
+        """
+        SELECT stream_kind, subject_family, sender_domain, triage_tier, novelty_score, signals_json
+        FROM message_ingest_triage
+        WHERE msg_id = ?
+        """,
+        ("m-triage",),
+    ).fetchone()
+    assert triage_row is not None
+    assert triage_row[0] == "bulk"
+    assert triage_row[1] == "weekly digest"
+    assert triage_row[2] == "example.com"
+    assert triage_row[3] in {"light", "minimal"}
+    assert float(triage_row[4]) == 1.0
+    assert json.loads(str(triage_row[5]))["list_id"] is True
+
+    reputation_row = conn.execute(
+        """
+        SELECT observation_count, full_count, light_count, minimal_count
+        FROM message_stream_reputation
+        """
+    ).fetchone()
+    assert reputation_row is not None
+    assert int(reputation_row[0]) == 1
+    assert int(reputation_row[1]) + int(reputation_row[2]) + int(reputation_row[3]) == 1
 
 
 def test_update_does_not_trigger_idle_backfill(conn, app_cfg, monkeypatch: pytest.MonkeyPatch):

@@ -61,6 +61,8 @@ query = "label:inbox"
     assert cfg.gmail_idle_backfill_limit is None
     assert cfg.gmail_request_timeout_seconds == 60.0
     assert cfg.gmail_progress_every == 100
+    assert cfg.ingest_triage.enabled is False
+    assert cfg.ingest_triage.mode == "observe"
 
 
 def test_load_config_uses_default_when_no_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -288,6 +290,44 @@ gog_history_timeout_seconds = 9
     assert cfg.profiles.gog_history_command == "gog"
     assert cfg.profiles.gog_history_max_messages == 5
     assert cfg.profiles.gog_history_timeout_seconds == 9
+
+
+def test_load_config_ingest_triage_section(tmp_path: Path):
+    cfg_path = tmp_path / "cfg.toml"
+    cfg_path.write_text(
+        """
+[[accounts]]
+email = "acct@example.com"
+credentials_file = "credentials.json"
+token_file = "token.json"
+
+[ingest_triage]
+enabled = true
+mode = "observe"
+""".strip()
+    )
+
+    cfg = load_config(str(cfg_path))
+    assert cfg.ingest_triage.enabled is True
+    assert cfg.ingest_triage.mode == "observe"
+
+
+def test_load_config_rejects_invalid_ingest_triage_mode(tmp_path: Path):
+    cfg_path = tmp_path / "cfg.toml"
+    cfg_path.write_text(
+        """
+[[accounts]]
+email = "acct@example.com"
+credentials_file = "credentials.json"
+token_file = "token.json"
+
+[ingest_triage]
+mode = "suppress"
+""".strip()
+    )
+
+    with pytest.raises(ValueError, match="ingest_triage.mode"):
+        load_config(str(cfg_path))
 
 
 def test_resolve_password(monkeypatch: pytest.MonkeyPatch):

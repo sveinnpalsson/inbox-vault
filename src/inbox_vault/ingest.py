@@ -10,10 +10,12 @@ from googleapiclient.errors import HttpError
 from .config import AppConfig
 from .db import (
     get_cursor,
+    get_stream_observation_count,
     get_oldest_internal_ts,
     message_exists,
     upsert_contact_seen,
     upsert_cursor,
+    upsert_message_ingest_triage,
     upsert_message,
     upsert_raw,
 )
@@ -26,6 +28,7 @@ from .gmail_client import (
     list_message_ids_paged,
     payload_to_record,
 )
+from .ingest_triage import derive_ingest_triage
 
 MAILBOX_SCOPE = "INBOX,SENT"
 LOG = logging.getLogger(__name__)
@@ -75,7 +78,41 @@ def _update_contacts_from_record(conn, record: dict):
         upsert_contact_seen(conn, record["to_addr"])
 
 
-def _ingest_message_id(conn, service, account_email: str, msg_id: str) -> bool:
+def _persist_observe_only_triage(
+    conn,
+    cfg: AppConfig,
+    *,
+    rec: dict[str, Any],
+    raw_payload: dict[str, Any],
+) -> None:
+    if not cfg.ingest_triage.enabled or cfg.ingest_triage.mode != "observe":
+        return
+    provisional = derive_ingest_triage(rec, raw_payload=raw_payload)
+    triage = derive_ingest_triage(
+        rec,
+        raw_payload=raw_payload,
+        prior_observation_count=get_stream_observation_count(conn, provisional.stream_id),
+    )
+    upsert_message_ingest_triage(
+        conn,
+        {
+            "msg_id": triage.msg_id,
+            "account_email": triage.account_email,
+            "stream_id": triage.stream_id,
+            "stream_kind": triage.stream_kind,
+            "subject_family": triage.subject_family,
+            "sender_domain": triage.sender_domain,
+            "triage_tier": triage.triage_tier,
+            "decision_source": triage.decision_source,
+            "bulk_score": triage.bulk_score,
+            "importance_score": triage.importance_score,
+            "novelty_score": triage.novelty_score,
+            "signals_json": triage.signals_json,
+        },
+    )
+
+
+def _ingest_message_id(conn, cfg: AppConfig, service, account_email: str, msg_id: str) -> bool:
     try:
         raw = fetch_full_message_payload(service, msg_id)
         if not raw:
@@ -88,6 +125,7 @@ def _ingest_message_id(conn, service, account_email: str, msg_id: str) -> bool:
         upsert_message(conn, rec)
         upsert_raw(conn, rec["msg_id"], account_email, raw)
         _update_contacts_from_record(conn, rec)
+        _persist_observe_only_triage(conn, cfg, rec=rec, raw_payload=raw)
         return True
     except Exception:
         # Privacy-safe logging: keep identifiers only, no message content.
@@ -144,7 +182,7 @@ def backfill(
                 account_processed += 1
                 if message_exists(conn, msg_id):
                     stats["skipped_existing"] += 1
-                elif _ingest_message_id(conn, service, acct.email, msg_id):
+                elif _ingest_message_id(conn, cfg, service, acct.email, msg_id):
                     stats["ingested"] += 1
                 else:
                     stats["failed"] += 1
@@ -228,7 +266,7 @@ def backfill(
         processed += 1
         if message_exists(conn, msg_id):
             stats["skipped_existing"] += 1
-        elif _ingest_message_id(conn, service, account_email, msg_id):
+        elif _ingest_message_id(conn, cfg, service, account_email, msg_id):
             stats["ingested"] += 1
         else:
             stats["failed"] += 1
@@ -380,7 +418,7 @@ def update(
         incremental_processed = 0
         for msg_id in ids:
             incremental_processed += 1
-            if _ingest_message_id(conn, service, acct.email, msg_id):
+            if _ingest_message_id(conn, cfg, service, acct.email, msg_id):
                 stats["ingested"] += 1
             else:
                 stats["failed"] += 1
@@ -544,7 +582,9 @@ def repair(
                     else:
                         stats["backfill_candidates"] += 1
                         state["account_candidates"] += 1
-                        if _ingest_message_id(conn, state["service"], state["acct"].email, msg_id):
+                        if _ingest_message_id(
+                            conn, cfg, state["service"], state["acct"].email, msg_id
+                        ):
                             stats["backfill_ingested"] += 1
                             state["account_ingested"] += 1
                         else:

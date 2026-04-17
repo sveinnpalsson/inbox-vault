@@ -94,6 +94,12 @@ gog_history_command = "gog"
 gog_history_max_messages = 8
 gog_history_timeout_seconds = 15
 
+[ingest_triage]
+# observe-only phase 1 rollout; current ingest/fetch behavior remains unchanged
+enabled = false
+# observe
+mode = "observe"
+
 [[accounts]]
 name = "main"
 email = "you@gmail.com"
