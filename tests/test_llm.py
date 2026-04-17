@@ -91,7 +91,8 @@ def test_chat_json_uses_reasoning_content_when_content_empty(monkeypatch):
 def test_chat_text_supports_content_array(monkeypatch):
     cfg = LLMConfig(endpoint="http://llm.local", model="test-model", timeout_seconds=1.0)
 
-    def fake_post(*_args, **_kwargs):
+    def fake_post(*_args, **kwargs):
+        assert kwargs["json"]["chat_template_kwargs"] == {"enable_thinking": False}
         return _Resp(
             200,
             {
@@ -112,3 +113,30 @@ def test_chat_text_supports_content_array(monkeypatch):
 
     out = chat_text(cfg, [{"role": "user", "content": "say hi"}])
     assert out == "hello world"
+
+
+def test_chat_text_retries_without_response_format_then_chat_template_kwargs(monkeypatch):
+    cfg = LLMConfig(endpoint="http://llm.local", model="test-model", timeout_seconds=1.0)
+    payloads: list[dict] = []
+
+    def fake_post(*_args, **kwargs):
+        payloads.append(dict(kwargs["json"]))
+        if len(payloads) < 3:
+            return _Resp(400)
+        return _Resp(200, {"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("inbox_vault.llm.requests.post", fake_post)
+
+    out = chat_text(
+        cfg,
+        [{"role": "user", "content": "json please"}],
+        response_format={"type": "json_object"},
+    )
+
+    assert out == "ok"
+    assert payloads[0]["response_format"] == {"type": "json_object"}
+    assert payloads[0]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "response_format" not in payloads[1]
+    assert payloads[1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "response_format" not in payloads[2]
+    assert "chat_template_kwargs" not in payloads[2]

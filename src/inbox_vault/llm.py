@@ -121,6 +121,9 @@ def chat_text(
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        # Match llm-vault's local llama.cpp/Qwen behavior by disabling thinking so
+        # structured output lands in content instead of reasoning-specific fields.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     if response_format is not None:
         payload["response_format"] = response_format
@@ -133,19 +136,36 @@ def chat_text(
         )
         resp.raise_for_status()
     except requests.HTTPError as exc:
-        # Some OpenAI-compatible servers reject response_format; retry once without it.
-        if (
-            response_format is not None
-            and exc.response is not None
-            and exc.response.status_code == 400
-        ):
-            payload.pop("response_format", None)
-            resp = requests.post(
-                f"{cfg.endpoint.rstrip('/')}/v1/chat/completions",
-                json=payload,
-                timeout=cfg.timeout_seconds,
-            )
-            resp.raise_for_status()
+        if exc.response is not None and exc.response.status_code == 400:
+            # Some OpenAI-compatible servers reject response_format and/or
+            # chat_template_kwargs. Retry compatibly before giving up.
+            if response_format is not None:
+                payload.pop("response_format", None)
+                try:
+                    resp = requests.post(
+                        f"{cfg.endpoint.rstrip('/')}/v1/chat/completions",
+                        json=payload,
+                        timeout=cfg.timeout_seconds,
+                    )
+                    resp.raise_for_status()
+                except requests.HTTPError as exc2:
+                    if exc2.response is None or exc2.response.status_code != 400:
+                        raise
+                    payload.pop("chat_template_kwargs", None)
+                    resp = requests.post(
+                        f"{cfg.endpoint.rstrip('/')}/v1/chat/completions",
+                        json=payload,
+                        timeout=cfg.timeout_seconds,
+                    )
+                    resp.raise_for_status()
+            else:
+                payload.pop("chat_template_kwargs", None)
+                resp = requests.post(
+                    f"{cfg.endpoint.rstrip('/')}/v1/chat/completions",
+                    json=payload,
+                    timeout=cfg.timeout_seconds,
+                )
+                resp.raise_for_status()
         else:
             raise
 
