@@ -56,6 +56,11 @@ def safe_execute(callable_execute, retries: int = 3, backoff: float = 1.0):
             raise
 
 
+def _decode_base64url_bytes(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
 def _token_scopes_from_file(token_file: str) -> list[str]:
     try:
         with open(token_file, encoding="utf-8") as f:
@@ -258,6 +263,19 @@ def fetch_full_message_payload(service, msg_id: str) -> dict[str, Any] | None:
         raise
 
 
+def fetch_attachment_bytes(service, msg_id: str, attachment_id: str) -> bytes:
+    resp = safe_execute(
+        lambda: service.users()
+        .messages()
+        .attachments()
+        .get(userId="me", messageId=msg_id, id=attachment_id)
+    )
+    data = str(resp.get("data") or "")
+    if not data:
+        return b""
+    return _decode_base64url_bytes(data)
+
+
 def decode_name(name: str) -> str:
     try:
         return str(make_header(decode_header(name))).strip()
@@ -295,6 +313,27 @@ def _is_attachment_part(part: dict[str, Any]) -> bool:
     if body.get("attachmentId"):
         return True
     return bool(str(part.get("filename") or "").strip())
+
+
+def _find_part_by_part_id(part: dict[str, Any], target_part_id: str) -> dict[str, Any] | None:
+    if str(part.get("partId") or "").strip() == target_part_id:
+        return part
+    for nested in part.get("parts", []) or []:
+        found = _find_part_by_part_id(nested, target_part_id)
+        if found is not None:
+            return found
+    return None
+
+
+def extract_inline_attachment_bytes(raw: dict[str, Any], part_id: str) -> bytes | None:
+    payload = raw.get("payload", {})
+    target = _find_part_by_part_id(payload, part_id)
+    if target is None:
+        return None
+    data = str(((target.get("body") or {}).get("data")) or "")
+    if not data:
+        return None
+    return _decode_base64url_bytes(data)
 
 
 def _collect_parts(
@@ -335,9 +374,7 @@ def _collect_parts(
         data = body.get("data")
         if not is_attachment and mime in ("text/plain", "text/html") and data:
             try:
-                # Gmail base64url data may be missing padding.
-                padding = "=" * (-len(data) % 4)
-                decoded = base64.urlsafe_b64decode(data + padding)
+                decoded = _decode_base64url_bytes(data)
                 text = decoded.decode("utf-8", errors="ignore")
                 key = "plain" if mime == "text/plain" else "html"
                 collected[key] += text + "\n"

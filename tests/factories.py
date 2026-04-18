@@ -52,6 +52,9 @@ def gmail_message_payload(
                 ),
             },
         }
+        inline_data_text = attachment.get("inline_data_text")
+        if isinstance(inline_data_text, str):
+            part["body"]["data"] = _b64url(inline_data_text)
         parts.append(part)
 
     return {

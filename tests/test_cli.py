@@ -139,6 +139,35 @@ def test_validate_command_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
             },
         ),
         (
+            ["materialize-attachments", "--limit", "12"],
+            {
+                "materialize_attachment_bytes": lambda *_args, **_kwargs: {
+                    "accounts": 1,
+                    "limit": 12,
+                    "missing_only": True,
+                    "selected_attachments": 12,
+                    "processed_attachments": 12,
+                    "materialized_attachments": 11,
+                    "failed_attachments": 1,
+                    "bytes_written": 8192,
+                    "inline_sourced": 3,
+                    "gmail_fetched": 8,
+                },
+            },
+            {
+                "accounts": 1,
+                "limit": 12,
+                "missing_only": True,
+                "selected_attachments": 12,
+                "processed_attachments": 12,
+                "materialized_attachments": 11,
+                "failed_attachments": 1,
+                "bytes_written": 8192,
+                "inline_sourced": 3,
+                "gmail_fetched": 8,
+            },
+        ),
+        (
             ["enrich", "--limit", "5"],
             {"enrich_pending": lambda *_args, **_kwargs: 5},
             {"updated": 5, "diagnostics": {}},
@@ -354,6 +383,44 @@ def test_backfill_attachments_all_passthrough(
     out = json.loads(capsys.readouterr().out)
     assert out["missing_only"] is False
     assert captured["missing_only"] is False
+
+
+def test_materialize_attachments_passthrough_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    cfg = tmp_path / "config.toml"
+    _write_config(cfg)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+
+    captured: dict[str, object] = {}
+
+    def fake_materialize_attachments(*_args, **kwargs):
+        captured.update(kwargs)
+        return {
+            "accounts": 1,
+            "limit": 5,
+            "missing_only": True,
+            "selected_attachments": 5,
+            "processed_attachments": 5,
+            "materialized_attachments": 5,
+            "failed_attachments": 0,
+            "bytes_written": 2048,
+            "inline_sourced": 2,
+            "gmail_fetched": 3,
+        }
+
+    monkeypatch.setattr(cli, "materialize_attachment_bytes", fake_materialize_attachments)
+
+    cli.main(
+        ["--config", str(cfg), "materialize-attachments", "--limit", "5", "--commit-every", "25"]
+    )
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["materialized_attachments"] == 5
+    assert captured["limit"] == 5
+    assert captured["missing_only"] is True
+    assert captured["commit_every_attachments"] == 25
 
 
 def test_repair_rejects_negative_backfill_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1228,6 +1295,8 @@ endpoint = "http://embedding.test:11434"
         "messages_with_attachments": 1,
         "messages_with_inventory": 0,
         "messages_missing_inventory": 2,
+        "materialized_attachments": 0,
+        "pending_materialization": 2,
         "inline_attachments": 1,
         "non_inline_attachments": 1,
         "state_counts": {"metadata_only": 2},

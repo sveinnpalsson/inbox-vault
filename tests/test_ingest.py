@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
 from dataclasses import replace
+import hashlib
 import json
 
 import pytest
@@ -8,7 +10,13 @@ from googleapiclient.errors import HttpError
 
 from inbox_vault import ingest
 from inbox_vault.config import AccountConfig, IngestTriageConfig
-from inbox_vault.db import get_cursor, message_exists, upsert_message, upsert_message_attachments
+from inbox_vault.db import (
+    get_cursor,
+    message_exists,
+    upsert_message,
+    upsert_message_attachments,
+    upsert_raw,
+)
 from inbox_vault.vectors import count_pending_vector_updates
 from tests.factories import gmail_message_payload
 
@@ -350,6 +358,191 @@ def test_backfill_attachment_inventory_all_records_zero_attachment_messages(
         ("m-no-attach",),
     ).fetchone()
     assert state_row == (0, "metadata_only")
+
+
+def test_materialize_attachment_bytes_uses_inline_payload_data(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+    monkeypatch.setattr(
+        ingest,
+        "fetch_attachment_bytes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("inline attachment should not call Gmail attachment fetch")
+        ),
+    )
+
+    msg_id = "m-inline-cache"
+    raw_payload = gmail_message_payload(
+        msg_id,
+        history_id=700,
+        labels=["INBOX"],
+        attachments=[
+            {
+                "part_id": "2",
+                "attachment_id": "att-inline-cache",
+                "mime_type": "application/pdf",
+                "filename": "report.pdf",
+                "size_bytes": 11,
+                "content_disposition": "attachment",
+                "inline_data_text": "inline-bytes",
+            }
+        ],
+    )
+    upsert_message(
+        conn,
+        {
+            "msg_id": msg_id,
+            "account_email": app_cfg.accounts[0].email,
+            "thread_id": "t-inline-cache",
+            "date_iso": "2026-04-18",
+            "internal_ts": 1713398400000,
+            "from_addr": "sender@example.com",
+            "to_addr": "acct@example.com",
+            "subject": "inline cache",
+            "snippet": "inline cache",
+            "body_text": "inline cache",
+            "labels": ["INBOX"],
+            "history_id": 1,
+        },
+    )
+    upsert_raw(conn, msg_id, app_cfg.accounts[0].email, raw_payload)
+    upsert_message_attachments(
+        conn,
+        msg_id,
+        app_cfg.accounts[0].email,
+        [
+            {
+                "part_id": "2",
+                "gmail_attachment_id": "att-inline-cache",
+                "mime_type": "application/pdf",
+                "filename": "report.pdf",
+                "size_bytes": 11,
+                "content_disposition": "attachment",
+                "content_id": "",
+                "is_inline": False,
+                "inventory_state": "metadata_only",
+            }
+        ],
+    )
+    conn.commit()
+
+    out = ingest.materialize_attachment_bytes(conn, app_cfg)
+
+    assert out["selected_attachments"] == 1
+    assert out["materialized_attachments"] == 1
+    assert out["inline_sourced"] == 1
+    assert out["gmail_fetched"] == 0
+
+    row = conn.execute(
+        """
+        SELECT storage_kind, storage_path, content_sha256, content_size_bytes
+        FROM message_attachments
+        WHERE msg_id = ? AND part_id = ?
+        """,
+        (msg_id, "2"),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "file"
+    cache_path = Path(app_cfg.db.path).resolve().parent / str(row[1])
+    assert cache_path.is_file()
+    assert cache_path.read_bytes() == b"inline-bytes"
+    assert row[2] == hashlib.sha256(b"inline-bytes").hexdigest()
+    assert row[3] == len(b"inline-bytes")
+
+
+def test_materialize_attachment_bytes_fetches_via_gmail_and_recovers_missing_cache(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+
+    msg_id = "m-gmail-cache"
+    raw_payload = gmail_message_payload(
+        msg_id,
+        history_id=701,
+        labels=["INBOX"],
+        attachments=[
+            {
+                "part_id": "2",
+                "attachment_id": "att-gmail-cache",
+                "mime_type": "image/jpeg",
+                "filename": "photo.jpg",
+                "size_bytes": 9,
+                "content_disposition": "attachment",
+            }
+        ],
+    )
+    upsert_message(
+        conn,
+        {
+            "msg_id": msg_id,
+            "account_email": app_cfg.accounts[0].email,
+            "thread_id": "t-gmail-cache",
+            "date_iso": "2026-04-18",
+            "internal_ts": 1713398400000,
+            "from_addr": "sender@example.com",
+            "to_addr": "acct@example.com",
+            "subject": "gmail cache",
+            "snippet": "gmail cache",
+            "body_text": "gmail cache",
+            "labels": ["INBOX"],
+            "history_id": 1,
+        },
+    )
+    upsert_raw(conn, msg_id, app_cfg.accounts[0].email, raw_payload)
+    upsert_message_attachments(
+        conn,
+        msg_id,
+        app_cfg.accounts[0].email,
+        [
+            {
+                "part_id": "2",
+                "gmail_attachment_id": "att-gmail-cache",
+                "mime_type": "image/jpeg",
+                "filename": "photo.jpg",
+                "size_bytes": 9,
+                "content_disposition": "attachment",
+                "content_id": "",
+                "is_inline": False,
+                "inventory_state": "metadata_only",
+            }
+        ],
+    )
+    conn.commit()
+
+    fetch_calls: list[tuple[str, str]] = []
+
+    def _fetch_attachment_bytes(_svc, fetched_msg_id, attachment_id):
+        fetch_calls.append((fetched_msg_id, attachment_id))
+        return b"jpeg-bytes"
+
+    monkeypatch.setattr(ingest, "fetch_attachment_bytes", _fetch_attachment_bytes)
+
+    first = ingest.materialize_attachment_bytes(conn, app_cfg)
+    assert first["gmail_fetched"] == 1
+    row = conn.execute(
+        """
+        SELECT storage_path
+        FROM message_attachments
+        WHERE msg_id = ? AND part_id = ?
+        """,
+        (msg_id, "2"),
+    ).fetchone()
+    assert row is not None
+    cache_path = Path(app_cfg.db.path).resolve().parent / str(row[0])
+    assert cache_path.is_file()
+    cache_path.unlink()
+
+    second = ingest.materialize_attachment_bytes(conn, app_cfg)
+    assert second["selected_attachments"] == 1
+    assert second["materialized_attachments"] == 1
+    assert second["gmail_fetched"] == 1
+    assert fetch_calls == [
+        (msg_id, "att-gmail-cache"),
+        (msg_id, "att-gmail-cache"),
+    ]
 
 
 def test_update_persists_observe_only_ingest_triage(conn, app_cfg, monkeypatch: pytest.MonkeyPatch):

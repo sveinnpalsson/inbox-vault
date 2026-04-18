@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,11 @@ def _compose_source_text(subject: str | None, snippet: str | None, body: str | N
     ).strip()
 
 
+def attachment_key(account_email: str, msg_id: str, part_id: str) -> str:
+    payload = "\0".join([str(account_email or ""), str(msg_id or ""), str(part_id or "")])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def get_conn(db_path: str, password: str):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite.connect(db_path, timeout=30.0, check_same_thread=False)
@@ -102,6 +108,7 @@ def get_conn(db_path: str, password: str):
           msg_id TEXT NOT NULL REFERENCES messages(msg_id) ON DELETE CASCADE,
           account_email TEXT NOT NULL,
           part_id TEXT NOT NULL,
+          attachment_key TEXT NOT NULL DEFAULT '',
           gmail_attachment_id TEXT NOT NULL DEFAULT '',
           mime_type TEXT NOT NULL DEFAULT '',
           filename TEXT NOT NULL DEFAULT '',
@@ -110,6 +117,11 @@ def get_conn(db_path: str, password: str):
           content_id TEXT NOT NULL DEFAULT '',
           is_inline INTEGER NOT NULL DEFAULT 0,
           inventory_state TEXT NOT NULL DEFAULT 'metadata_only',
+          storage_kind TEXT NOT NULL DEFAULT '',
+          storage_path TEXT NOT NULL DEFAULT '',
+          content_sha256 TEXT NOT NULL DEFAULT '',
+          content_size_bytes INTEGER NOT NULL DEFAULT 0,
+          materialized_at TEXT NOT NULL DEFAULT '',
           last_seen_at TEXT NOT NULL,
           PRIMARY KEY (msg_id, part_id)
         );
@@ -320,6 +332,22 @@ def get_conn(db_path: str, password: str):
                 f"ALTER TABLE message_ingest_triage ADD COLUMN {column} {column_type} NOT NULL DEFAULT {default}"
             )
 
+    attachment_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(message_attachments)").fetchall()
+    }
+    for column, column_type, default in [
+        ("attachment_key", "TEXT", "''"),
+        ("storage_kind", "TEXT", "''"),
+        ("storage_path", "TEXT", "''"),
+        ("content_sha256", "TEXT", "''"),
+        ("content_size_bytes", "INTEGER", "0"),
+        ("materialized_at", "TEXT", "''"),
+    ]:
+        if attachment_cols and column not in attachment_cols:
+            conn.execute(
+                f"ALTER TABLE message_attachments ADD COLUMN {column} {column_type} NOT NULL DEFAULT {default}"
+            )
+
     try:
         conn.execute("SELECT count(*) FROM sqlite_master;").fetchone()
     except sqlite.DatabaseError as exc:  # pragma: no cover
@@ -442,6 +470,27 @@ def upsert_message_attachments(
     account_email: str,
     attachments: list[dict[str, Any]],
 ):
+    existing_rows = conn.execute(
+        """
+        SELECT part_id, attachment_key, storage_kind, storage_path, content_sha256,
+               content_size_bytes, materialized_at
+        FROM message_attachments
+        WHERE msg_id = ?
+        """,
+        (msg_id,),
+    ).fetchall()
+    existing_materialization = {
+        str(row[0] or ""): {
+            "attachment_key": str(row[1] or ""),
+            "storage_kind": str(row[2] or ""),
+            "storage_path": str(row[3] or ""),
+            "content_sha256": str(row[4] or ""),
+            "content_size_bytes": int(row[5] or 0),
+            "materialized_at": str(row[6] or ""),
+        }
+        for row in existing_rows
+        if row and row[0] is not None
+    }
     conn.execute("DELETE FROM message_attachments WHERE msg_id = ?", (msg_id,))
 
     seen_at = utc_now()
@@ -450,11 +499,18 @@ def upsert_message_attachments(
         part_id = str(attachment.get("part_id") or "").strip()
         if not part_id:
             continue
+        existing = existing_materialization.get(part_id, {})
+        stable_attachment_key = str(existing.get("attachment_key") or "").strip() or attachment_key(
+            account_email,
+            msg_id,
+            part_id,
+        )
         rows.append(
             (
                 msg_id,
                 account_email,
                 part_id,
+                stable_attachment_key,
                 str(attachment.get("gmail_attachment_id") or "").strip(),
                 str(attachment.get("mime_type") or "").strip().lower(),
                 str(attachment.get("filename") or "").strip(),
@@ -463,6 +519,11 @@ def upsert_message_attachments(
                 str(attachment.get("content_id") or "").strip(),
                 1 if attachment.get("is_inline") else 0,
                 str(attachment.get("inventory_state") or "metadata_only").strip(),
+                str(existing.get("storage_kind") or "").strip(),
+                str(existing.get("storage_path") or "").strip(),
+                str(existing.get("content_sha256") or "").strip(),
+                int(existing.get("content_size_bytes") or 0),
+                str(existing.get("materialized_at") or "").strip(),
                 seen_at,
             )
         )
@@ -471,9 +532,11 @@ def upsert_message_attachments(
         conn.executemany(
             """
             INSERT INTO message_attachments (
-              msg_id, account_email, part_id, gmail_attachment_id, mime_type, filename,
-              size_bytes, content_disposition, content_id, is_inline, inventory_state, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              msg_id, account_email, part_id, attachment_key, gmail_attachment_id, mime_type,
+              filename, size_bytes, content_disposition, content_id, is_inline, inventory_state,
+              storage_kind, storage_path, content_sha256, content_size_bytes, materialized_at,
+              last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -490,6 +553,42 @@ def upsert_message_attachments(
           inventoried_at=excluded.inventoried_at
         """,
         (msg_id, account_email, "metadata_only", len(rows), seen_at),
+    )
+
+
+def update_attachment_materialization(
+    conn,
+    *,
+    msg_id: str,
+    part_id: str,
+    attachment_key_value: str,
+    storage_kind: str,
+    storage_path: str,
+    content_sha256: str,
+    content_size_bytes: int,
+    materialized_at: str,
+):
+    conn.execute(
+        """
+        UPDATE message_attachments
+        SET attachment_key = ?,
+            storage_kind = ?,
+            storage_path = ?,
+            content_sha256 = ?,
+            content_size_bytes = ?,
+            materialized_at = ?
+        WHERE msg_id = ? AND part_id = ?
+        """,
+        (
+            attachment_key_value,
+            storage_kind,
+            storage_path,
+            content_sha256,
+            int(content_size_bytes),
+            materialized_at,
+            msg_id,
+            part_id,
+        ),
     )
 
 

@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import mimetypes
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from googleapiclient.errors import HttpError
 
 from .config import AppConfig
 from .db import (
+    attachment_key,
     get_cursor,
     get_stream_observation_count,
     get_oldest_internal_ts,
     message_exists,
+    update_attachment_materialization,
     upsert_contact_seen,
     upsert_cursor,
     upsert_message_attachments,
@@ -21,6 +27,8 @@ from .db import (
     upsert_raw,
 )
 from .gmail_client import (
+    extract_inline_attachment_bytes,
+    fetch_attachment_bytes,
     fetch_full_message_payload,
     get_authenticated_email,
     get_profile_history_id,
@@ -35,6 +43,7 @@ MAILBOX_SCOPE = "INBOX,SENT"
 LOG = logging.getLogger(__name__)
 
 _PLACEHOLDER_EMAILS = {"you@gmail.com", "operator@example.com", ""}
+_SAFE_ATTACHMENT_EXT_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
 
 
 def _resolve_account_email(acct, service) -> None:
@@ -329,6 +338,276 @@ def backfill_attachment_inventory(
         {
             "event": "stage",
             "stage": "attachment_backfill_done",
+            **stats,
+        },
+    )
+
+    return stats
+
+
+def _safe_attachment_extension(mime_type: str) -> str:
+    normalized = str(mime_type or "").split(";", 1)[0].strip().lower()
+    ext = mimetypes.guess_extension(normalized) or ".bin"
+    if ext == ".jpe":
+        ext = ".jpg"
+    if not _SAFE_ATTACHMENT_EXT_RE.match(ext):
+        return ".bin"
+    return ext
+
+
+def _attachment_materialization_relpath(
+    *,
+    account_email: str,
+    attachment_key_value: str,
+    mime_type: str,
+) -> str:
+    account_key = hashlib.sha256(str(account_email or "").encode("utf-8")).hexdigest()[:16]
+    filename = f"{attachment_key_value}{_safe_attachment_extension(mime_type)}"
+    return str(Path("attachments") / account_key / attachment_key_value[:2] / filename)
+
+
+def _attachment_materialization_candidates(conn, *, account_email: str) -> list[dict[str, str]]:
+    rows = conn.execute(
+        """
+        SELECT msg_id, account_email, part_id, attachment_key, gmail_attachment_id, mime_type,
+               storage_kind, storage_path
+        FROM message_attachments
+        WHERE account_email = ?
+        ORDER BY COALESCE(last_seen_at, '') DESC, msg_id DESC, part_id DESC
+        """,
+        (account_email,),
+    ).fetchall()
+    return [
+        {
+            "msg_id": str(row[0] or ""),
+            "account_email": str(row[1] or ""),
+            "part_id": str(row[2] or ""),
+            "attachment_key": str(row[3] or ""),
+            "gmail_attachment_id": str(row[4] or ""),
+            "mime_type": str(row[5] or ""),
+            "storage_kind": str(row[6] or ""),
+            "storage_path": str(row[7] or ""),
+        }
+        for row in rows
+        if row and row[0] is not None and row[2] is not None
+    ]
+
+
+def materialize_attachment_bytes(
+    conn,
+    cfg: AppConfig,
+    *,
+    limit: int | None = None,
+    missing_only: bool = True,
+    account_email: str | None = None,
+    commit_every_attachments: int = 100,
+    progress_callback: _ProgressCallback | None = None,
+) -> dict[str, Any]:
+    safe_limit = None if limit is None else max(1, int(limit))
+    safe_commit_every = max(1, int(commit_every_attachments))
+    progress_every = max(1, int(cfg.gmail_progress_every))
+    db_dir = Path(cfg.db.path).resolve().parent
+
+    stats: dict[str, Any] = {
+        "accounts": 0,
+        "limit": safe_limit,
+        "missing_only": bool(missing_only),
+        "selected_attachments": 0,
+        "processed_attachments": 0,
+        "materialized_attachments": 0,
+        "failed_attachments": 0,
+        "bytes_written": 0,
+        "inline_sourced": 0,
+        "gmail_fetched": 0,
+    }
+
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "stage",
+            "stage": "attachment_materialize_start",
+            "accounts_total": len(cfg.accounts),
+            "limit": safe_limit,
+            "missing_only": bool(missing_only),
+            "account_filter": account_email,
+            "commit_every_attachments": safe_commit_every,
+            "progress_every": progress_every,
+        },
+    )
+
+    processed_since_commit = 0
+    remaining = safe_limit
+
+    for acct_idx, acct in enumerate(cfg.accounts, start=1):
+        service = get_service(
+            acct.credentials_file,
+            acct.token_file,
+            timeout_seconds=cfg.gmail_request_timeout_seconds,
+        )
+        _resolve_account_email(acct, service)
+
+        if account_email and acct.email != account_email:
+            continue
+
+        stats["accounts"] += 1
+        candidates = []
+        for candidate in _attachment_materialization_candidates(conn, account_email=acct.email):
+            attachment_key_value = (
+                str(candidate.get("attachment_key") or "").strip()
+                or attachment_key(acct.email, candidate["msg_id"], candidate["part_id"])
+            )
+            storage_path = str(candidate.get("storage_path") or "").strip()
+            abs_path = db_dir / storage_path if storage_path else None
+            already_materialized = bool(
+                str(candidate.get("storage_kind") or "").strip() == "file"
+                and storage_path
+                and abs_path is not None
+                and abs_path.is_file()
+            )
+            if missing_only and already_materialized:
+                continue
+            candidate["attachment_key"] = attachment_key_value
+            candidates.append(candidate)
+            if remaining is not None and len(candidates) >= remaining:
+                break
+
+        stats["selected_attachments"] += len(candidates)
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "stage",
+                "stage": "attachment_materialize_account_start",
+                "account": acct.email,
+                "account_index": acct_idx,
+                "accounts_total": len(cfg.accounts),
+                "selected_attachments": len(candidates),
+            },
+        )
+
+        account_processed = 0
+        account_materialized = 0
+        account_failed = 0
+
+        for candidate in candidates:
+            account_processed += 1
+            stats["processed_attachments"] += 1
+            msg_id = candidate["msg_id"]
+            part_id = candidate["part_id"]
+            attachment_key_value = candidate["attachment_key"]
+            try:
+                raw_row = conn.execute(
+                    "SELECT raw_json FROM raw_messages WHERE msg_id = ?",
+                    (msg_id,),
+                ).fetchone()
+                raw_payload = None
+                if raw_row and raw_row[0]:
+                    raw_payload = json.loads(str(raw_row[0]))
+
+                payload_bytes = None
+                source = ""
+                if raw_payload is not None:
+                    payload_bytes = extract_inline_attachment_bytes(raw_payload, part_id)
+                    if payload_bytes is not None:
+                        source = "inline"
+
+                if payload_bytes is None:
+                    gmail_attachment_id = str(candidate.get("gmail_attachment_id") or "").strip()
+                    if not gmail_attachment_id:
+                        raise RuntimeError("attachment bytes unavailable: missing inline data and gmail_attachment_id")
+                    payload_bytes = fetch_attachment_bytes(service, msg_id, gmail_attachment_id)
+                    source = "gmail_attachment_get"
+
+                relpath = _attachment_materialization_relpath(
+                    account_email=acct.email,
+                    attachment_key_value=attachment_key_value,
+                    mime_type=str(candidate.get("mime_type") or ""),
+                )
+                abs_path = db_dir / relpath
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = abs_path.with_name(abs_path.name + ".tmp")
+                tmp_path.write_bytes(payload_bytes)
+                tmp_path.replace(abs_path)
+
+                checksum = hashlib.sha256(payload_bytes).hexdigest()
+                materialized_at = datetime.now(timezone.utc).isoformat()
+                update_attachment_materialization(
+                    conn,
+                    msg_id=msg_id,
+                    part_id=part_id,
+                    attachment_key_value=attachment_key_value,
+                    storage_kind="file",
+                    storage_path=relpath,
+                    content_sha256=checksum,
+                    content_size_bytes=len(payload_bytes),
+                    materialized_at=materialized_at,
+                )
+                stats["materialized_attachments"] += 1
+                stats["bytes_written"] += len(payload_bytes)
+                if source == "inline":
+                    stats["inline_sourced"] += 1
+                else:
+                    stats["gmail_fetched"] += 1
+                account_materialized += 1
+            except Exception:
+                LOG.exception(
+                    "Failed to materialize attachment bytes for message_id=%s part_id=%s account=%s",
+                    msg_id,
+                    part_id,
+                    acct.email,
+                )
+                stats["failed_attachments"] += 1
+                account_failed += 1
+
+            processed_since_commit += 1
+            if processed_since_commit >= safe_commit_every:
+                conn.commit()
+                processed_since_commit = 0
+
+            if account_processed % progress_every == 0:
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "event": "progress",
+                        "stage": "attachment_materialize_account",
+                        "account": acct.email,
+                        "account_index": acct_idx,
+                        "accounts_total": len(cfg.accounts),
+                        "selected_attachments": len(candidates),
+                        "processed_attachments": stats["processed_attachments"],
+                        "materialized_attachments": stats["materialized_attachments"],
+                        "failed_attachments": stats["failed_attachments"],
+                        "bytes_written": stats["bytes_written"],
+                    },
+                )
+
+        conn.commit()
+        processed_since_commit = 0
+
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "stage",
+                "stage": "attachment_materialize_account_done",
+                "account": acct.email,
+                "account_index": acct_idx,
+                "accounts_total": len(cfg.accounts),
+                "selected_attachments": len(candidates),
+                "account_processed": account_processed,
+                "account_materialized": account_materialized,
+                "account_failed": account_failed,
+            },
+        )
+
+        if remaining is not None:
+            remaining = max(0, remaining - len(candidates))
+            if remaining == 0:
+                break
+
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "stage",
+            "stage": "attachment_materialize_done",
             **stats,
         },
     )

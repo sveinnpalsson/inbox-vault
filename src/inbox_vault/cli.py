@@ -17,7 +17,13 @@ from .db import (
 )
 from .enrich import enrich_pending
 from .evals import bootstrap_eval_template, run_retrieval_eval
-from .ingest import backfill, backfill_attachment_inventory, repair, update
+from .ingest import (
+    backfill,
+    backfill_attachment_inventory,
+    materialize_attachment_bytes,
+    repair,
+    update,
+)
 from .profiles import build_profiles
 from .redaction import (
     REDACTION_POLICY_VERSION,
@@ -214,6 +220,29 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=100,
         help="Commit attachment inventory progress every N processed messages.",
+    )
+
+    p_attachment_materialize = sub.add_parser(
+        "materialize-attachments",
+        help="Materialize attachment bytes into the local cache for downstream consumers",
+    )
+    p_attachment_materialize.add_argument("--account-email", default=None)
+    p_attachment_materialize.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional global cap for attachments materialized in this run.",
+    )
+    p_attachment_materialize.add_argument(
+        "--all",
+        action="store_true",
+        help="Rewrite all cached attachments in scope, not just attachments missing a valid materialized file.",
+    )
+    p_attachment_materialize.add_argument(
+        "--commit-every",
+        type=int,
+        default=100,
+        help="Commit materialization progress every N processed attachments.",
     )
 
     p_enrich = sub.add_parser("enrich", help="Enrich unprocessed emails using local LLM")
@@ -746,6 +775,16 @@ def run_status(conn, cfg) -> dict[str, object]:
     inline_attachments = int(
         conn.execute("SELECT count(*) FROM message_attachments WHERE is_inline = 1").fetchone()[0]
     )
+    materialized_attachments = int(
+        conn.execute(
+            """
+            SELECT count(*)
+            FROM message_attachments
+            WHERE COALESCE(storage_kind, '') = 'file'
+              AND COALESCE(storage_path, '') != ''
+            """
+        ).fetchone()[0]
+    )
     attachment_state_counts = {
         str(state or ""): int(count)
         for state, count in conn.execute(
@@ -859,6 +898,8 @@ def run_status(conn, cfg) -> dict[str, object]:
             "messages_with_attachments": attachment_messages,
             "messages_with_inventory": inventory_messages,
             "messages_missing_inventory": missing_inventory_messages,
+            "materialized_attachments": materialized_attachments,
+            "pending_materialization": max(0, attachment_total - materialized_attachments),
             "inline_attachments": inline_attachments,
             "non_inline_attachments": max(0, attachment_total - inline_attachments),
             "state_counts": attachment_state_counts,
@@ -1153,6 +1194,15 @@ def _emit_ingest_progress(event: dict) -> None:
                 f"failed={int(event.get('failed_messages') or 0)} "
                 f"attachments={int(event.get('attachments_upserted') or 0)}"
             )
+        elif stage == "attachment_materialize_account":
+            line = (
+                f"[ingest-progress] attachment_materialize acct={account} ({account_pos}/{account_total}) "
+                f"selected={int(event.get('selected_attachments') or 0)} "
+                f"processed={int(event.get('processed_attachments') or 0)} "
+                f"materialized={int(event.get('materialized_attachments') or 0)} "
+                f"failed={int(event.get('failed_attachments') or 0)} "
+                f"bytes={int(event.get('bytes_written') or 0)}"
+            )
         else:
             new_ids = int(event.get("new_ids") or event.get("new_ids_total") or 0)
             ingested = int(event.get("ingested") or 0)
@@ -1190,6 +1240,14 @@ def _emit_ingest_progress(event: dict) -> None:
                 f"refreshed={int(event.get('account_refreshed') or 0)} "
                 f"failed={int(event.get('account_failed') or 0)}"
             )
+        elif stage in {"attachment_materialize_account_start", "attachment_materialize_account_done"}:
+            line = (
+                f"[ingest-stage] {stage} acct={account} "
+                f"selected={int(event.get('selected_attachments') or 0)} "
+                f"processed={int(event.get('account_processed') or 0)} "
+                f"materialized={int(event.get('account_materialized') or 0)} "
+                f"failed={int(event.get('account_failed') or 0)}"
+            )
         elif stage in {
             "update_start",
             "update_done",
@@ -1199,6 +1257,8 @@ def _emit_ingest_progress(event: dict) -> None:
             "repair_done",
             "attachment_backfill_start",
             "attachment_backfill_done",
+            "attachment_materialize_start",
+            "attachment_materialize_done",
         }:
             line = f"[ingest-stage] {stage}"
         else:
@@ -1377,7 +1437,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    if args.command in {"backfill", "update", "repair", "backfill-attachments"}:
+    if args.command in {"backfill", "update", "repair", "backfill-attachments", "materialize-attachments"}:
         _validate_accounts(cfg)
 
     conn = get_conn(cfg.db.path, password)
@@ -1588,6 +1648,28 @@ def main(argv: list[str] | None = None) -> None:
                         missing_only=not args.all,
                         account_email=args.account_email,
                         commit_every_messages=args.commit_every,
+                        progress_callback=_emit_ingest_progress,
+                    ),
+                    indent=2,
+                )
+            )
+            return
+
+        if args.command == "materialize-attachments":
+            if args.limit is not None and args.limit < 1:
+                raise ValueError("--limit must be >= 1")
+            if args.commit_every < 1:
+                raise ValueError("--commit-every must be >= 1")
+
+            print(
+                json.dumps(
+                    materialize_attachment_bytes(
+                        conn,
+                        cfg,
+                        limit=args.limit,
+                        missing_only=not args.all,
+                        account_email=args.account_email,
+                        commit_every_attachments=args.commit_every,
                         progress_callback=_emit_ingest_progress,
                     ),
                     indent=2,
