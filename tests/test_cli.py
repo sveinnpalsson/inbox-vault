@@ -586,8 +586,43 @@ def test_repair_defaults_run_enrich_and_index(tmp_path: Path, monkeypatch: pytes
     assert out["index_vectors"]["indexed"] == 2
     assert enrich_calls["count"] == 1
     assert enrich_kwargs["include_degraded"] is True
+    assert enrich_kwargs["limit"] is None
     assert captured["pending_only"] is True
     assert captured["skip_applied_light"] is False
+
+
+def test_repair_enrich_limit_passthrough(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    cfg = tmp_path / "config.toml"
+    _write_config(cfg)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+
+    monkeypatch.setattr(
+        cli,
+        "repair",
+        lambda *_args, **_kwargs: {"backfill_ingested": 0, "interrupted": False},
+    )
+    captured: dict[str, object] = {}
+
+    def fake_enrich(*_args, **kwargs):
+        captured.update(kwargs)
+        return 7
+
+    monkeypatch.setattr(cli, "enrich_pending", fake_enrich)
+    monkeypatch.setattr(cli, "count_pending_vector_updates", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        cli,
+        "index_vectors",
+        lambda *_args, **_kwargs: {"scanned": 0, "indexed": 0, "unchanged": 0, "failed": 0},
+    )
+
+    cli.main(["--config", str(cfg), "repair", "--backfill-limit", "0", "--enrich-limit", "25"])
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["enrich"]["updated"] == 7
+    assert captured["limit"] == 25
 
 
 def test_repair_emits_post_ingest_progress_to_stderr(
@@ -597,6 +632,8 @@ def test_repair_emits_post_ingest_progress_to_stderr(
     _write_config(cfg)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+    perf_values = iter([100.0, 105.0, 112.0])
+    monkeypatch.setattr(cli.time, "perf_counter", lambda: next(perf_values))
 
     monkeypatch.setattr(
         cli,
@@ -624,6 +661,7 @@ def test_repair_emits_post_ingest_progress_to_stderr(
                 "http_failed": 1,
                 "parse_failed": 3,
                 "contract_failed": 1,
+                "elapsed_s": 20.0,
             }
         )
         progress_callback(
@@ -641,17 +679,28 @@ def test_repair_emits_post_ingest_progress_to_stderr(
                     "repair_attempted": 1,
                     "repair_succeeded": 1,
                 },
+                "elapsed_s": 24.0,
             }
         )
         return 12
 
     monkeypatch.setattr(cli, "enrich_pending", fake_enrich)
     monkeypatch.setattr(cli, "count_pending_vector_updates", lambda *_args, **_kwargs: 5)
-    monkeypatch.setattr(
-        cli,
-        "index_vectors",
-        lambda *_args, **_kwargs: {"scanned": 5, "indexed": 4, "unchanged": 1, "failed": 0},
-    )
+
+    def fake_index_vectors(*_args, **kwargs):
+        progress_callback = kwargs["progress_callback"]
+        progress_callback(
+            {
+                "event": "message_done",
+                "position": 3,
+                "total": 12,
+                "indexed": 3,
+                "failed": 0,
+            }
+        )
+        return {"scanned": 12, "indexed": 10, "unchanged": 2, "failed": 0}
+
+    monkeypatch.setattr(cli, "index_vectors", fake_index_vectors)
 
     cli.main(["--config", str(cfg), "repair", "--backfill-limit", "5"])
 
@@ -660,16 +709,21 @@ def test_repair_emits_post_ingest_progress_to_stderr(
     assert "[repair-phase] enrich_start total=12 include_degraded=true" in err_lines
     assert (
         "[repair-phase] enrich_progress completed=10/12 fallback_used=2 http_failed=1 "
-        "parse_failed=3 contract_failed=1"
+        "parse_failed=3 contract_failed=1 rate_per_min=30.00 eta_s=4"
     ) in err_lines
     assert (
         "[repair-phase] enrich_done updated=12 attempted=12 succeeded=12 fallback_used=2 "
-        "http_failed=1 parse_failed=3 contract_failed=1 repair_attempted=1 repair_succeeded=1"
+        "http_failed=1 parse_failed=3 contract_failed=1 repair_attempted=1 repair_succeeded=1 "
+        "elapsed_s=24.0 rate_per_min=30.00"
     ) in err_lines
     assert "[repair-phase] index_start" in err_lines
     assert (
-        "[repair-phase] index_done scanned=5 indexed=4 unchanged=1 failed=0 "
-        "pending_before=5 pending_after=5 skip_applied_light=False"
+        "[repair-phase] index_progress completed=3/12 indexed=3 failed=0 "
+        "rate_per_min=36.00 eta_s=15"
+    ) in err_lines
+    assert (
+        "[repair-phase] index_done scanned=12 indexed=10 unchanged=2 failed=0 "
+        "pending_before=5 pending_after=5 skip_applied_light=False elapsed_s=12.0 rate_per_min=60.00"
     ) in err_lines
 
 

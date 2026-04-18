@@ -874,32 +874,37 @@ def upsert_enrichment(conn, msg_id: str, data: dict[str, Any], model: str):
 def enrichment_repair_candidates(
     conn,
     *,
-    limit: int = 1000,
+    limit: int | None = 1000,
     include_degraded: bool = False,
 ):
-    safe_limit = max(1, int(limit))
+    limit_sql = ""
+    params: tuple[object, ...] = ()
+    if limit is not None:
+        safe_limit = max(1, int(limit))
+        limit_sql = " LIMIT ?"
+        params = (safe_limit,)
     if include_degraded:
         return conn.execute(
-            """
+            f"""
             SELECT m.msg_id, m.subject, m.snippet, m.body_text, m.from_addr, m.to_addr, m.date_iso
             FROM messages m
             LEFT JOIN message_enrichment e ON e.msg_id = m.msg_id
             WHERE e.msg_id IS NULL OR COALESCE(e.model, '') = 'heuristic-fallback'
             ORDER BY COALESCE(m.internal_ts, 0) DESC
-            LIMIT ?
+            {limit_sql}
             """,
-            (safe_limit,),
+            params,
         ).fetchall()
     return conn.execute(
-        """
+        f"""
         SELECT m.msg_id, m.subject, m.snippet, m.body_text, m.from_addr, m.to_addr, m.date_iso
         FROM messages m
         LEFT JOIN message_enrichment e ON e.msg_id = m.msg_id
         WHERE e.msg_id IS NULL
         ORDER BY COALESCE(m.internal_ts, 0) DESC
-        LIMIT ?
+        {limit_sql}
         """,
-        (safe_limit,),
+        params,
     ).fetchall()
 
 

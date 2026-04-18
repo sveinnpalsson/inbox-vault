@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import requests
@@ -168,7 +169,7 @@ def _repair_enrichment_json(
 def enrich_pending(
     conn,
     cfg: AppConfig,
-    limit: int = 200,
+    limit: int | None = 200,
     diagnostics: LLMDiagnostics | None = None,
     *,
     include_degraded: bool = False,
@@ -181,6 +182,7 @@ def enrich_pending(
         return 0
 
     rows = enrichment_repair_candidates(conn, limit=limit, include_degraded=include_degraded)
+    started_at = time.perf_counter()
     if progress_callback is not None:
         progress_callback(
             {
@@ -289,6 +291,7 @@ def enrich_pending(
                     "http_failed": stats["http_failed"],
                     "parse_failed": stats["parse_failed"],
                     "contract_failed": stats["contract_failed"],
+                    "elapsed_s": time.perf_counter() - started_at,
                 }
             )
 
@@ -303,6 +306,7 @@ def enrich_pending(
                 "updated": count,
                 "total": len(rows),
                 "diagnostics": dict(stats),
+                "elapsed_s": time.perf_counter() - started_at,
             }
         )
     LOG.info(

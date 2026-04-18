@@ -4,6 +4,7 @@ import argparse
 import json
 import socket
 import sys
+import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
@@ -174,6 +175,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Run pending enrichment repair (default: enabled; use --no-enrich to skip).",
+    )
+    p_repair.add_argument(
+        "--enrich-limit",
+        type=int,
+        default=None,
+        help="Optional per-run cap for enrichment repair (default: process the full pending backlog).",
     )
     p_repair.add_argument(
         "--index-vectors",
@@ -1335,55 +1342,113 @@ def _format_repair_index_summary(result: dict[str, int | str]) -> str:
     return " ".join(parts)
 
 
-def _emit_repair_progress(event: dict) -> None:
-    event_name = str(event.get("event") or "")
-    stage = str(event.get("stage") or "")
+def _format_eta_s(completed: int, total: int, elapsed_s: float) -> str:
+    if completed < 3 or elapsed_s < 1.0 or total <= completed:
+        return ""
+    per_item_s = elapsed_s / completed
+    return f" eta_s={int(round((total - completed) * per_item_s))}"
 
-    if event_name == "stage" and stage == "enrich_start":
-        total = int(event.get("total") or 0)
-        include_degraded = bool(event.get("include_degraded"))
-        print(
-            f"[repair-phase] enrich_start total={total} include_degraded={str(include_degraded).lower()}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return
 
-    if event_name == "progress" and stage == "enrich_progress":
-        print(
-            "[repair-phase] enrich_progress "
-            f"completed={int(event.get('completed') or 0)}/{int(event.get('total') or 0)} "
-            f"fallback_used={int(event.get('fallback_used') or 0)} "
-            f"http_failed={int(event.get('http_failed') or 0)} "
-            f"parse_failed={int(event.get('parse_failed') or 0)} "
-            f"contract_failed={int(event.get('contract_failed') or 0)}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return
+def _format_rate_per_min(completed: int, elapsed_s: float) -> str:
+    if completed <= 0 or elapsed_s <= 0:
+        return ""
+    return f" rate_per_min={(completed / elapsed_s) * 60.0:.2f}"
 
-    if event_name == "stage" and stage == "enrich_done":
-        diagnostics = dict(event.get("diagnostics") or {})
-        print(
-            "[repair-phase] enrich_done "
-            f"updated={int(event.get('updated') or 0)} "
-            + _format_repair_diag_summary(diagnostics),
-            file=sys.stderr,
-            flush=True,
-        )
-        return
 
-    if event_name == "stage" and stage == "index_start":
-        print("[repair-phase] index_start", file=sys.stderr, flush=True)
-        return
+def _make_repair_progress_emitter():
+    state = {
+        "index_started_at": None,
+    }
 
-    if event_name == "stage" and stage == "index_done":
-        result = dict(event.get("result") or {})
-        print(
-            "[repair-phase] index_done " + _format_repair_index_summary(result),
-            file=sys.stderr,
-            flush=True,
-        )
+    def _emit(event: dict) -> None:
+        event_name = str(event.get("event") or "")
+        stage = str(event.get("stage") or "")
+
+        if event_name == "stage" and stage == "enrich_start":
+            total = int(event.get("total") or 0)
+            include_degraded = bool(event.get("include_degraded"))
+            print(
+                f"[repair-phase] enrich_start total={total} include_degraded={str(include_degraded).lower()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        if event_name == "progress" and stage == "enrich_progress":
+            completed = int(event.get("completed") or 0)
+            total = int(event.get("total") or 0)
+            elapsed_s = float(event.get("elapsed_s") or 0.0)
+            line = (
+                "[repair-phase] enrich_progress "
+                f"completed={completed}/{total} "
+                f"fallback_used={int(event.get('fallback_used') or 0)} "
+                f"http_failed={int(event.get('http_failed') or 0)} "
+                f"parse_failed={int(event.get('parse_failed') or 0)} "
+                f"contract_failed={int(event.get('contract_failed') or 0)}"
+                f"{_format_rate_per_min(completed, elapsed_s)}"
+                f"{_format_eta_s(completed, total, elapsed_s)}"
+            )
+            print(line, file=sys.stderr, flush=True)
+            return
+
+        if event_name == "stage" and stage == "enrich_done":
+            diagnostics = dict(event.get("diagnostics") or {})
+            updated = int(event.get("updated") or 0)
+            elapsed_s = float(event.get("elapsed_s") or 0.0)
+            line = (
+                "[repair-phase] enrich_done "
+                f"updated={updated} "
+                + _format_repair_diag_summary(diagnostics)
+                + f" elapsed_s={elapsed_s:.1f}"
+                + _format_rate_per_min(updated, elapsed_s)
+            )
+            print(line, file=sys.stderr, flush=True)
+            return
+
+        if event_name == "stage" and stage == "index_start":
+            state["index_started_at"] = time.perf_counter()
+            print("[repair-phase] index_start", file=sys.stderr, flush=True)
+            return
+
+        if event_name in {
+            "message_done",
+            "message_failed",
+            "message_unchanged",
+            "message_skipped_filtered",
+        }:
+            completed = int(event.get("position") or 0)
+            total = int(event.get("total") or 0)
+            if completed <= 0 or total <= 0:
+                return
+            if completed not in {1, 3, total} and completed % 10 != 0:
+                return
+            started_at = state.get("index_started_at")
+            elapsed_s = max(0.0, time.perf_counter() - started_at) if started_at is not None else 0.0
+            line = (
+                "[repair-phase] index_progress "
+                f"completed={completed}/{total} "
+                f"indexed={int(event.get('indexed') or 0)} "
+                f"failed={int(event.get('failed') or 0)}"
+                f"{_format_rate_per_min(completed, elapsed_s)}"
+                f"{_format_eta_s(completed, total, elapsed_s)}"
+            )
+            print(line, file=sys.stderr, flush=True)
+            return
+
+        if event_name == "stage" and stage == "index_done":
+            result = dict(event.get("result") or {})
+            started_at = state.get("index_started_at")
+            elapsed_s = max(0.0, time.perf_counter() - started_at) if started_at is not None else 0.0
+            processed = int(result.get("scanned") or 0)
+            line = (
+                "[repair-phase] index_done "
+                + _format_repair_index_summary(result)
+                + f" elapsed_s={elapsed_s:.1f}"
+                + _format_rate_per_min(processed, elapsed_s)
+            )
+            print(line, file=sys.stderr, flush=True)
+
+    return _emit
 
 
 def _run_index_vectors_for_ingest(
@@ -1392,6 +1457,7 @@ def _run_index_vectors_for_ingest(
     *,
     limit: int | None,
     pending_only: bool,
+    progress_callback=_emit_index_progress,
 ) -> dict[str, int | str]:
     skip_applied_light = bool(cfg.ingest_triage.enabled and cfg.ingest_triage.mode == "enforce")
     pending_before = count_pending_vector_updates(
@@ -1406,7 +1472,7 @@ def _run_index_vectors_for_ingest(
         index_level=INDEX_LEVEL_REDACTED,
         limit=limit,
         pending_only=pending_only,
-        progress_callback=_emit_index_progress,
+        progress_callback=progress_callback,
         skip_applied_light=skip_applied_light,
     )
     pending_after = count_pending_vector_updates(
@@ -1661,6 +1727,8 @@ def main(argv: list[str] | None = None) -> None:
                 raise ValueError("--backfill-limit must be >= 0")
             if args.commit_every < 1:
                 raise ValueError("--commit-every must be >= 1")
+            if args.enrich_limit is not None and args.enrich_limit < 1:
+                raise ValueError("--enrich-limit must be >= 1")
             if args.index_limit is not None and args.index_limit < 1:
                 raise ValueError("--index-limit must be >= 1")
 
@@ -1674,6 +1742,7 @@ def main(argv: list[str] | None = None) -> None:
             index_limit = (
                 args.index_limit if args.index_limit is not None else cfg.indexing.auto_index_limit
             )
+            repair_progress = _make_repair_progress_emitter()
 
             out: dict[str, object] = {
                 "ingest": repair(
@@ -1695,23 +1764,25 @@ def main(argv: list[str] | None = None) -> None:
                     "updated": enrich_pending(
                         conn,
                         cfg,
+                        limit=args.enrich_limit,
                         diagnostics=enrich_diag,
                         include_degraded=True,
-                        progress_callback=_emit_repair_progress,
+                        progress_callback=repair_progress,
                     ),
                     "repair_scope": "pending+heuristic-fallback",
                     "diagnostics": enrich_diag,
                 }
 
             if args.index_vectors:
-                _emit_repair_progress({"event": "stage", "stage": "index_start"})
+                repair_progress({"event": "stage", "stage": "index_start"})
                 out["index_vectors"] = _run_index_vectors_for_ingest(
                     conn,
                     cfg,
                     limit=index_limit,
                     pending_only=pending_only,
+                    progress_callback=repair_progress,
                 )
-                _emit_repair_progress(
+                repair_progress(
                     {
                         "event": "stage",
                         "stage": "index_done",
