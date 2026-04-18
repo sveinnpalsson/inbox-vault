@@ -273,11 +273,67 @@ def parse_address_header(value: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _walk_parts(parts: Iterable[dict], collected: dict[str, str]):
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _part_headers(part: dict[str, Any]) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for header in part.get("headers", []) or []:
+        name = str(header.get("name") or "").strip().lower()
+        if not name:
+            continue
+        headers[name] = str(header.get("value") or "").strip()
+    return headers
+
+
+def _is_attachment_part(part: dict[str, Any]) -> bool:
+    body = part.get("body") or {}
+    if body.get("attachmentId"):
+        return True
+    return bool(str(part.get("filename") or "").strip())
+
+
+def _collect_parts(
+    parts: Iterable[dict[str, Any]],
+    *,
+    collected: dict[str, str],
+    attachments: list[dict[str, Any]],
+):
     for part in parts:
-        mime = part.get("mimeType", "")
-        data = (part.get("body") or {}).get("data")
-        if mime in ("text/plain", "text/html") and data:
+        body = part.get("body") or {}
+        mime = str(part.get("mimeType") or "").strip().lower()
+        is_attachment = _is_attachment_part(part)
+
+        if is_attachment:
+            headers = _part_headers(part)
+            disposition = headers.get("content-disposition", "")
+            content_id = headers.get("content-id", "")
+            gmail_attachment_id = str(body.get("attachmentId") or "").strip()
+            part_id = str(part.get("partId") or "").strip()
+            if not part_id:
+                part_id = gmail_attachment_id or f"attachment-{len(attachments) + 1}"
+            disposition_lower = disposition.lower()
+            attachments.append(
+                {
+                    "part_id": part_id,
+                    "gmail_attachment_id": gmail_attachment_id,
+                    "mime_type": mime,
+                    "filename": str(part.get("filename") or "").strip(),
+                    "size_bytes": _coerce_int(body.get("size")),
+                    "content_disposition": disposition,
+                    "content_id": content_id,
+                    "is_inline": disposition_lower.startswith("inline")
+                    or (not disposition_lower and bool(content_id)),
+                    "inventory_state": "metadata_only",
+                }
+            )
+
+        data = body.get("data")
+        if not is_attachment and mime in ("text/plain", "text/html") and data:
             try:
                 # Gmail base64url data may be missing padding.
                 padding = "=" * (-len(data) % 4)
@@ -290,7 +346,7 @@ def _walk_parts(parts: Iterable[dict], collected: dict[str, str]):
                 pass
         nested = part.get("parts") or []
         if nested:
-            _walk_parts(nested, collected)
+            _collect_parts(nested, collected=collected, attachments=attachments)
 
 
 def payload_to_record(raw: dict[str, Any], account_email: str) -> dict[str, Any]:
@@ -316,7 +372,8 @@ def payload_to_record(raw: dict[str, Any], account_email: str) -> dict[str, Any]
     payload = raw.get("payload", {})
     parts = payload.get("parts") or [payload]
     collected = {"plain": "", "html": ""}
-    _walk_parts(parts, collected)
+    attachments: list[dict[str, Any]] = []
+    _collect_parts(parts, collected=collected, attachments=attachments)
 
     if collected["plain"].strip():
         body = collected["plain"]
@@ -341,6 +398,7 @@ def payload_to_record(raw: dict[str, Any], account_email: str) -> dict[str, Any]
         "body_text": body,
         "labels": raw.get("labelIds", []),
         "history_id": int(raw.get("historyId")) if raw.get("historyId") else None,
+        "attachments": attachments,
     }
 
 

@@ -15,6 +15,7 @@ from .db import (
     message_exists,
     upsert_contact_seen,
     upsert_cursor,
+    upsert_message_attachments,
     upsert_message_ingest_triage,
     upsert_message,
     upsert_raw,
@@ -130,6 +131,12 @@ def _ingest_message_id(conn, cfg: AppConfig, service, account_email: str, msg_id
 
         upsert_message(conn, rec)
         upsert_raw(conn, rec["msg_id"], account_email, raw)
+        upsert_message_attachments(
+            conn,
+            rec["msg_id"],
+            account_email,
+            list(rec.get("attachments", [])),
+        )
         _update_contacts_from_record(conn, rec)
         _persist_observe_only_triage(conn, cfg, rec=rec, raw_payload=raw)
         return True

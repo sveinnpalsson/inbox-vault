@@ -122,6 +122,67 @@ def test_update_counts_failed_ingest_and_continues(conn, app_cfg, monkeypatch: p
     }
 
 
+def test_update_persists_attachment_inventory_metadata_only(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+    monkeypatch.setattr(ingest, "get_profile_history_id", lambda *_: 400)
+    monkeypatch.setattr(
+        ingest, "list_incremental_added_ids", lambda *_args, **_kwargs: ({"m-attach"}, 450)
+    )
+
+    payload = gmail_message_payload(
+        "m-attach",
+        history_id=450,
+        labels=["INBOX"],
+        attachments=[
+            {
+                "part_id": "2",
+                "attachment_id": "att-pdf",
+                "mime_type": "application/pdf",
+                "filename": "invoice.pdf",
+                "size_bytes": 2048,
+                "content_disposition": "attachment",
+            },
+            {
+                "part_id": "3",
+                "attachment_id": "att-inline",
+                "mime_type": "image/png",
+                "filename": "logo.png",
+                "size_bytes": 512,
+                "content_disposition": "inline",
+                "content_id": "<logo-1>",
+            },
+        ],
+    )
+    monkeypatch.setattr(ingest, "fetch_full_message_payload", lambda *_args, **_kwargs: payload)
+
+    out = ingest.update(conn, app_cfg)
+
+    assert out == {
+        "accounts": 1,
+        "new_ids": 1,
+        "ingested": 1,
+        "cursor_resets": 0,
+        "failed": 0,
+    }
+    rows = conn.execute(
+        """
+        SELECT part_id, gmail_attachment_id, mime_type, filename, size_bytes,
+               content_disposition, content_id, is_inline, inventory_state
+        FROM message_attachments
+        WHERE msg_id = ?
+        ORDER BY part_id
+        """,
+        ("m-attach",),
+    ).fetchall()
+    assert rows == [
+        ("2", "att-pdf", "application/pdf", "invoice.pdf", 2048, "attachment", "", 0, "metadata_only"),
+        ("3", "att-inline", "image/png", "logo.png", 512, "inline", "<logo-1>", 1, "metadata_only"),
+    ]
+
+
 def test_update_persists_observe_only_ingest_triage(conn, app_cfg, monkeypatch: pytest.MonkeyPatch):
     triage_cfg = replace(app_cfg, ingest_triage=IngestTriageConfig(enabled=True, mode="observe"))
     service = object()

@@ -1043,6 +1043,44 @@ endpoint = "http://embedding.test:11434"
                 1,
             ),
         )
+        conn.executemany(
+            """
+            INSERT INTO message_attachments (
+              msg_id, account_email, part_id, gmail_attachment_id, mime_type, filename,
+              size_bytes, content_disposition, content_id, is_inline, inventory_state, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "m-new",
+                    "acct@example.com",
+                    "2",
+                    "att-pdf",
+                    "application/pdf",
+                    "invoice.pdf",
+                    2048,
+                    "attachment",
+                    "",
+                    0,
+                    "metadata_only",
+                    "2026-03-10T10:04:00+00:00",
+                ),
+                (
+                    "m-new",
+                    "acct@example.com",
+                    "3",
+                    "att-inline",
+                    "image/png",
+                    "logo.png",
+                    512,
+                    "inline",
+                    "<logo-1>",
+                    1,
+                    "metadata_only",
+                    "2026-03-10T10:04:00+00:00",
+                ),
+            ],
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1058,6 +1096,7 @@ endpoint = "http://embedding.test:11434"
 
     assert out["counts"] == {
         "messages": 2,
+        "attachments": 2,
         "message_vectors": 1,
         "message_chunk_vectors": 1,
         "enrichments": 2,
@@ -1082,6 +1121,13 @@ endpoint = "http://embedding.test:11434"
         "heuristic_fallback": 1,
         "repairable": 1,
         "degraded": True,
+    }
+    assert out["attachment_inventory"] == {
+        "attachments": 2,
+        "messages_with_attachments": 1,
+        "inline_attachments": 1,
+        "non_inline_attachments": 1,
+        "state_counts": {"metadata_only": 2},
     }
     assert out["available_index_levels"] == ["redacted"]
     assert out["full_search_available"] is False

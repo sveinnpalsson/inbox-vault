@@ -98,6 +98,22 @@ def get_conn(db_path: str, password: str):
           fetched_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS message_attachments (
+          msg_id TEXT NOT NULL REFERENCES messages(msg_id) ON DELETE CASCADE,
+          account_email TEXT NOT NULL,
+          part_id TEXT NOT NULL,
+          gmail_attachment_id TEXT NOT NULL DEFAULT '',
+          mime_type TEXT NOT NULL DEFAULT '',
+          filename TEXT NOT NULL DEFAULT '',
+          size_bytes INTEGER,
+          content_disposition TEXT NOT NULL DEFAULT '',
+          content_id TEXT NOT NULL DEFAULT '',
+          is_inline INTEGER NOT NULL DEFAULT 0,
+          inventory_state TEXT NOT NULL DEFAULT 'metadata_only',
+          last_seen_at TEXT NOT NULL,
+          PRIMARY KEY (msg_id, part_id)
+        );
+
         CREATE TABLE IF NOT EXISTS message_enrichment (
           msg_id TEXT PRIMARY KEY REFERENCES messages(msg_id) ON DELETE CASCADE,
           category TEXT,
@@ -255,6 +271,8 @@ def get_conn(db_path: str, password: str):
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_email);
+        CREATE INDEX IF NOT EXISTS idx_message_attachments_account
+          ON message_attachments(account_email, inventory_state);
         CREATE INDEX IF NOT EXISTS idx_ingest_triage_stream ON message_ingest_triage(stream_id);
         CREATE INDEX IF NOT EXISTS idx_ingest_triage_tier ON message_ingest_triage(triage_tier);
         CREATE INDEX IF NOT EXISTS idx_stream_reputation_account ON message_stream_reputation(account_email);
@@ -405,6 +423,53 @@ def upsert_raw(conn, msg_id: str, account_email: str, raw_payload: dict):
           fetched_at=excluded.fetched_at
         """,
         (msg_id, account_email, json.dumps(raw_payload), utc_now()),
+    )
+
+
+def upsert_message_attachments(
+    conn,
+    msg_id: str,
+    account_email: str,
+    attachments: list[dict[str, Any]],
+):
+    conn.execute("DELETE FROM message_attachments WHERE msg_id = ?", (msg_id,))
+    if not attachments:
+        return
+
+    seen_at = utc_now()
+    rows: list[tuple[Any, ...]] = []
+    for attachment in attachments:
+        part_id = str(attachment.get("part_id") or "").strip()
+        if not part_id:
+            continue
+        rows.append(
+            (
+                msg_id,
+                account_email,
+                part_id,
+                str(attachment.get("gmail_attachment_id") or "").strip(),
+                str(attachment.get("mime_type") or "").strip().lower(),
+                str(attachment.get("filename") or "").strip(),
+                attachment.get("size_bytes"),
+                str(attachment.get("content_disposition") or "").strip(),
+                str(attachment.get("content_id") or "").strip(),
+                1 if attachment.get("is_inline") else 0,
+                str(attachment.get("inventory_state") or "metadata_only").strip(),
+                seen_at,
+            )
+        )
+
+    if not rows:
+        return
+
+    conn.executemany(
+        """
+        INSERT INTO message_attachments (
+          msg_id, account_email, part_id, gmail_attachment_id, mime_type, filename,
+          size_bytes, content_disposition, content_id, is_inline, inventory_state, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
     )
 
 

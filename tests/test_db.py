@@ -16,6 +16,7 @@ from inbox_vault.db import (
     upsert_contact_seen,
     upsert_cursor,
     upsert_enrichment,
+    upsert_message_attachments,
     upsert_message,
     upsert_raw,
 )
@@ -25,6 +26,7 @@ def test_schema_and_crud_paths(conn):
     expected_tables = {
         "messages",
         "raw_messages",
+        "message_attachments",
         "message_enrichment",
         "contact_stats",
         "contact_profiles",
@@ -68,6 +70,76 @@ def test_schema_and_crud_paths(conn):
     upsert_raw(conn, "m1", "acct@example.com", {"raw": "value"})
     raw = conn.execute("SELECT raw_json FROM raw_messages WHERE msg_id='m1'").fetchone()[0]
     assert json.loads(raw)["raw"] == "value"
+
+    upsert_message_attachments(
+        conn,
+        "m1",
+        "acct@example.com",
+        [
+            {
+                "part_id": "2",
+                "gmail_attachment_id": "att-2",
+                "mime_type": "application/pdf",
+                "filename": "invoice.pdf",
+                "size_bytes": 2048,
+                "content_disposition": "attachment",
+                "content_id": "",
+                "is_inline": False,
+                "inventory_state": "metadata_only",
+            },
+            {
+                "part_id": "3",
+                "gmail_attachment_id": "att-3",
+                "mime_type": "image/png",
+                "filename": "logo.png",
+                "size_bytes": 512,
+                "content_disposition": "inline",
+                "content_id": "<logo-1>",
+                "is_inline": True,
+                "inventory_state": "metadata_only",
+            },
+        ],
+    )
+    attachment_rows = conn.execute(
+        """
+        SELECT part_id, gmail_attachment_id, mime_type, filename, size_bytes,
+               content_disposition, content_id, is_inline, inventory_state
+        FROM message_attachments
+        WHERE msg_id = 'm1'
+        ORDER BY part_id
+        """
+    ).fetchall()
+    assert attachment_rows == [
+        ("2", "att-2", "application/pdf", "invoice.pdf", 2048, "attachment", "", 0, "metadata_only"),
+        ("3", "att-3", "image/png", "logo.png", 512, "inline", "<logo-1>", 1, "metadata_only"),
+    ]
+
+    upsert_message_attachments(
+        conn,
+        "m1",
+        "acct@example.com",
+        [
+            {
+                "part_id": "9",
+                "gmail_attachment_id": "att-9",
+                "mime_type": "text/calendar",
+                "filename": "invite.ics",
+                "size_bytes": 128,
+                "content_disposition": "attachment",
+                "content_id": "",
+                "is_inline": False,
+                "inventory_state": "metadata_only",
+            }
+        ],
+    )
+    replaced_rows = conn.execute(
+        """
+        SELECT part_id, gmail_attachment_id, mime_type, filename
+        FROM message_attachments
+        WHERE msg_id = 'm1'
+        """
+    ).fetchall()
+    assert replaced_rows == [("9", "att-9", "text/calendar", "invite.ics")]
 
     assert get_cursor(conn, "acct@example.com", "INBOX,SENT") is None
     upsert_cursor(conn, "acct@example.com", "INBOX,SENT", 55)

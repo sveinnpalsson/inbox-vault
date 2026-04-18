@@ -20,8 +20,40 @@ def gmail_message_payload(
     body_text: str = "This is a synthetic message body.",
     labels: list[str] | None = None,
     internal_date_ms: int = 1_700_000_000_000,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create a synthetic Gmail message payload in the shape returned by Gmail API."""
+    parts: list[dict[str, Any]] = [
+        {
+            "partId": "1",
+            "mimeType": "text/plain",
+            "body": {"data": _b64url(body_text)},
+        }
+    ]
+
+    for idx, attachment in enumerate(attachments or [], start=2):
+        headers = []
+        disposition = str(attachment.get("content_disposition", "attachment")).strip()
+        if disposition:
+            headers.append({"name": "Content-Disposition", "value": disposition})
+        content_id = str(attachment.get("content_id") or "").strip()
+        if content_id:
+            headers.append({"name": "Content-ID", "value": content_id})
+
+        part = {
+            "partId": str(attachment.get("part_id") or idx),
+            "mimeType": str(attachment.get("mime_type") or "application/octet-stream"),
+            "filename": str(attachment.get("filename") or ""),
+            "headers": headers,
+            "body": {
+                "size": int(attachment.get("size_bytes", 0)),
+                "attachmentId": str(
+                    attachment.get("attachment_id") or f"att-{msg_id}-{idx}"
+                ),
+            },
+        }
+        parts.append(part)
+
     return {
         "id": msg_id,
         "threadId": thread_id or f"thread-{msg_id}",
@@ -36,12 +68,7 @@ def gmail_message_payload(
                 {"name": "Subject", "value": subject},
                 {"name": "Date", "value": "Mon, 04 Dec 2023 10:15:00 +0000"},
             ],
-            "parts": [
-                {
-                    "mimeType": "text/plain",
-                    "body": {"data": _b64url(body_text)},
-                }
-            ],
+            "parts": parts,
         },
     }
 

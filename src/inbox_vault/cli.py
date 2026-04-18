@@ -714,6 +714,26 @@ def run_status(conn, cfg) -> dict[str, object]:
             "SELECT count(*) FROM redaction_entries WHERE COALESCE(status, 'active') = 'rejected'"
         ).fetchone()[0]
     )
+    attachment_total = int(
+        conn.execute("SELECT count(*) FROM message_attachments").fetchone()[0]
+    )
+    attachment_messages = int(
+        conn.execute("SELECT count(DISTINCT msg_id) FROM message_attachments").fetchone()[0]
+    )
+    inline_attachments = int(
+        conn.execute("SELECT count(*) FROM message_attachments WHERE is_inline = 1").fetchone()[0]
+    )
+    attachment_state_counts = {
+        str(state or ""): int(count)
+        for state, count in conn.execute(
+            """
+            SELECT inventory_state, count(*)
+            FROM message_attachments
+            GROUP BY inventory_state
+            ORDER BY inventory_state
+            """
+        ).fetchall()
+    }
     policy_drift = {
         INDEX_LEVEL_REDACTED: int(
             conn.execute(
@@ -738,6 +758,7 @@ def run_status(conn, cfg) -> dict[str, object]:
 
     counts = {
         "messages": int(conn.execute("SELECT count(*) FROM messages").fetchone()[0]),
+        "attachments": attachment_total,
         "message_vectors": int(
             conn.execute("SELECT count(*) FROM message_vectors").fetchone()[0]
         ),
@@ -796,6 +817,13 @@ def run_status(conn, cfg) -> dict[str, object]:
             "heuristic_fallback": heuristic_fallback_enrichments,
             "repairable": pending_enrichments + heuristic_fallback_enrichments,
             "degraded": heuristic_fallback_enrichments > 0,
+        },
+        "attachment_inventory": {
+            "attachments": attachment_total,
+            "messages_with_attachments": attachment_messages,
+            "inline_attachments": inline_attachments,
+            "non_inline_attachments": max(0, attachment_total - inline_attachments),
+            "state_counts": attachment_state_counts,
         },
         "available_index_levels": available_levels,
         "full_search_available": full_available,

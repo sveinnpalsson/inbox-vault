@@ -27,6 +27,7 @@ Design notes:
 ## What it does
 
 - **Syncs Gmail** into a local SQLCipher-encrypted database (`update`, `update --backfill`, `repair`)
+- **Inventories attachment metadata safely** -- captures filename, MIME type, size, and inline/disposition hints without fetching, parsing, or opening attachment bytes
 - **Enriches messages** with a local LLM -- category, importance, action items, summaries
 - **Redacts PII** through three configurable modes: regex patterns, LLM-based detection, or hybrid with persistent coreference-preserving placeholder maps
 - **Builds contact profiles** from conversation history using signal-based tiering and a two-step evidence-then-synthesis LLM pipeline
