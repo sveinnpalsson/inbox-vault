@@ -19,7 +19,11 @@ from .enrich import enrich_pending
 from .evals import bootstrap_eval_template, run_retrieval_eval
 from .ingest import backfill, repair, update
 from .profiles import build_profiles
-from .redaction import REDACTION_POLICY_VERSION, redact_text
+from .redaction import (
+    REDACTION_POLICY_VERSION,
+    is_persistent_redaction_value_allowed,
+    redact_text,
+)
 from .stress import run_isolated_stress
 from .vectors import (
     INDEX_LEVEL_AUTO,
@@ -525,12 +529,13 @@ def _resolve_date_range(
     return from_ts_ms, to_ts_ms
 
 
-def _latest_message_status(conn) -> dict[str, object] | None:
+def _message_status(conn, *, newest: bool) -> dict[str, object] | None:
+    order = "DESC" if newest else "ASC"
     row = conn.execute(
-        """
-        SELECT msg_id, account_email, internal_ts, date_iso
+        f"""
+        SELECT msg_id, account_email, internal_ts, date_iso, history_id
         FROM messages
-        ORDER BY COALESCE(internal_ts, 0) DESC
+        ORDER BY COALESCE(internal_ts, 0) {order}, msg_id {order}
         LIMIT 1
         """
     ).fetchone()
@@ -557,9 +562,135 @@ def _latest_message_status(conn) -> dict[str, object] | None:
         "account_email": row[1],
         "internal_ts": internal_ts,
         "date_iso": row[3],
+        "history_id": int(row[4]) if row[4] is not None else None,
         "observed_at": observed_iso,
         "freshness_seconds": freshness_seconds,
         "freshness_hours": freshness_hours,
+    }
+
+
+def _latest_message_status(conn) -> dict[str, object] | None:
+    return _message_status(conn, newest=True)
+
+
+def _first_message_status(conn) -> dict[str, object] | None:
+    return _message_status(conn, newest=False)
+
+
+def _history_sync_status(conn) -> dict[str, object]:
+    latest_rows = conn.execute(
+        """
+        SELECT msg_id, account_email, internal_ts, date_iso, history_id
+        FROM messages
+        ORDER BY account_email ASC, COALESCE(internal_ts, 0) DESC, msg_id DESC
+        """
+    ).fetchall()
+    latest_by_account: dict[str, dict[str, object]] = {}
+    for row in latest_rows:
+        account_email = str(row[1])
+        if account_email in latest_by_account:
+            continue
+        internal_ts = int(row[2]) if row[2] is not None else None
+        observed_iso = row[3]
+        if internal_ts is not None and internal_ts > 0:
+            observed_iso = datetime.fromtimestamp(internal_ts / 1000, tz=timezone.utc).isoformat()
+        latest_by_account[account_email] = {
+            "msg_id": row[0],
+            "internal_ts": internal_ts,
+            "date_iso": row[3],
+            "history_id": int(row[4]) if row[4] is not None else None,
+            "observed_at": observed_iso,
+        }
+
+    cursor_rows = conn.execute(
+        """
+        SELECT account_email, scope, history_id, updated_at
+        FROM sync_cursors
+        ORDER BY account_email ASC, scope ASC
+        """
+    ).fetchall()
+    cursor_by_account: dict[str, dict[str, object]] = {}
+    for row in cursor_rows:
+        cursor_by_account[str(row[0])] = {
+            "scope": row[1],
+            "history_id": int(row[2]) if row[2] is not None else None,
+            "updated_at": row[3],
+        }
+
+    accounts = sorted(set(latest_by_account) | set(cursor_by_account))
+    items: list[dict[str, object]] = []
+    for account_email in accounts:
+        latest = latest_by_account.get(account_email)
+        cursor = cursor_by_account.get(account_email)
+        latest_history_id = latest.get("history_id") if latest else None
+        cursor_history_id = cursor.get("history_id") if cursor else None
+        cursor_ahead_by = None
+        if latest_history_id is not None and cursor_history_id is not None:
+            cursor_ahead_by = max(0, int(cursor_history_id) - int(latest_history_id))
+        backfill_repair_advisable = bool(cursor_ahead_by and cursor_ahead_by > 0)
+        items.append(
+            {
+                "account_email": account_email,
+                "cursor_scope": cursor.get("scope") if cursor else None,
+                "cursor_history_id": cursor_history_id,
+                "cursor_updated_at": cursor.get("updated_at") if cursor else None,
+                "latest_ingested_message": latest,
+                "cursor_ahead_by_history_ids": cursor_ahead_by,
+                "backfill_repair_advisable": backfill_repair_advisable,
+                "heuristic": (
+                    "cursor is ahead of the latest locally ingested history_id; repair --backfill-limit N may help fill recoverable gaps"
+                    if backfill_repair_advisable
+                    else None
+                ),
+            }
+        )
+
+    return {
+        "accounts": items,
+        "any_backfill_repair_advisable": any(
+            bool(item["backfill_repair_advisable"]) for item in items
+        ),
+    }
+
+
+def _redaction_persistence_status(conn) -> dict[str, object]:
+    rows = conn.execute(
+        """
+        SELECT policy_version, COALESCE(status, 'active') AS status, count(*)
+        FROM redaction_entries
+        GROUP BY policy_version, COALESCE(status, 'active')
+        ORDER BY policy_version, status
+        """
+    ).fetchall()
+    active_by_policy: dict[str, int] = {}
+    rejected_by_policy: dict[str, int] = {}
+    for policy_version, status, count in rows:
+        key = str(policy_version or "")
+        if status == "rejected":
+            rejected_by_policy[key] = int(count)
+        else:
+            active_by_policy[key] = int(count)
+
+    invalid_active_entries = 0
+    invalid_rows = conn.execute(
+        """
+        SELECT key_name, original_value
+        FROM redaction_entries
+        WHERE COALESCE(status, 'active') = 'active'
+        """
+    ).fetchall()
+    for key_name, original_value in invalid_rows:
+        if not is_persistent_redaction_value_allowed(str(key_name), str(original_value)):
+            invalid_active_entries += 1
+
+    legacy_active_entries = sum(
+        count for policy, count in active_by_policy.items() if policy != REDACTION_POLICY_VERSION
+    )
+    return {
+        "active_by_policy_version": active_by_policy,
+        "rejected_by_policy_version": rejected_by_policy,
+        "legacy_active_entries": legacy_active_entries,
+        "invalid_active_entries": invalid_active_entries,
     }
 
 
@@ -639,6 +770,13 @@ def run_status(conn, cfg) -> dict[str, object]:
     )
     llm_endpoint_reachable = _endpoint_reachable(cfg.llm.endpoint) if cfg.llm.enabled else None
     embeddings_endpoint_reachable = _endpoint_reachable(cfg.embeddings.endpoint)
+    history_sync = _history_sync_status(conn)
+    redaction_persistence = _redaction_persistence_status(conn)
+    action_needed = any(int(value or 0) > 0 for value in policy_drift.values()) or bool(
+        history_sync["any_backfill_repair_advisable"]
+        or redaction_persistence["legacy_active_entries"]
+        or redaction_persistence["invalid_active_entries"]
+    )
     return {
         "counts": counts,
         "redaction_policy_version": REDACTION_POLICY_VERSION,
@@ -667,12 +805,15 @@ def run_status(conn, cfg) -> dict[str, object]:
             INDEX_LEVEL_FULL: pending_full,
         },
         "policy_drift_vectors": policy_drift,
+        "redaction_persistence": redaction_persistence,
+        "history_sync": history_sync,
         "ingest_triage": {
             "enabled": bool(cfg.ingest_triage.enabled),
             "mode": cfg.ingest_triage.mode,
             "summary": ingest_triage_summary(conn),
         },
-        "action_needed": any(int(value or 0) > 0 for value in policy_drift.values()),
+        "action_needed": action_needed,
+        "first_message": _first_message_status(conn),
         "latest_message": _latest_message_status(conn),
     }
 

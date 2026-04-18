@@ -952,7 +952,7 @@ def _seed_retrieval_data(tmp_path: Path):
         conn.close()
 
 
-def test_status_command_reports_counts_and_latest(
+def test_status_command_reports_counts_latest_and_history_sync(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):
     cfg = tmp_path / "config.toml"
@@ -1001,6 +1001,48 @@ endpoint = "http://embedding.test:11434"
                 "2026-04-06T20:00:00+00:00",
             ),
         )
+        conn.execute(
+            """
+            INSERT INTO sync_cursors (account_email, scope, history_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(account_email, scope) DO UPDATE SET
+              history_id=excluded.history_id,
+              updated_at=excluded.updated_at
+            """,
+            (
+                "acct@example.com",
+                "INBOX,SENT",
+                5,
+                "2026-03-10T10:04:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO redaction_entries (
+              scope_type, scope_id, key_name, placeholder, value_norm, original_value, source_mode,
+              policy_version, status, validator_name, detector_sources, modality, source_field,
+              first_seen_at, last_seen_at, hit_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "account",
+                "acct@example.com",
+                "ADDRESS",
+                "<REDACTED_ADDRESS_A>",
+                "boston",
+                "Boston",
+                "llm_chunk",
+                "2026-03-22-precision-1",
+                "active",
+                "",
+                "",
+                "email",
+                "body",
+                "2026-03-10T10:04:00+00:00",
+                "2026-03-10T10:04:00+00:00",
+                1,
+            ),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1020,7 +1062,7 @@ endpoint = "http://embedding.test:11434"
         "message_chunk_vectors": 1,
         "enrichments": 2,
         "profiles": 1,
-        "active_redaction_entries": 0,
+        "active_redaction_entries": 1,
         "rejected_redaction_entries": 0,
     }
     assert out["redaction_policy_version"] == "2026-03-22-precision-2"
@@ -1046,6 +1088,33 @@ endpoint = "http://embedding.test:11434"
     assert out["vector_level_counts"] == {"redacted": {"messages": 1, "chunks": 1}}
     assert out["pending_vectors"] == {"redacted": 4, "full": None}
     assert out["policy_drift_vectors"] == {"redacted": 1}
+    assert out["redaction_persistence"] == {
+        "active_by_policy_version": {"2026-03-22-precision-1": 1},
+        "rejected_by_policy_version": {},
+        "legacy_active_entries": 1,
+        "invalid_active_entries": 1,
+    }
+    assert out["history_sync"] == {
+        "accounts": [
+            {
+                "account_email": "acct@example.com",
+                "cursor_scope": "INBOX,SENT",
+                "cursor_history_id": 5,
+                "cursor_updated_at": "2026-03-10T10:04:00+00:00",
+                "latest_ingested_message": {
+                    "msg_id": "m-new",
+                    "internal_ts": 1773136800000,
+                    "date_iso": "2026-03-10T10:00:00+00:00",
+                    "history_id": 1,
+                    "observed_at": "2026-03-10T10:00:00+00:00",
+                },
+                "cursor_ahead_by_history_ids": 4,
+                "backfill_repair_advisable": True,
+                "heuristic": "cursor is ahead of the latest locally ingested history_id; repair --backfill-limit N may help fill recoverable gaps",
+            }
+        ],
+        "any_backfill_repair_advisable": True,
+    }
     assert out["ingest_triage"] == {
         "enabled": False,
         "mode": "observe",
@@ -1058,7 +1127,10 @@ endpoint = "http://embedding.test:11434"
         },
     }
     assert out["action_needed"] is True
+    assert out["first_message"]["msg_id"] == "m-old"
+    assert out["first_message"]["history_id"] == 1
     assert out["latest_message"]["msg_id"] == "m-new"
+    assert out["latest_message"]["history_id"] == 1
     assert out["latest_message"]["freshness_seconds"] is not None
 
 
