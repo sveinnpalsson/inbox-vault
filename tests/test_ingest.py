@@ -78,6 +78,12 @@ def test_update_uses_cursor_and_ingests_incremental(conn, app_cfg, monkeypatch: 
         "ingested": 2,
         "cursor_resets": 0,
         "failed": 0,
+        "selected_attachments": 0,
+        "materialized_attachments": 0,
+        "attachment_materialization_failed": 0,
+        "attachment_bytes_written": 0,
+        "inline_attachment_sources": 0,
+        "gmail_attachment_fetches": 0,
     }
     assert seen_start_ids == [400]
     assert get_cursor(conn, app_cfg.accounts[0].email, ingest.MAILBOX_SCOPE) == 450
@@ -101,6 +107,12 @@ def test_update_resets_cursor_on_404_history_gap(conn, app_cfg, monkeypatch: pyt
         "ingested": 0,
         "cursor_resets": 1,
         "failed": 0,
+        "selected_attachments": 0,
+        "materialized_attachments": 0,
+        "attachment_materialization_failed": 0,
+        "attachment_bytes_written": 0,
+        "inline_attachment_sources": 0,
+        "gmail_attachment_fetches": 0,
     }
     assert get_cursor(conn, app_cfg.accounts[0].email, ingest.MAILBOX_SCOPE) == 777
 
@@ -127,12 +139,86 @@ def test_update_counts_failed_ingest_and_continues(conn, app_cfg, monkeypatch: p
         "ingested": 1,
         "cursor_resets": 0,
         "failed": 1,
+        "selected_attachments": 0,
+        "materialized_attachments": 0,
+        "attachment_materialization_failed": 0,
+        "attachment_bytes_written": 0,
+        "inline_attachment_sources": 0,
+        "gmail_attachment_fetches": 0,
     }
 
 
-def test_update_persists_attachment_inventory_metadata_only(
+def test_update_materializes_attachment_bytes_by_default(
     conn, app_cfg, monkeypatch: pytest.MonkeyPatch
 ):
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+    monkeypatch.setattr(ingest, "get_profile_history_id", lambda *_: 400)
+    monkeypatch.setattr(
+        ingest, "list_incremental_added_ids", lambda *_args, **_kwargs: ({"m-attach"}, 450)
+    )
+    monkeypatch.setattr(
+        ingest,
+        "fetch_attachment_bytes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("inline attachment should not call Gmail attachment fetch")
+        ),
+    )
+
+    payload = gmail_message_payload(
+        "m-attach",
+        history_id=450,
+        labels=["INBOX"],
+        attachments=[
+            {
+                "part_id": "2",
+                "attachment_id": "att-pdf",
+                "mime_type": "application/pdf",
+                "filename": "invoice.pdf",
+                "size_bytes": 12,
+                "content_disposition": "attachment",
+                "inline_data_text": "invoice-bytes",
+            }
+        ],
+    )
+    monkeypatch.setattr(ingest, "fetch_full_message_payload", lambda *_args, **_kwargs: payload)
+
+    out = ingest.update(conn, app_cfg)
+
+    assert out == {
+        "accounts": 1,
+        "new_ids": 1,
+        "ingested": 1,
+        "cursor_resets": 0,
+        "failed": 0,
+        "selected_attachments": 1,
+        "materialized_attachments": 1,
+        "attachment_materialization_failed": 0,
+        "attachment_bytes_written": len(b"invoice-bytes"),
+        "inline_attachment_sources": 1,
+        "gmail_attachment_fetches": 0,
+    }
+    row = conn.execute(
+        """
+        SELECT storage_kind, storage_path, content_sha256, content_size_bytes
+        FROM message_attachments
+        WHERE msg_id = ? AND part_id = ?
+        """,
+        ("m-attach", "2"),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "file"
+    cache_path = Path(app_cfg.db.path).resolve().parent / str(row[1])
+    assert cache_path.is_file()
+    assert cache_path.read_bytes() == b"invoice-bytes"
+    assert row[2] == hashlib.sha256(b"invoice-bytes").hexdigest()
+    assert row[3] == len(b"invoice-bytes")
+
+
+def test_update_persists_attachment_inventory_metadata_only_when_auto_materialization_disabled(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    cfg = replace(app_cfg, gmail_materialize_attachments_on_update=False)
     service = object()
     monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
     monkeypatch.setattr(ingest, "get_profile_history_id", lambda *_: 400)
@@ -166,7 +252,7 @@ def test_update_persists_attachment_inventory_metadata_only(
     )
     monkeypatch.setattr(ingest, "fetch_full_message_payload", lambda *_args, **_kwargs: payload)
 
-    out = ingest.update(conn, app_cfg)
+    out = ingest.update(conn, cfg)
 
     assert out == {
         "accounts": 1,
@@ -174,6 +260,12 @@ def test_update_persists_attachment_inventory_metadata_only(
         "ingested": 1,
         "cursor_resets": 0,
         "failed": 0,
+        "selected_attachments": 2,
+        "materialized_attachments": 0,
+        "attachment_materialization_failed": 0,
+        "attachment_bytes_written": 0,
+        "inline_attachment_sources": 0,
+        "gmail_attachment_fetches": 0,
     }
     rows = conn.execute(
         """
@@ -580,6 +672,12 @@ def test_update_persists_observe_only_ingest_triage(conn, app_cfg, monkeypatch: 
         "ingested": 1,
         "cursor_resets": 0,
         "failed": 0,
+        "selected_attachments": 0,
+        "materialized_attachments": 0,
+        "attachment_materialization_failed": 0,
+        "attachment_bytes_written": 0,
+        "inline_attachment_sources": 0,
+        "gmail_attachment_fetches": 0,
     }
 
     triage_row = conn.execute(
@@ -815,6 +913,8 @@ def test_repair_default_skips_historical_gmail_listing(conn, app_cfg, monkeypatc
     assert out["backfill_attempted_accounts"] == 0
     assert out["backfill_scanned"] == 0
     assert out["backfill_ingested"] == 0
+    assert out["materialized_attachments"] == 0
+    assert out["attachment_materialization_failed"] == 0
 
 
 def test_repair_backfill_ingests_bounded_missing_history(conn, app_cfg, monkeypatch: pytest.MonkeyPatch):
@@ -872,6 +972,74 @@ def test_repair_backfill_ingests_bounded_missing_history(conn, app_cfg, monkeypa
     assert out["backfill_skipped_existing"] == 1
     assert out["backfill_failed"] == 0
     assert out["interrupted"] is False
+    assert out["selected_attachments"] == 0
+    assert out["materialized_attachments"] == 0
+
+
+def test_repair_materializes_attachments_for_backfilled_messages_by_default(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+    monkeypatch.setattr(ingest, "get_profile_history_id", lambda *_: 333)
+    monkeypatch.setattr(
+        ingest,
+        "list_message_ids_paged",
+        lambda *_args, **_kwargs: ["older-attach"],
+    )
+    monkeypatch.setattr(
+        ingest,
+        "fetch_attachment_bytes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("inline attachment should not call Gmail attachment fetch")
+        ),
+    )
+    monkeypatch.setattr(
+        ingest,
+        "fetch_full_message_payload",
+        lambda _svc, mid: gmail_message_payload(
+            mid,
+            history_id=333,
+            labels=["INBOX"],
+            attachments=[
+                {
+                    "part_id": "2",
+                    "attachment_id": "att-older-attach",
+                    "mime_type": "application/pdf",
+                    "filename": "older.pdf",
+                    "size_bytes": 10,
+                    "content_disposition": "attachment",
+                    "inline_data_text": "older-bytes",
+                }
+            ],
+        ),
+    )
+
+    out = ingest.repair(conn, app_cfg, backfill_limit=1)
+
+    assert out["backfill_ingested"] == 1
+    assert out["selected_attachments"] == 1
+    assert out["materialized_attachments"] == 1
+    assert out["attachment_materialization_failed"] == 0
+    assert out["attachment_bytes_written"] == len(b"older-bytes")
+    assert out["inline_attachment_sources"] == 1
+    assert out["gmail_attachment_fetches"] == 0
+
+    row = conn.execute(
+        """
+        SELECT storage_kind, storage_path, content_sha256, content_size_bytes
+        FROM message_attachments
+        WHERE msg_id = ? AND part_id = ?
+        """,
+        ("older-attach", "2"),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "file"
+    cache_path = Path(app_cfg.db.path).resolve().parent / str(row[1])
+    assert cache_path.is_file()
+    assert cache_path.read_bytes() == b"older-bytes"
+    assert row[2] == hashlib.sha256(b"older-bytes").hexdigest()
+    assert row[3] == len(b"older-bytes")
 
 
 def test_repair_commits_partial_progress_on_keyboard_interrupt(

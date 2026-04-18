@@ -124,6 +124,8 @@ class AppConfig:
     gmail_idle_backfill_limit: int | None = None
     gmail_request_timeout_seconds: float = 60.0
     gmail_progress_every: int = 100
+    gmail_materialize_attachments_on_update: bool = True
+    gmail_materialize_attachments_on_repair: bool = True
 
 
 DEFAULT_CONFIG_PATH = "config.toml"
@@ -291,6 +293,14 @@ def load_config(path: str | None = None) -> AppConfig:
         gmail_raw.get("progress_every", 100),
         key="gmail.progress_every",
         min_value=1,
+    )
+    gmail_materialize_attachments_on_update = _parse_bool(
+        gmail_raw.get("materialize_attachments_on_update", True),
+        key="gmail.materialize_attachments_on_update",
+    )
+    gmail_materialize_attachments_on_repair = _parse_bool(
+        gmail_raw.get("materialize_attachments_on_repair", True),
+        key="gmail.materialize_attachments_on_repair",
     )
 
     llm_endpoint = str(llm_raw.get("endpoint", "http://localhost:8080")).strip()
@@ -577,6 +587,8 @@ def load_config(path: str | None = None) -> AppConfig:
         gmail_idle_backfill_limit=gmail_idle_backfill_limit,
         gmail_request_timeout_seconds=gmail_request_timeout_seconds,
         gmail_progress_every=gmail_progress_every,
+        gmail_materialize_attachments_on_update=gmail_materialize_attachments_on_update,
+        gmail_materialize_attachments_on_repair=gmail_materialize_attachments_on_repair,
     )
 
 

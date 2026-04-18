@@ -61,6 +61,8 @@ query = "label:inbox"
     assert cfg.gmail_idle_backfill_limit is None
     assert cfg.gmail_request_timeout_seconds == 60.0
     assert cfg.gmail_progress_every == 100
+    assert cfg.gmail_materialize_attachments_on_update is True
+    assert cfg.gmail_materialize_attachments_on_repair is True
     assert cfg.ingest_triage.enabled is False
     assert cfg.ingest_triage.mode == "observe"
 
@@ -421,6 +423,26 @@ progress_every = 25
     cfg = load_config(str(cfg_path))
     assert cfg.gmail_request_timeout_seconds == 42.0
     assert cfg.gmail_progress_every == 25
+
+
+def test_load_config_parses_attachment_materialization_controls(tmp_path: Path):
+    cfg_path = tmp_path / "cfg.toml"
+    cfg_path.write_text(
+        """
+[[accounts]]
+email = "acct@example.com"
+credentials_file = "credentials.json"
+token_file = "token.json"
+
+[gmail]
+materialize_attachments_on_update = false
+materialize_attachments_on_repair = false
+""".strip()
+    )
+
+    cfg = load_config(str(cfg_path))
+    assert cfg.gmail_materialize_attachments_on_update is False
+    assert cfg.gmail_materialize_attachments_on_repair is False
 
 
 def test_load_config_rejects_invalid_gmail_timeout_and_progress(tmp_path: Path):

@@ -161,7 +161,7 @@ The two primary commands are `update` and `repair`. Everything else is available
 | **`update`** | **Sync + enrich + index in one step** (incremental by default; `--backfill N` for historical import) |
 | **`repair`** | **Catch up gaps** with bounded historical backfill + pending enrichment/indexing |
 | `backfill-attachments` | Refresh attachment metadata for already-ingested messages without rerunning enrichment or vector indexing |
-| `materialize-attachments` | Materialize attachment bytes into the local cache so downstream tools can consume them without Gmail-specific fetch logic |
+| `materialize-attachments` | Materialize or repair attachment bytes for already-ingested mail without rerunning enrichment or vector indexing |
 | `enrich` | Run enrichment separately (classification, summaries via local LLM) |
 | `build-profiles` | Generate contact profiles from conversation history |
 | `index-vectors` | Build chunk-level vector embeddings with redaction |
@@ -200,7 +200,7 @@ The two primary commands are `update` and `repair`. Everything else is available
 | `config.multi-account.example.toml` | Sanitized multi-account example |
 | `config.toml` / `config.local*.toml` | Your local config (git-ignored) |
 
-Key config sections: `[database]`, `[gmail]`, `[llm]`, `[embeddings]`, `[redaction]`, `[retrieval]`, `[indexing]`, `[profiles]`, `[[accounts]]`. See `config.example.toml` for all options with comments.
+Key config sections: `[database]`, `[gmail]`, `[llm]`, `[embeddings]`, `[redaction]`, `[retrieval]`, `[indexing]`, `[profiles]`, `[[accounts]]`. Gmail attachment materialization is enabled by default during `update` and `repair`; use `materialize-attachments` for catch-up on older rows already in the database. See `config.example.toml` for all options with comments.
 
 ## Automation
 

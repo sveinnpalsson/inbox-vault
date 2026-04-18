@@ -129,30 +129,147 @@ def _persist_observe_only_triage(
 
 
 def _ingest_message_id(conn, cfg: AppConfig, service, account_email: str, msg_id: str) -> bool:
+    ingested, _materialization = _ingest_message_id_with_attachment_materialization(
+        conn,
+        cfg,
+        service,
+        account_email,
+        msg_id,
+        materialize_attachments=False,
+    )
+    return ingested
+
+
+def _ingest_message_id_with_attachment_materialization(
+    conn,
+    cfg: AppConfig,
+    service,
+    account_email: str,
+    msg_id: str,
+    *,
+    materialize_attachments: bool,
+) -> tuple[bool, dict[str, int]]:
+    materialization = {
+        "selected_attachments": 0,
+        "materialized_attachments": 0,
+        "failed_attachments": 0,
+        "bytes_written": 0,
+        "inline_sourced": 0,
+        "gmail_fetched": 0,
+    }
     try:
         raw = fetch_full_message_payload(service, msg_id)
         if not raw:
-            return False
+            return False, materialization
 
         rec = payload_to_record(raw, account_email)
         if not rec.get("msg_id"):
-            return False
+            return False, materialization
 
         upsert_message(conn, rec)
         upsert_raw(conn, rec["msg_id"], account_email, raw)
+        attachments = list(rec.get("attachments", []))
+        materialization["selected_attachments"] = len(attachments)
         upsert_message_attachments(
             conn,
             rec["msg_id"],
             account_email,
-            list(rec.get("attachments", [])),
+            attachments,
         )
         _update_contacts_from_record(conn, rec)
         _persist_observe_only_triage(conn, cfg, rec=rec, raw_payload=raw)
-        return True
+        if materialize_attachments and attachments:
+            materialization = _materialize_ingested_message_attachments(
+                conn,
+                account_email=account_email,
+                service=service,
+                msg_id=rec["msg_id"],
+                raw_payload=raw,
+                attachments=attachments,
+            )
+        return True, materialization
     except Exception:
         # Privacy-safe logging: keep identifiers only, no message content.
         LOG.exception("Failed to ingest message_id=%s account=%s", msg_id, account_email)
-        return False
+        return False, materialization
+
+
+def _materialize_ingested_message_attachments(
+    conn,
+    *,
+    account_email: str,
+    service,
+    msg_id: str,
+    raw_payload: dict[str, Any],
+    attachments: list[dict[str, Any]],
+) -> dict[str, int]:
+    db_dir = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve().parent
+    stats = {
+        "selected_attachments": len(attachments),
+        "materialized_attachments": 0,
+        "failed_attachments": 0,
+        "bytes_written": 0,
+        "inline_sourced": 0,
+        "gmail_fetched": 0,
+    }
+
+    for attachment in attachments:
+        part_id = str(attachment.get("part_id") or "").strip()
+        if not part_id:
+            continue
+        attachment_key_value = attachment_key(account_email, msg_id, part_id)
+        try:
+            payload_bytes = extract_inline_attachment_bytes(raw_payload, part_id)
+            source = "inline"
+            if payload_bytes is None:
+                gmail_attachment_id = str(attachment.get("gmail_attachment_id") or "").strip()
+                if not gmail_attachment_id:
+                    raise RuntimeError(
+                        "attachment bytes unavailable: missing inline data and gmail_attachment_id"
+                    )
+                payload_bytes = fetch_attachment_bytes(service, msg_id, gmail_attachment_id)
+                source = "gmail_attachment_get"
+
+            relpath = _attachment_materialization_relpath(
+                account_email=account_email,
+                attachment_key_value=attachment_key_value,
+                mime_type=str(attachment.get("mime_type") or ""),
+            )
+            abs_path = db_dir / relpath
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = abs_path.with_name(abs_path.name + ".tmp")
+            tmp_path.write_bytes(payload_bytes)
+            tmp_path.replace(abs_path)
+
+            checksum = hashlib.sha256(payload_bytes).hexdigest()
+            materialized_at = datetime.now(timezone.utc).isoformat()
+            update_attachment_materialization(
+                conn,
+                msg_id=msg_id,
+                part_id=part_id,
+                attachment_key_value=attachment_key_value,
+                storage_kind="file",
+                storage_path=relpath,
+                content_sha256=checksum,
+                content_size_bytes=len(payload_bytes),
+                materialized_at=materialized_at,
+            )
+            stats["materialized_attachments"] += 1
+            stats["bytes_written"] += len(payload_bytes)
+            if source == "inline":
+                stats["inline_sourced"] += 1
+            else:
+                stats["gmail_fetched"] += 1
+        except Exception:
+            LOG.exception(
+                "Failed to materialize attachment bytes for message_id=%s part_id=%s account=%s",
+                msg_id,
+                part_id,
+                account_email,
+            )
+            stats["failed_attachments"] += 1
+
+    return stats
 
 
 def _attachment_backfill_candidates(
@@ -391,6 +508,30 @@ def _attachment_materialization_candidates(conn, *, account_email: str) -> list[
         for row in rows
         if row and row[0] is not None and row[2] is not None
     ]
+
+
+def _merge_attachment_materialization_stats(
+    stats: dict[str, Any],
+    materialization: dict[str, int],
+) -> None:
+    stats["selected_attachments"] = int(stats.get("selected_attachments") or 0) + int(
+        materialization.get("selected_attachments") or 0
+    )
+    stats["materialized_attachments"] = int(stats.get("materialized_attachments") or 0) + int(
+        materialization.get("materialized_attachments") or 0
+    )
+    stats["attachment_materialization_failed"] = int(
+        stats.get("attachment_materialization_failed") or 0
+    ) + int(materialization.get("failed_attachments") or 0)
+    stats["attachment_bytes_written"] = int(stats.get("attachment_bytes_written") or 0) + int(
+        materialization.get("bytes_written") or 0
+    )
+    stats["inline_attachment_sources"] = int(
+        stats.get("inline_attachment_sources") or 0
+    ) + int(materialization.get("inline_sourced") or 0)
+    stats["gmail_attachment_fetches"] = int(
+        stats.get("gmail_attachment_fetches") or 0
+    ) + int(materialization.get("gmail_fetched") or 0)
 
 
 def materialize_attachment_bytes(
@@ -823,6 +964,12 @@ def update(
         "ingested": 0,
         "cursor_resets": 0,
         "failed": 0,
+        "selected_attachments": 0,
+        "materialized_attachments": 0,
+        "attachment_materialization_failed": 0,
+        "attachment_bytes_written": 0,
+        "inline_attachment_sources": 0,
+        "gmail_attachment_fetches": 0,
     }
 
     _emit_progress(
@@ -900,8 +1047,17 @@ def update(
         incremental_processed = 0
         for msg_id in ids:
             incremental_processed += 1
-            if _ingest_message_id(conn, cfg, service, acct.email, msg_id):
+            ingested, materialization = _ingest_message_id_with_attachment_materialization(
+                conn,
+                cfg,
+                service,
+                acct.email,
+                msg_id,
+                materialize_attachments=cfg.gmail_materialize_attachments_on_update,
+            )
+            if ingested:
                 stats["ingested"] += 1
+                _merge_attachment_materialization_stats(stats, materialization)
             else:
                 stats["failed"] += 1
 
@@ -973,6 +1129,12 @@ def repair(
         "backfill_failed": 0,
         "backfill_queries": {},
         "interrupted": False,
+        "selected_attachments": 0,
+        "materialized_attachments": 0,
+        "attachment_materialization_failed": 0,
+        "attachment_bytes_written": 0,
+        "inline_attachment_sources": 0,
+        "gmail_attachment_fetches": 0,
     }
 
     _emit_progress(
@@ -1064,11 +1226,18 @@ def repair(
                     else:
                         stats["backfill_candidates"] += 1
                         state["account_candidates"] += 1
-                        if _ingest_message_id(
-                            conn, cfg, state["service"], state["acct"].email, msg_id
-                        ):
+                        ingested, materialization = _ingest_message_id_with_attachment_materialization(
+                            conn,
+                            cfg,
+                            state["service"],
+                            state["acct"].email,
+                            msg_id,
+                            materialize_attachments=cfg.gmail_materialize_attachments_on_repair,
+                        )
+                        if ingested:
                             stats["backfill_ingested"] += 1
                             state["account_ingested"] += 1
+                            _merge_attachment_materialization_stats(stats, materialization)
                         else:
                             stats["backfill_failed"] += 1
                             state["account_failed"] += 1

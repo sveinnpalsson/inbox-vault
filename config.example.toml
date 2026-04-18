@@ -15,6 +15,10 @@ query = "label:inbox OR label:sent"
 request_timeout_seconds = 60
 # Emit privacy-safe ingest progress every N scanned/processed messages.
 progress_every = 100
+# Materialize attachment bytes during normal incremental update runs.
+materialize_attachments_on_update = true
+# Materialize attachment bytes during repair backfill ingest.
+materialize_attachments_on_repair = true
 
 [llm]
 enabled = true
