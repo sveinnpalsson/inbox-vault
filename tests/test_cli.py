@@ -110,6 +110,35 @@ def test_validate_command_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
             {"ingest": {"backfill_ingested": 1, "interrupted": False}},
         ),
         (
+            ["backfill-attachments", "--limit", "25"],
+            {
+                "backfill_attachment_inventory": lambda *_args, **_kwargs: {
+                    "accounts": 1,
+                    "limit": 25,
+                    "missing_only": True,
+                    "selected_messages": 25,
+                    "processed_messages": 25,
+                    "refreshed_messages": 25,
+                    "failed_messages": 0,
+                    "attachments_upserted": 4,
+                    "messages_with_attachments": 3,
+                    "messages_without_attachments": 22,
+                },
+            },
+            {
+                "accounts": 1,
+                "limit": 25,
+                "missing_only": True,
+                "selected_messages": 25,
+                "processed_messages": 25,
+                "refreshed_messages": 25,
+                "failed_messages": 0,
+                "attachments_upserted": 4,
+                "messages_with_attachments": 3,
+                "messages_without_attachments": 22,
+            },
+        ),
+        (
             ["enrich", "--limit", "5"],
             {"enrich_pending": lambda *_args, **_kwargs: 5},
             {"updated": 5, "diagnostics": {}},
@@ -253,6 +282,78 @@ def test_repair_backfill_limit_passthrough(
     assert out["ingest"] == {"backfill_ingested": 0, "interrupted": False}
     assert captured["backfill_limit"] == 10
     assert captured["commit_every_messages"] == 50
+
+
+def test_backfill_attachments_passthrough_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    cfg = tmp_path / "config.toml"
+    _write_config(cfg)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+
+    captured: dict[str, object] = {}
+
+    def fake_backfill_attachments(*_args, **kwargs):
+        captured.update(kwargs)
+        return {
+            "accounts": 1,
+            "limit": 10,
+            "missing_only": True,
+            "selected_messages": 10,
+            "processed_messages": 10,
+            "refreshed_messages": 10,
+            "failed_messages": 0,
+            "attachments_upserted": 2,
+            "messages_with_attachments": 2,
+            "messages_without_attachments": 8,
+        }
+
+    monkeypatch.setattr(cli, "backfill_attachment_inventory", fake_backfill_attachments)
+
+    cli.main(
+        ["--config", str(cfg), "backfill-attachments", "--limit", "10", "--commit-every", "25"]
+    )
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["selected_messages"] == 10
+    assert captured["limit"] == 10
+    assert captured["missing_only"] is True
+    assert captured["commit_every_messages"] == 25
+
+
+def test_backfill_attachments_all_passthrough(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    cfg = tmp_path / "config.toml"
+    _write_config(cfg)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+
+    captured: dict[str, object] = {}
+
+    def fake_backfill_attachments(*_args, **kwargs):
+        captured.update(kwargs)
+        return {
+            "accounts": 1,
+            "limit": None,
+            "missing_only": False,
+            "selected_messages": 2,
+            "processed_messages": 2,
+            "refreshed_messages": 2,
+            "failed_messages": 0,
+            "attachments_upserted": 1,
+            "messages_with_attachments": 1,
+            "messages_without_attachments": 1,
+        }
+
+    monkeypatch.setattr(cli, "backfill_attachment_inventory", fake_backfill_attachments)
+
+    cli.main(["--config", str(cfg), "backfill-attachments", "--all"])
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["missing_only"] is False
+    assert captured["missing_only"] is False
 
 
 def test_repair_rejects_negative_backfill_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1125,6 +1226,8 @@ endpoint = "http://embedding.test:11434"
     assert out["attachment_inventory"] == {
         "attachments": 2,
         "messages_with_attachments": 1,
+        "messages_with_inventory": 0,
+        "messages_missing_inventory": 2,
         "inline_attachments": 1,
         "non_inline_attachments": 1,
         "state_counts": {"metadata_only": 2},

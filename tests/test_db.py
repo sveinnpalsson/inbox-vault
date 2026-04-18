@@ -27,6 +27,7 @@ def test_schema_and_crud_paths(conn):
         "messages",
         "raw_messages",
         "message_attachments",
+        "message_attachment_inventory_state",
         "message_enrichment",
         "contact_stats",
         "contact_profiles",
@@ -113,6 +114,14 @@ def test_schema_and_crud_paths(conn):
         ("2", "att-2", "application/pdf", "invoice.pdf", 2048, "attachment", "", 0, "metadata_only"),
         ("3", "att-3", "image/png", "logo.png", 512, "inline", "<logo-1>", 1, "metadata_only"),
     ]
+    inventory_state = conn.execute(
+        """
+        SELECT attachment_count, inventory_state
+        FROM message_attachment_inventory_state
+        WHERE msg_id = 'm1'
+        """
+    ).fetchone()
+    assert inventory_state == (2, "metadata_only")
 
     upsert_message_attachments(
         conn,
@@ -140,6 +149,14 @@ def test_schema_and_crud_paths(conn):
         """
     ).fetchall()
     assert replaced_rows == [("9", "att-9", "text/calendar", "invite.ics")]
+    replaced_state = conn.execute(
+        """
+        SELECT attachment_count, inventory_state
+        FROM message_attachment_inventory_state
+        WHERE msg_id = 'm1'
+        """
+    ).fetchone()
+    assert replaced_state == (1, "metadata_only")
 
     assert get_cursor(conn, "acct@example.com", "INBOX,SENT") is None
     upsert_cursor(conn, "acct@example.com", "INBOX,SENT", 55)

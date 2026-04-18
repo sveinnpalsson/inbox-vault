@@ -17,7 +17,7 @@ from .db import (
 )
 from .enrich import enrich_pending
 from .evals import bootstrap_eval_template, run_retrieval_eval
-from .ingest import backfill, repair, update
+from .ingest import backfill, backfill_attachment_inventory, repair, update
 from .profiles import build_profiles
 from .redaction import (
     REDACTION_POLICY_VERSION,
@@ -191,6 +191,29 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional per-run cap when indexing via repair (default from [indexing].auto_index_limit).",
+    )
+
+    p_attachment_backfill = sub.add_parser(
+        "backfill-attachments",
+        help="Refresh attachment metadata for already-ingested messages without enrichment/indexing",
+    )
+    p_attachment_backfill.add_argument("--account-email", default=None)
+    p_attachment_backfill.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional global cap for messages refreshed in this run.",
+    )
+    p_attachment_backfill.add_argument(
+        "--all",
+        action="store_true",
+        help="Refresh all already-ingested messages in scope, not just those missing attachment inventory.",
+    )
+    p_attachment_backfill.add_argument(
+        "--commit-every",
+        type=int,
+        default=100,
+        help="Commit attachment inventory progress every N processed messages.",
     )
 
     p_enrich = sub.add_parser("enrich", help="Enrich unprocessed emails using local LLM")
@@ -789,6 +812,19 @@ def run_status(conn, cfg) -> dict[str, object]:
             """
         ).fetchone()[0]
     )
+    inventory_messages = int(
+        conn.execute("SELECT count(*) FROM message_attachment_inventory_state").fetchone()[0]
+    )
+    missing_inventory_messages = int(
+        conn.execute(
+            """
+            SELECT count(*)
+            FROM messages m
+            LEFT JOIN message_attachment_inventory_state s ON s.msg_id = m.msg_id
+            WHERE s.msg_id IS NULL
+            """
+        ).fetchone()[0]
+    )
     llm_endpoint_reachable = _endpoint_reachable(cfg.llm.endpoint) if cfg.llm.enabled else None
     embeddings_endpoint_reachable = _endpoint_reachable(cfg.embeddings.endpoint)
     history_sync = _history_sync_status(conn)
@@ -821,6 +857,8 @@ def run_status(conn, cfg) -> dict[str, object]:
         "attachment_inventory": {
             "attachments": attachment_total,
             "messages_with_attachments": attachment_messages,
+            "messages_with_inventory": inventory_messages,
+            "messages_missing_inventory": missing_inventory_messages,
             "inline_attachments": inline_attachments,
             "non_inline_attachments": max(0, attachment_total - inline_attachments),
             "state_counts": attachment_state_counts,
@@ -1106,6 +1144,15 @@ def _emit_ingest_progress(event: dict) -> None:
                 f"skipped={int(event.get('backfill_skipped_existing') or 0)} "
                 f"failed={int(event.get('backfill_failed') or 0)}"
             )
+        elif stage == "attachment_backfill_account":
+            line = (
+                f"[ingest-progress] attachment_backfill acct={account} ({account_pos}/{account_total}) "
+                f"selected={int(event.get('selected_messages') or 0)} "
+                f"processed={int(event.get('processed_messages') or 0)} "
+                f"refreshed={int(event.get('refreshed_messages') or 0)} "
+                f"failed={int(event.get('failed_messages') or 0)} "
+                f"attachments={int(event.get('attachments_upserted') or 0)}"
+            )
         else:
             new_ids = int(event.get("new_ids") or event.get("new_ids_total") or 0)
             ingested = int(event.get("ingested") or 0)
@@ -1135,6 +1182,14 @@ def _emit_ingest_progress(event: dict) -> None:
                 f"ingested={int(event.get('account_ingested') or 0)} "
                 f"failed={int(event.get('account_failed') or 0)}"
             )
+        elif stage in {"attachment_backfill_account_start", "attachment_backfill_account_done"}:
+            line = (
+                f"[ingest-stage] {stage} acct={account} "
+                f"selected={int(event.get('selected_messages') or 0)} "
+                f"processed={int(event.get('account_processed') or 0)} "
+                f"refreshed={int(event.get('account_refreshed') or 0)} "
+                f"failed={int(event.get('account_failed') or 0)}"
+            )
         elif stage in {
             "update_start",
             "update_done",
@@ -1142,6 +1197,8 @@ def _emit_ingest_progress(event: dict) -> None:
             "backfill_done",
             "repair_start",
             "repair_done",
+            "attachment_backfill_start",
+            "attachment_backfill_done",
         }:
             line = f"[ingest-stage] {stage}"
         else:
@@ -1320,7 +1377,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    if args.command in {"backfill", "update", "repair"}:
+    if args.command in {"backfill", "update", "repair", "backfill-attachments"}:
         _validate_accounts(cfg)
 
     conn = get_conn(cfg.db.path, password)
@@ -1514,6 +1571,28 @@ def main(argv: list[str] | None = None) -> None:
                 )
 
             print(json.dumps(out, indent=2))
+            return
+
+        if args.command == "backfill-attachments":
+            if args.limit is not None and args.limit < 1:
+                raise ValueError("--limit must be >= 1")
+            if args.commit_every < 1:
+                raise ValueError("--commit-every must be >= 1")
+
+            print(
+                json.dumps(
+                    backfill_attachment_inventory(
+                        conn,
+                        cfg,
+                        limit=args.limit,
+                        missing_only=not args.all,
+                        account_email=args.account_email,
+                        commit_every_messages=args.commit_every,
+                        progress_callback=_emit_ingest_progress,
+                    ),
+                    indent=2,
+                )
+            )
             return
 
         if args.command == "enrich":

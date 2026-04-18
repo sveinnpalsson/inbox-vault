@@ -146,6 +146,196 @@ def _ingest_message_id(conn, cfg: AppConfig, service, account_email: str, msg_id
         return False
 
 
+def _attachment_backfill_candidates(
+    conn,
+    *,
+    account_email: str,
+    missing_only: bool,
+    limit: int | None,
+) -> list[str]:
+    sql = """
+        SELECT m.msg_id
+        FROM messages m
+        LEFT JOIN message_attachment_inventory_state s ON s.msg_id = m.msg_id
+        WHERE m.account_email = ?
+    """
+    params: list[Any] = [account_email]
+    if missing_only:
+        sql += " AND s.msg_id IS NULL"
+    sql += " ORDER BY COALESCE(m.internal_ts, 0) DESC, m.msg_id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    return [str(row[0]) for row in rows if row and row[0] is not None]
+
+
+def backfill_attachment_inventory(
+    conn,
+    cfg: AppConfig,
+    *,
+    limit: int | None = None,
+    missing_only: bool = True,
+    account_email: str | None = None,
+    commit_every_messages: int = 100,
+    progress_callback: _ProgressCallback | None = None,
+) -> dict[str, Any]:
+    safe_limit = None if limit is None else max(1, int(limit))
+    safe_commit_every = max(1, int(commit_every_messages))
+    progress_every = max(1, int(cfg.gmail_progress_every))
+
+    stats: dict[str, Any] = {
+        "accounts": 0,
+        "limit": safe_limit,
+        "missing_only": bool(missing_only),
+        "selected_messages": 0,
+        "processed_messages": 0,
+        "refreshed_messages": 0,
+        "failed_messages": 0,
+        "attachments_upserted": 0,
+        "messages_with_attachments": 0,
+        "messages_without_attachments": 0,
+    }
+
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "stage",
+            "stage": "attachment_backfill_start",
+            "accounts_total": len(cfg.accounts),
+            "limit": safe_limit,
+            "missing_only": bool(missing_only),
+            "account_filter": account_email,
+            "commit_every_messages": safe_commit_every,
+            "progress_every": progress_every,
+        },
+    )
+
+    processed_since_commit = 0
+    remaining = safe_limit
+
+    for acct_idx, acct in enumerate(cfg.accounts, start=1):
+        service = get_service(
+            acct.credentials_file,
+            acct.token_file,
+            timeout_seconds=cfg.gmail_request_timeout_seconds,
+        )
+        _resolve_account_email(acct, service)
+
+        if account_email and acct.email != account_email:
+            continue
+
+        stats["accounts"] += 1
+        candidate_ids = _attachment_backfill_candidates(
+            conn,
+            account_email=acct.email,
+            missing_only=missing_only,
+            limit=remaining,
+        )
+        stats["selected_messages"] += len(candidate_ids)
+
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "stage",
+                "stage": "attachment_backfill_account_start",
+                "account": acct.email,
+                "account_index": acct_idx,
+                "accounts_total": len(cfg.accounts),
+                "selected_messages": len(candidate_ids),
+            },
+        )
+
+        account_processed = 0
+        account_refreshed = 0
+        account_failed = 0
+
+        for msg_id in candidate_ids:
+            account_processed += 1
+            stats["processed_messages"] += 1
+            try:
+                raw = fetch_full_message_payload(service, msg_id)
+                if not raw:
+                    stats["failed_messages"] += 1
+                    account_failed += 1
+                    continue
+
+                rec = payload_to_record(raw, acct.email)
+                attachments = list(rec.get("attachments", []))
+                upsert_message_attachments(conn, msg_id, acct.email, attachments)
+                stats["refreshed_messages"] += 1
+                stats["attachments_upserted"] += len(attachments)
+                if attachments:
+                    stats["messages_with_attachments"] += 1
+                else:
+                    stats["messages_without_attachments"] += 1
+                account_refreshed += 1
+            except Exception:
+                LOG.exception(
+                    "Failed to backfill attachment inventory for message_id=%s account=%s",
+                    msg_id,
+                    acct.email,
+                )
+                stats["failed_messages"] += 1
+                account_failed += 1
+
+            processed_since_commit += 1
+            if processed_since_commit >= safe_commit_every:
+                conn.commit()
+                processed_since_commit = 0
+
+            if account_processed % progress_every == 0:
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "event": "progress",
+                        "stage": "attachment_backfill_account",
+                        "account": acct.email,
+                        "account_index": acct_idx,
+                        "accounts_total": len(cfg.accounts),
+                        "selected_messages": len(candidate_ids),
+                        "processed_messages": stats["processed_messages"],
+                        "refreshed_messages": stats["refreshed_messages"],
+                        "failed_messages": stats["failed_messages"],
+                        "attachments_upserted": stats["attachments_upserted"],
+                    },
+                )
+
+        conn.commit()
+        processed_since_commit = 0
+
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "stage",
+                "stage": "attachment_backfill_account_done",
+                "account": acct.email,
+                "account_index": acct_idx,
+                "accounts_total": len(cfg.accounts),
+                "selected_messages": len(candidate_ids),
+                "account_processed": account_processed,
+                "account_refreshed": account_refreshed,
+                "account_failed": account_failed,
+            },
+        )
+
+        if remaining is not None:
+            remaining = max(0, remaining - len(candidate_ids))
+            if remaining == 0:
+                break
+
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "stage",
+            "stage": "attachment_backfill_done",
+            **stats,
+        },
+    )
+
+    return stats
+
+
 def backfill(
     conn,
     cfg: AppConfig,

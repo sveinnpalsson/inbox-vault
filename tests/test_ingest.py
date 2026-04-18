@@ -8,7 +8,7 @@ from googleapiclient.errors import HttpError
 
 from inbox_vault import ingest
 from inbox_vault.config import AccountConfig, IngestTriageConfig
-from inbox_vault.db import get_cursor, message_exists, upsert_message
+from inbox_vault.db import get_cursor, message_exists, upsert_message, upsert_message_attachments
 from inbox_vault.vectors import count_pending_vector_updates
 from tests.factories import gmail_message_payload
 
@@ -181,6 +181,175 @@ def test_update_persists_attachment_inventory_metadata_only(
         ("2", "att-pdf", "application/pdf", "invoice.pdf", 2048, "attachment", "", 0, "metadata_only"),
         ("3", "att-inline", "image/png", "logo.png", 512, "inline", "<logo-1>", 1, "metadata_only"),
     ]
+    state_row = conn.execute(
+        """
+        SELECT attachment_count, inventory_state
+        FROM message_attachment_inventory_state
+        WHERE msg_id = ?
+        """,
+        ("m-attach",),
+    ).fetchone()
+    assert state_row == (2, "metadata_only")
+
+
+def test_backfill_attachment_inventory_missing_only_refreshes_only_uninventoried_messages(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+
+    upsert_message(
+        conn,
+        {
+            "msg_id": "m-missing",
+            "account_email": app_cfg.accounts[0].email,
+            "thread_id": "t-missing",
+            "date_iso": "2026-04-18",
+            "internal_ts": 1713398400000,
+            "from_addr": "sender@example.com",
+            "to_addr": "acct@example.com",
+            "subject": "missing",
+            "snippet": "missing",
+            "body_text": "missing",
+            "labels": ["INBOX"],
+            "history_id": 1,
+        },
+    )
+    upsert_message(
+        conn,
+        {
+            "msg_id": "m-existing",
+            "account_email": app_cfg.accounts[0].email,
+            "thread_id": "t-existing",
+            "date_iso": "2026-04-17",
+            "internal_ts": 1713312000000,
+            "from_addr": "sender@example.com",
+            "to_addr": "acct@example.com",
+            "subject": "existing",
+            "snippet": "existing",
+            "body_text": "existing",
+            "labels": ["INBOX"],
+            "history_id": 2,
+        },
+    )
+    conn.commit()
+    upsert_message_attachments(
+        conn,
+        "m-existing",
+        app_cfg.accounts[0].email,
+        [
+            {
+                "part_id": "2",
+                "gmail_attachment_id": "att-existing",
+                "mime_type": "application/pdf",
+                "filename": "existing.pdf",
+                "size_bytes": 128,
+                "content_disposition": "attachment",
+                "content_id": "",
+                "is_inline": False,
+                "inventory_state": "metadata_only",
+            }
+        ],
+    )
+    conn.commit()
+
+    fetched_ids: list[str] = []
+
+    def _fetch(_svc, msg_id):
+        fetched_ids.append(msg_id)
+        return gmail_message_payload(
+            msg_id,
+            history_id=500,
+            labels=["INBOX"],
+            attachments=[
+                {
+                    "part_id": "2",
+                    "attachment_id": f"att-{msg_id}",
+                    "mime_type": "application/pdf",
+                    "filename": f"{msg_id}.pdf",
+                    "size_bytes": 2048,
+                    "content_disposition": "attachment",
+                }
+            ],
+        )
+
+    monkeypatch.setattr(ingest, "fetch_full_message_payload", _fetch)
+
+    out = ingest.backfill_attachment_inventory(conn, app_cfg)
+
+    assert out == {
+        "accounts": 1,
+        "limit": None,
+        "missing_only": True,
+        "selected_messages": 1,
+        "processed_messages": 1,
+        "refreshed_messages": 1,
+        "failed_messages": 0,
+        "attachments_upserted": 1,
+        "messages_with_attachments": 1,
+        "messages_without_attachments": 0,
+    }
+    assert fetched_ids == ["m-missing"]
+    state_rows = conn.execute(
+        """
+        SELECT msg_id, attachment_count
+        FROM message_attachment_inventory_state
+        ORDER BY msg_id
+        """
+    ).fetchall()
+    assert state_rows == [("m-existing", 1), ("m-missing", 1)]
+
+
+def test_backfill_attachment_inventory_all_records_zero_attachment_messages(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+
+    upsert_message(
+        conn,
+        {
+            "msg_id": "m-no-attach",
+            "account_email": app_cfg.accounts[0].email,
+            "thread_id": "t-none",
+            "date_iso": "2026-04-18",
+            "internal_ts": 1713398400000,
+            "from_addr": "sender@example.com",
+            "to_addr": "acct@example.com",
+            "subject": "none",
+            "snippet": "none",
+            "body_text": "none",
+            "labels": ["INBOX"],
+            "history_id": 1,
+        },
+    )
+    conn.commit()
+
+    monkeypatch.setattr(
+        ingest,
+        "fetch_full_message_payload",
+        lambda *_args, **_kwargs: gmail_message_payload(
+            "m-no-attach",
+            history_id=600,
+            labels=["INBOX"],
+            attachments=[],
+        ),
+    )
+
+    first = ingest.backfill_attachment_inventory(conn, app_cfg)
+    second = ingest.backfill_attachment_inventory(conn, app_cfg)
+
+    assert first["messages_without_attachments"] == 1
+    assert second["selected_messages"] == 0
+    state_row = conn.execute(
+        """
+        SELECT attachment_count, inventory_state
+        FROM message_attachment_inventory_state
+        WHERE msg_id = ?
+        """,
+        ("m-no-attach",),
+    ).fetchone()
+    assert state_row == (0, "metadata_only")
 
 
 def test_update_persists_observe_only_ingest_triage(conn, app_cfg, monkeypatch: pytest.MonkeyPatch):

@@ -114,6 +114,14 @@ def get_conn(db_path: str, password: str):
           PRIMARY KEY (msg_id, part_id)
         );
 
+        CREATE TABLE IF NOT EXISTS message_attachment_inventory_state (
+          msg_id TEXT PRIMARY KEY REFERENCES messages(msg_id) ON DELETE CASCADE,
+          account_email TEXT NOT NULL,
+          inventory_state TEXT NOT NULL DEFAULT 'metadata_only',
+          attachment_count INTEGER NOT NULL DEFAULT 0,
+          inventoried_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS message_enrichment (
           msg_id TEXT PRIMARY KEY REFERENCES messages(msg_id) ON DELETE CASCADE,
           category TEXT,
@@ -273,6 +281,8 @@ def get_conn(db_path: str, password: str):
         CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_email);
         CREATE INDEX IF NOT EXISTS idx_message_attachments_account
           ON message_attachments(account_email, inventory_state);
+        CREATE INDEX IF NOT EXISTS idx_attachment_inventory_state_account
+          ON message_attachment_inventory_state(account_email, inventoried_at);
         CREATE INDEX IF NOT EXISTS idx_ingest_triage_stream ON message_ingest_triage(stream_id);
         CREATE INDEX IF NOT EXISTS idx_ingest_triage_tier ON message_ingest_triage(triage_tier);
         CREATE INDEX IF NOT EXISTS idx_stream_reputation_account ON message_stream_reputation(account_email);
@@ -433,8 +443,6 @@ def upsert_message_attachments(
     attachments: list[dict[str, Any]],
 ):
     conn.execute("DELETE FROM message_attachments WHERE msg_id = ?", (msg_id,))
-    if not attachments:
-        return
 
     seen_at = utc_now()
     rows: list[tuple[Any, ...]] = []
@@ -459,17 +467,29 @@ def upsert_message_attachments(
             )
         )
 
-    if not rows:
-        return
+    if rows:
+        conn.executemany(
+            """
+            INSERT INTO message_attachments (
+              msg_id, account_email, part_id, gmail_attachment_id, mime_type, filename,
+              size_bytes, content_disposition, content_id, is_inline, inventory_state, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
-    conn.executemany(
+    conn.execute(
         """
-        INSERT INTO message_attachments (
-          msg_id, account_email, part_id, gmail_attachment_id, mime_type, filename,
-          size_bytes, content_disposition, content_id, is_inline, inventory_state, last_seen_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO message_attachment_inventory_state (
+          msg_id, account_email, inventory_state, attachment_count, inventoried_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(msg_id) DO UPDATE SET
+          account_email=excluded.account_email,
+          inventory_state=excluded.inventory_state,
+          attachment_count=excluded.attachment_count,
+          inventoried_at=excluded.inventoried_at
         """,
-        rows,
+        (msg_id, account_email, "metadata_only", len(rows), seen_at),
     )
 
 
