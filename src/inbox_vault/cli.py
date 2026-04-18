@@ -1306,6 +1306,86 @@ def _emit_index_progress(event: dict) -> None:
     print(line, file=sys.stderr, flush=True)
 
 
+def _format_repair_diag_summary(diagnostics: dict[str, int]) -> str:
+    ordered_keys = (
+        "attempted",
+        "succeeded",
+        "fallback_used",
+        "http_failed",
+        "parse_failed",
+        "contract_failed",
+        "repair_attempted",
+        "repair_succeeded",
+    )
+    return " ".join(f"{key}={int(diagnostics.get(key) or 0)}" for key in ordered_keys)
+
+
+def _format_repair_index_summary(result: dict[str, int | str]) -> str:
+    ordered_keys = (
+        "scanned",
+        "indexed",
+        "unchanged",
+        "failed",
+        "pending_before",
+        "pending_after",
+    )
+    parts = [f"{key}={result[key]}" for key in ordered_keys if key in result]
+    if "skip_applied_light" in result:
+        parts.append(f"skip_applied_light={result['skip_applied_light']}")
+    return " ".join(parts)
+
+
+def _emit_repair_progress(event: dict) -> None:
+    event_name = str(event.get("event") or "")
+    stage = str(event.get("stage") or "")
+
+    if event_name == "stage" and stage == "enrich_start":
+        total = int(event.get("total") or 0)
+        include_degraded = bool(event.get("include_degraded"))
+        print(
+            f"[repair-phase] enrich_start total={total} include_degraded={str(include_degraded).lower()}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    if event_name == "progress" and stage == "enrich_progress":
+        print(
+            "[repair-phase] enrich_progress "
+            f"completed={int(event.get('completed') or 0)}/{int(event.get('total') or 0)} "
+            f"fallback_used={int(event.get('fallback_used') or 0)} "
+            f"http_failed={int(event.get('http_failed') or 0)} "
+            f"parse_failed={int(event.get('parse_failed') or 0)} "
+            f"contract_failed={int(event.get('contract_failed') or 0)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    if event_name == "stage" and stage == "enrich_done":
+        diagnostics = dict(event.get("diagnostics") or {})
+        print(
+            "[repair-phase] enrich_done "
+            f"updated={int(event.get('updated') or 0)} "
+            + _format_repair_diag_summary(diagnostics),
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    if event_name == "stage" and stage == "index_start":
+        print("[repair-phase] index_start", file=sys.stderr, flush=True)
+        return
+
+    if event_name == "stage" and stage == "index_done":
+        result = dict(event.get("result") or {})
+        print(
+            "[repair-phase] index_done " + _format_repair_index_summary(result),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def _run_index_vectors_for_ingest(
     conn,
     cfg,
@@ -1617,17 +1697,26 @@ def main(argv: list[str] | None = None) -> None:
                         cfg,
                         diagnostics=enrich_diag,
                         include_degraded=True,
+                        progress_callback=_emit_repair_progress,
                     ),
                     "repair_scope": "pending+heuristic-fallback",
                     "diagnostics": enrich_diag,
                 }
 
             if args.index_vectors:
+                _emit_repair_progress({"event": "stage", "stage": "index_start"})
                 out["index_vectors"] = _run_index_vectors_for_ingest(
                     conn,
                     cfg,
                     limit=index_limit,
                     pending_only=pending_only,
+                )
+                _emit_repair_progress(
+                    {
+                        "event": "stage",
+                        "stage": "index_done",
+                        "result": out["index_vectors"],
+                    }
                 )
 
             print(json.dumps(out, indent=2))

@@ -172,6 +172,7 @@ def enrich_pending(
     diagnostics: LLMDiagnostics | None = None,
     *,
     include_degraded: bool = False,
+    progress_callback=None,
 ) -> int:
     stats = _empty_diag()
     if not cfg.llm.enabled:
@@ -180,6 +181,15 @@ def enrich_pending(
         return 0
 
     rows = enrichment_repair_candidates(conn, limit=limit, include_degraded=include_degraded)
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "event": "stage",
+                "stage": "enrich_start",
+                "total": len(rows),
+                "include_degraded": include_degraded,
+            }
+        )
     count = 0
     for msg_id, subject, snippet, body_text, from_addr, to_addr, date_iso in rows:
         stats["attempted"] += 1
@@ -266,10 +276,35 @@ def enrich_pending(
         stats["succeeded"] += 1
         if fallback_path_used:
             stats["fallback_used"] += 1
+        if progress_callback is not None and (
+            count == 1 or count == len(rows) or count % 10 == 0
+        ):
+            progress_callback(
+                {
+                    "event": "progress",
+                    "stage": "enrich_progress",
+                    "completed": count,
+                    "total": len(rows),
+                    "fallback_used": stats["fallback_used"],
+                    "http_failed": stats["http_failed"],
+                    "parse_failed": stats["parse_failed"],
+                    "contract_failed": stats["contract_failed"],
+                }
+            )
 
     conn.commit()
     if diagnostics is not None:
         diagnostics.update(stats)
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "event": "stage",
+                "stage": "enrich_done",
+                "updated": count,
+                "total": len(rows),
+                "diagnostics": dict(stats),
+            }
+        )
     LOG.info(
         "enrich diagnostics attempted=%s succeeded=%s http_failed=%s parse_failed=%s contract_failed=%s "
         "repair_attempted=%s repair_succeeded=%s fallback_used=%s",

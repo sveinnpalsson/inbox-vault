@@ -590,6 +590,89 @@ def test_repair_defaults_run_enrich_and_index(tmp_path: Path, monkeypatch: pytes
     assert captured["skip_applied_light"] is False
 
 
+def test_repair_emits_post_ingest_progress_to_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    cfg = tmp_path / "config.toml"
+    _write_config(cfg)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+
+    monkeypatch.setattr(
+        cli,
+        "repair",
+        lambda *_args, **_kwargs: {"backfill_ingested": 4, "interrupted": False},
+    )
+
+    def fake_enrich(*_args, **kwargs):
+        progress_callback = kwargs["progress_callback"]
+        progress_callback(
+            {
+                "event": "stage",
+                "stage": "enrich_start",
+                "total": 12,
+                "include_degraded": True,
+            }
+        )
+        progress_callback(
+            {
+                "event": "progress",
+                "stage": "enrich_progress",
+                "completed": 10,
+                "total": 12,
+                "fallback_used": 2,
+                "http_failed": 1,
+                "parse_failed": 3,
+                "contract_failed": 1,
+            }
+        )
+        progress_callback(
+            {
+                "event": "stage",
+                "stage": "enrich_done",
+                "updated": 12,
+                "diagnostics": {
+                    "attempted": 12,
+                    "succeeded": 12,
+                    "fallback_used": 2,
+                    "http_failed": 1,
+                    "parse_failed": 3,
+                    "contract_failed": 1,
+                    "repair_attempted": 1,
+                    "repair_succeeded": 1,
+                },
+            }
+        )
+        return 12
+
+    monkeypatch.setattr(cli, "enrich_pending", fake_enrich)
+    monkeypatch.setattr(cli, "count_pending_vector_updates", lambda *_args, **_kwargs: 5)
+    monkeypatch.setattr(
+        cli,
+        "index_vectors",
+        lambda *_args, **_kwargs: {"scanned": 5, "indexed": 4, "unchanged": 1, "failed": 0},
+    )
+
+    cli.main(["--config", str(cfg), "repair", "--backfill-limit", "5"])
+
+    captured = capsys.readouterr()
+    err_lines = captured.err.splitlines()
+    assert "[repair-phase] enrich_start total=12 include_degraded=true" in err_lines
+    assert (
+        "[repair-phase] enrich_progress completed=10/12 fallback_used=2 http_failed=1 "
+        "parse_failed=3 contract_failed=1"
+    ) in err_lines
+    assert (
+        "[repair-phase] enrich_done updated=12 attempted=12 succeeded=12 fallback_used=2 "
+        "http_failed=1 parse_failed=3 contract_failed=1 repair_attempted=1 repair_succeeded=1"
+    ) in err_lines
+    assert "[repair-phase] index_start" in err_lines
+    assert (
+        "[repair-phase] index_done scanned=5 indexed=4 unchanged=1 failed=0 "
+        "pending_before=5 pending_after=5 skip_applied_light=False"
+    ) in err_lines
+
+
 def test_repair_interrupted_skips_post_processing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):
