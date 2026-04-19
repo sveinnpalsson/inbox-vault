@@ -747,13 +747,50 @@ def index_vectors(
     redaction_maps_by_account: dict[str, PersistentRedactionMap] = {}
     pruned_accounts: set[str] = set()
     pending_prepared: list[_PreparedIndexMessage] = []
+    batch_sequence = 0
 
     def _flush_pending_batch() -> None:
-        nonlocal indexed_since_last_commit, pending_prepared
+        nonlocal indexed_since_last_commit, pending_prepared, batch_sequence
         if not pending_prepared:
             return
+        batch_sequence += 1
+        batch_messages = len(pending_prepared)
+        batch_texts = sum(1 + len(item.chunk_embedding_inputs) for item in pending_prepared)
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "batch_flush_start",
+                    "batch_index": batch_sequence,
+                    "batch_messages": batch_messages,
+                    "batch_texts": batch_texts,
+                    "position": pending_prepared[0].row_idx,
+                    "total": total_rows,
+                }
+            )
+            progress_callback(
+                {
+                    "event": "batch_embedding_start",
+                    "batch_index": batch_sequence,
+                    "batch_messages": batch_messages,
+                    "batch_texts": batch_texts,
+                    "position": pending_prepared[0].row_idx,
+                    "total": total_rows,
+                }
+            )
 
         embedding_results, embedding_failures = _embed_prepared_messages(cfg, pending_prepared)
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "batch_embedding_done",
+                    "batch_index": batch_sequence,
+                    "batch_messages": batch_messages,
+                    "batch_texts": batch_texts,
+                    "batch_failed_messages": len(embedding_failures),
+                    "position": pending_prepared[-1].row_idx,
+                    "total": total_rows,
+                }
+            )
         for prepared in pending_prepared:
             if prepared.msg_id in embedding_failures:
                 stats["failed"] += 1
@@ -777,6 +814,18 @@ def index_vectors(
                 continue
 
             message_embedding, chunk_embeddings = embedding_results[prepared.msg_id]
+            if progress_callback:
+                progress_callback(
+                    {
+                        "event": "message_substep",
+                        "position": prepared.row_idx,
+                        "total": prepared.total_rows,
+                        "msg_id": prepared.msg_id,
+                        "account_email": prepared.account_email,
+                        "substep": "persist",
+                        "chunk_count": len(prepared.chunks),
+                    }
+                )
             if not _persist_prepared_message(
                 conn,
                 cfg,
@@ -904,7 +953,7 @@ def index_vectors(
                     "msg_id": msg_id,
                     "account_email": acct,
                     "chunk_count": len(chunks),
-                    "substep": "embed-message",
+                    "substep": "redaction",
                 }
             )
 
@@ -977,7 +1026,7 @@ def index_vectors(
                     "total": total_rows,
                     "msg_id": msg_id,
                     "account_email": acct,
-                    "substep": "embed-batch-queued",
+                    "substep": "queued-for-batch",
                     "chunk_count": len(chunks),
                 }
             )

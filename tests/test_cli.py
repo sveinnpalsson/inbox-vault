@@ -692,6 +692,16 @@ def test_repair_emits_post_ingest_progress_to_stderr(
         progress_callback = kwargs["progress_callback"]
         progress_callback(
             {
+                "event": "message_start",
+                "position": 1,
+                "total": 12,
+                "msg_id": "m-001",
+                "account_email": "acct@example.com",
+                "substep": "normalization",
+            }
+        )
+        progress_callback(
+            {
                 "event": "message_done",
                 "position": 3,
                 "total": 12,
@@ -719,11 +729,153 @@ def test_repair_emits_post_ingest_progress_to_stderr(
         "[enrichment] done, updated 12 | attempted=12 succeeded=12 fallback_used=2 "
         "http_failed=1 parse_failed=3 contract_failed=1 repair_attempted=1 repair_succeeded=1 elapsed=24.0s"
     ) in err_lines
-    assert "[indexing] starting" in err_lines
+    assert "[indexing] starting | redaction=hybrid (llm chat + regex) | embeddings=batched" in err_lines
+    assert (
+        "[indexing] preparing 1/12 | step=normalization | redaction=hybrid (llm chat + regex)"
+        in err_lines
+    )
     assert "[indexing] 3/12, indexed 3, failed 0 | eta: 1 min" in err_lines
     assert (
         "[indexing] done | scanned=12 indexed=10 unchanged=2 failed=0 "
         "pending_before=5 pending_after=5 skip_applied_light=False elapsed=12.0s"
+    ) in err_lines
+
+
+def test_repair_verbose_emits_rich_index_substeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    cfg = tmp_path / "config.toml"
+    _write_config(cfg)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
+    perf_values = iter([50.0, 58.0])
+    monkeypatch.setattr(cli.time, "perf_counter", lambda: next(perf_values))
+
+    monkeypatch.setattr(
+        cli,
+        "repair",
+        lambda *_args, **_kwargs: {"backfill_ingested": 0, "interrupted": False},
+    )
+    monkeypatch.setattr(cli, "count_pending_vector_updates", lambda *_args, **_kwargs: 4)
+
+    def fake_index_vectors(*_args, **kwargs):
+        progress_callback = kwargs["progress_callback"]
+        progress_callback(
+            {
+                "event": "message_start",
+                "position": 1,
+                "total": 4,
+                "msg_id": "m-100",
+                "account_email": "acct@example.com",
+                "substep": "normalization",
+            }
+        )
+        progress_callback(
+            {
+                "event": "message_chunks_ready",
+                "position": 1,
+                "total": 4,
+                "msg_id": "m-100",
+                "account_email": "acct@example.com",
+                "chunk_count": 3,
+                "substep": "redaction",
+            }
+        )
+        progress_callback(
+            {
+                "event": "message_substep",
+                "position": 1,
+                "total": 4,
+                "msg_id": "m-100",
+                "account_email": "acct@example.com",
+                "substep": "redaction",
+            }
+        )
+        progress_callback(
+            {
+                "event": "message_substep",
+                "position": 1,
+                "total": 4,
+                "msg_id": "m-100",
+                "account_email": "acct@example.com",
+                "substep": "queued-for-batch",
+            }
+        )
+        progress_callback(
+            {
+                "event": "batch_flush_start",
+                "batch_index": 1,
+                "batch_messages": 4,
+                "batch_texts": 11,
+                "position": 1,
+                "total": 4,
+            }
+        )
+        progress_callback(
+            {
+                "event": "batch_embedding_start",
+                "batch_index": 1,
+                "batch_messages": 4,
+                "batch_texts": 11,
+                "position": 1,
+                "total": 4,
+            }
+        )
+        progress_callback(
+            {
+                "event": "batch_embedding_done",
+                "batch_index": 1,
+                "batch_messages": 4,
+                "batch_texts": 11,
+                "batch_failed_messages": 0,
+                "position": 4,
+                "total": 4,
+            }
+        )
+        progress_callback(
+            {
+                "event": "message_substep",
+                "position": 1,
+                "total": 4,
+                "msg_id": "m-100",
+                "account_email": "acct@example.com",
+                "substep": "persist",
+            }
+        )
+        progress_callback(
+            {
+                "event": "message_done",
+                "position": 1,
+                "total": 4,
+                "msg_id": "m-100",
+                "account_email": "acct@example.com",
+                "chunk_count": 3,
+                "elapsed_ms": 2200,
+                "messages_per_min": 27.27,
+                "indexed": 1,
+                "chunks_indexed": 3,
+                "failed": 0,
+            }
+        )
+        return {"scanned": 4, "indexed": 4, "unchanged": 0, "failed": 0}
+
+    monkeypatch.setattr(cli, "index_vectors", fake_index_vectors)
+
+    cli.main(["--config", str(cfg), "repair", "--backfill-limit", "0", "--no-enrich", "--verbose"])
+
+    err_lines = capsys.readouterr().err.splitlines()
+    assert "[indexing] starting | redaction=hybrid (llm chat + regex) | embeddings=batched" in err_lines
+    assert "[indexing] msg 1/4 m-100 (acct@example.com) start | step=normalization" in err_lines
+    assert "[indexing] msg 1/4 m-100 (acct@example.com) chunks=3 | next=redaction" in err_lines
+    assert "[indexing] msg 1/4 m-100 (acct@example.com) step=redaction" in err_lines
+    assert "[indexing] msg 1/4 m-100 (acct@example.com) step=queued-for-batch" in err_lines
+    assert "[indexing] batch 1 flush | messages=4 texts=11" in err_lines
+    assert "[indexing] batch 1 embedding | messages=4 texts=11" in err_lines
+    assert "[indexing] batch 1 embedded | messages=4 texts=11 failed_messages=0" in err_lines
+    assert "[indexing] msg 1/4 m-100 (acct@example.com) step=persist" in err_lines
+    assert (
+        "[indexing] done | scanned=4 indexed=4 unchanged=0 failed=0 "
+        "pending_before=4 pending_after=4 skip_applied_light=False elapsed=8.0s"
     ) in err_lines
 
 

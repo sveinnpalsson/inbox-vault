@@ -105,6 +105,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional per-run cap when indexing via backfill (default from [indexing].auto_index_limit).",
     )
+    p_backfill.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Emit richer indexing progress details to stderr.",
+    )
 
     p_update = sub.add_parser(
         "update",
@@ -147,6 +152,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional per-run cap for indexing (default from [indexing].auto_index_limit).",
+    )
+    p_update.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Emit richer indexing progress details to stderr.",
     )
 
     p_repair = sub.add_parser(
@@ -204,6 +214,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional per-run cap when indexing via repair (default from [indexing].auto_index_limit).",
+    )
+    p_repair.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Emit richer indexing progress details to stderr.",
     )
 
     p_attachment_backfill = sub.add_parser(
@@ -303,6 +318,11 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL],
         default=INDEX_LEVEL_REDACTED,
         help="Which dense index level to build. Redacted is the default safe index; full is operator opt-in.",
+    )
+    p_index.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Emit richer indexing progress details to stderr.",
     )
 
     p_search = sub.add_parser("search", help="Semantic search over indexed messages")
@@ -1273,44 +1293,147 @@ def _emit_ingest_progress(event: dict) -> None:
 
         print(line, file=sys.stderr, flush=True)
 
+def _describe_index_redaction_mode(mode: str | None, *, llm_enabled: bool = True) -> str:
+    selected = str(mode or "hybrid").strip().lower() or "hybrid"
+    if selected == "regex":
+        return "regex only"
+    if not llm_enabled:
+        return f"{selected} (regex fallback; llm disabled)"
+    if selected == "model":
+        return "model (llm chat)"
+    return "hybrid (llm chat + regex)"
 
 
-def _emit_index_progress(event: dict) -> None:
-    kind = str(event.get("event") or "")
-    pos = int(event.get("position") or 0)
-    total = int(event.get("total") or 0)
-    msg_id = str(event.get("msg_id") or "")
-    acct = str(event.get("account_email") or "")
-    chunk_count = int(event.get("chunk_count") or 0)
-    indexed = int(event.get("indexed") or 0)
-    chunks_indexed = int(event.get("chunks_indexed") or 0)
-    failed = int(event.get("failed") or 0)
-    elapsed_ms = int(event.get("elapsed_ms") or 0)
-    substep = str(event.get("substep") or "")
+def _make_index_progress_emitter(
+    *,
+    verbose: bool,
+    redaction_mode: str | None,
+    llm_enabled: bool = True,
+) -> callable:
+    state: dict[str, object] = {
+        "started_at": None,
+        "prepare_announced": False,
+        "redaction_summary": _describe_index_redaction_mode(
+            redaction_mode,
+            llm_enabled=llm_enabled,
+        ),
+    }
 
-    prefix = f"[index-progress] msg {pos}/{total} {msg_id} ({acct})"
-    if kind == "message_start":
-        line = f"{prefix} start | step={substep}"
-    elif kind == "message_chunks_ready":
-        line = f"{prefix} chunks_discovered={chunk_count} | next={substep}"
-    elif kind == "message_substep":
-        line = f"{prefix} step={substep}"
-    elif kind == "message_unchanged":
-        line = f"{prefix} unchanged → skipped | elapsed={elapsed_ms}ms"
-    elif kind == "message_skipped_filtered":
-        line = f"{prefix} filtered by label rules → skipped | elapsed={elapsed_ms}ms"
-    elif kind == "message_failed":
-        line = f"{prefix} FAILED at {substep} | elapsed={elapsed_ms}ms | indexed={indexed} chunks={chunks_indexed} failed={failed}"
-    elif kind == "message_done":
-        mpm = float(event.get("messages_per_min") or 0.0)
-        line = (
-            f"{prefix} done | chunks={chunk_count} elapsed={elapsed_ms}ms throughput={mpm:.2f}/min "
-            f"| in-batch indexed={indexed} chunks={chunks_indexed} failed={failed}"
-        )
-    else:
-        line = f"{prefix} event={kind}"
+    def _emit(event: dict) -> None:
+        kind = str(event.get("event") or "")
+        stage = str(event.get("stage") or "")
+        pos = int(event.get("position") or 0)
+        total = int(event.get("total") or 0)
+        msg_id = str(event.get("msg_id") or "")
+        acct = str(event.get("account_email") or "")
+        chunk_count = int(event.get("chunk_count") or 0)
+        indexed = int(event.get("indexed") or 0)
+        chunks_indexed = int(event.get("chunks_indexed") or 0)
+        failed = int(event.get("failed") or 0)
+        elapsed_ms = int(event.get("elapsed_ms") or 0)
+        substep = str(event.get("substep") or "")
+        redaction_summary = str(state["redaction_summary"])
 
-    print(line, file=sys.stderr, flush=True)
+        if kind == "stage" and stage == "index_start":
+            state["started_at"] = time.perf_counter()
+            print(
+                f"[indexing] starting | redaction={redaction_summary} | embeddings=batched",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        if kind == "stage" and stage == "index_done":
+            result = dict(event.get("result") or {})
+            started_at = state.get("started_at")
+            elapsed_s = max(0.0, time.perf_counter() - started_at) if started_at is not None else 0.0
+            print(
+                "[indexing] done | "
+                + _format_repair_index_summary(result)
+                + f" elapsed={elapsed_s:.1f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        if not verbose:
+            if kind == "message_start" and not state["prepare_announced"] and pos > 0 and total > 0:
+                state["prepare_announced"] = True
+                print(
+                    f"[indexing] preparing {pos}/{total} | step={substep} | redaction={redaction_summary}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+
+            if kind in {
+                "message_done",
+                "message_failed",
+                "message_unchanged",
+                "message_skipped_filtered",
+            }:
+                completed = pos
+                if completed <= 0 or total <= 0:
+                    return
+                if completed not in {1, 3, total} and completed % 10 != 0:
+                    return
+                started_at = state.get("started_at")
+                elapsed_s = max(0.0, time.perf_counter() - started_at) if started_at is not None else 0.0
+                print(
+                    f"[indexing] {completed}/{total}, indexed {indexed}, failed {failed}"
+                    f"{_format_eta_minutes(completed, total, elapsed_s)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return
+
+        prefix = f"[indexing] msg {pos}/{total} {msg_id} ({acct})"
+        if kind == "message_start":
+            line = f"{prefix} start | step={substep}"
+        elif kind == "message_chunks_ready":
+            line = f"{prefix} chunks={chunk_count} | next={substep}"
+        elif kind == "message_substep":
+            line = f"{prefix} step={substep}"
+        elif kind == "message_unchanged":
+            line = f"{prefix} unchanged -> skipped | elapsed={elapsed_ms}ms"
+        elif kind == "message_skipped_filtered":
+            line = f"{prefix} filtered -> skipped | elapsed={elapsed_ms}ms"
+        elif kind == "message_failed":
+            line = (
+                f"{prefix} FAILED at {substep} | elapsed={elapsed_ms}ms | "
+                f"indexed={indexed} chunks={chunks_indexed} failed={failed}"
+            )
+        elif kind == "message_done":
+            mpm = float(event.get("messages_per_min") or 0.0)
+            line = (
+                f"{prefix} done | chunks={chunk_count} elapsed={elapsed_ms}ms "
+                f"throughput={mpm:.2f}/min | indexed={indexed} chunks={chunks_indexed} failed={failed}"
+            )
+        elif kind == "batch_flush_start":
+            line = (
+                f"[indexing] batch {int(event.get('batch_index') or 0)} flush | "
+                f"messages={int(event.get('batch_messages') or 0)} "
+                f"texts={int(event.get('batch_texts') or 0)}"
+            )
+        elif kind == "batch_embedding_start":
+            line = (
+                f"[indexing] batch {int(event.get('batch_index') or 0)} embedding | "
+                f"messages={int(event.get('batch_messages') or 0)} "
+                f"texts={int(event.get('batch_texts') or 0)}"
+            )
+        elif kind == "batch_embedding_done":
+            line = (
+                f"[indexing] batch {int(event.get('batch_index') or 0)} embedded | "
+                f"messages={int(event.get('batch_messages') or 0)} "
+                f"texts={int(event.get('batch_texts') or 0)} "
+                f"failed_messages={int(event.get('batch_failed_messages') or 0)}"
+            )
+        else:
+            line = f"{prefix} event={kind}"
+
+        print(line, file=sys.stderr, flush=True)
+
+    return _emit
 
 
 def _format_repair_diag_summary(diagnostics: dict[str, int]) -> str:
@@ -1363,10 +1486,12 @@ def _print_pipeline_plan(command: str, stages: list[tuple[str, str]]) -> None:
         print(f"  - {label}: {description}", file=sys.stderr, flush=True)
 
 
-def _make_repair_progress_emitter():
-    state = {
-        "index_started_at": None,
-    }
+def _make_repair_progress_emitter(*, verbose: bool, redaction_mode: str | None, llm_enabled: bool):
+    index_emit = _make_index_progress_emitter(
+        verbose=verbose,
+        redaction_mode=redaction_mode,
+        llm_enabled=llm_enabled,
+    )
 
     def _emit(event: dict) -> None:
         event_name = str(event.get("event") or "")
@@ -1410,45 +1535,11 @@ def _make_repair_progress_emitter():
             print(line, file=sys.stderr, flush=True)
             return
 
-        if event_name == "stage" and stage == "index_start":
-            state["index_started_at"] = time.perf_counter()
-            print("[indexing] starting", file=sys.stderr, flush=True)
+        if event_name == "stage" and stage in {"index_start", "index_done"}:
+            index_emit(event)
             return
-
-        if event_name in {
-            "message_done",
-            "message_failed",
-            "message_unchanged",
-            "message_skipped_filtered",
-        }:
-            completed = int(event.get("position") or 0)
-            total = int(event.get("total") or 0)
-            if completed <= 0 or total <= 0:
-                return
-            if completed not in {1, 3, total} and completed % 10 != 0:
-                return
-            started_at = state.get("index_started_at")
-            elapsed_s = max(0.0, time.perf_counter() - started_at) if started_at is not None else 0.0
-            line = (
-                f"[indexing] {completed}/{total}, "
-                f"indexed {int(event.get('indexed') or 0)}, "
-                f"failed {int(event.get('failed') or 0)}"
-                f"{_format_eta_minutes(completed, total, elapsed_s)}"
-            )
-            print(line, file=sys.stderr, flush=True)
-            return
-
-        if event_name == "stage" and stage == "index_done":
-            result = dict(event.get("result") or {})
-            started_at = state.get("index_started_at")
-            elapsed_s = max(0.0, time.perf_counter() - started_at) if started_at is not None else 0.0
-            processed = int(result.get("scanned") or 0)
-            line = (
-                "[indexing] done | "
-                + _format_repair_index_summary(result)
-                + f" elapsed={elapsed_s:.1f}s"
-            )
-            print(line, file=sys.stderr, flush=True)
+        if event_name.startswith("message_") or event_name.startswith("batch_"):
+            index_emit(event)
 
     return _emit
 
@@ -1459,9 +1550,10 @@ def _run_index_vectors_for_ingest(
     *,
     limit: int | None,
     pending_only: bool,
-    progress_callback=_emit_index_progress,
+    progress_callback,
 ) -> dict[str, int | str]:
     skip_applied_light = bool(cfg.ingest_triage.enabled and cfg.ingest_triage.mode == "enforce")
+    progress_callback({"event": "stage", "stage": "index_start"})
     pending_before = count_pending_vector_updates(
         conn,
         cfg,
@@ -1486,6 +1578,7 @@ def _run_index_vectors_for_ingest(
     out["pending_before"] = pending_before
     out["pending_after"] = pending_after
     out["skip_applied_light"] = skip_applied_light
+    progress_callback({"event": "stage", "stage": "index_done", "result": out})
     return out
 
 
@@ -1634,11 +1727,17 @@ def main(argv: list[str] | None = None) -> None:
                     "diagnostics": profile_diag,
                 }
             if should_index:
+                index_progress = _make_index_progress_emitter(
+                    verbose=bool(args.verbose),
+                    redaction_mode=cfg.redaction.mode,
+                    llm_enabled=bool(cfg.llm.enabled),
+                )
                 out["index_vectors"] = _run_index_vectors_for_ingest(
                     conn,
                     cfg,
                     limit=index_limit,
                     pending_only=pending_only,
+                    progress_callback=index_progress,
                 )
             print(json.dumps(out, indent=2))
             return
@@ -1729,11 +1828,17 @@ def main(argv: list[str] | None = None) -> None:
 
             if args.index_vectors:
                 if _endpoint_reachable(cfg.embeddings.endpoint):
+                    index_progress = _make_index_progress_emitter(
+                        verbose=bool(args.verbose),
+                        redaction_mode=cfg.redaction.mode,
+                        llm_enabled=bool(cfg.llm.enabled),
+                    )
                     out["index_vectors"] = _run_index_vectors_for_ingest(
                         conn,
                         cfg,
                         limit=index_limit,
                         pending_only=pending_only,
+                        progress_callback=index_progress,
                     )
                 else:
                     print(
@@ -1766,7 +1871,11 @@ def main(argv: list[str] | None = None) -> None:
             index_limit = (
                 args.index_limit if args.index_limit is not None else cfg.indexing.auto_index_limit
             )
-            repair_progress = _make_repair_progress_emitter()
+            repair_progress = _make_repair_progress_emitter(
+                verbose=bool(args.verbose),
+                redaction_mode=cfg.redaction.mode,
+                llm_enabled=bool(cfg.llm.enabled),
+            )
 
             _print_pipeline_plan(
                 "repair",
@@ -1816,20 +1925,12 @@ def main(argv: list[str] | None = None) -> None:
                 }
 
             if args.index_vectors:
-                repair_progress({"event": "stage", "stage": "index_start"})
                 out["index_vectors"] = _run_index_vectors_for_ingest(
                     conn,
                     cfg,
                     limit=index_limit,
                     pending_only=pending_only,
                     progress_callback=repair_progress,
-                )
-                repair_progress(
-                    {
-                        "event": "stage",
-                        "stage": "index_done",
-                        "result": out["index_vectors"],
-                    }
                 )
 
             print(json.dumps(out, indent=2))
@@ -1918,6 +2019,12 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "index-vectors":
             include_labels = _parse_label_overrides(args.include_label)
             exclude_labels = _parse_label_overrides(args.exclude_label)
+            index_progress = _make_index_progress_emitter(
+                verbose=bool(args.verbose),
+                redaction_mode=args.redaction_mode or cfg.redaction.mode,
+                llm_enabled=bool(cfg.llm.enabled),
+            )
+            index_progress({"event": "stage", "stage": "index_start"})
             pending_before = count_pending_vector_updates(
                 conn,
                 cfg,
@@ -1941,7 +2048,7 @@ def main(argv: list[str] | None = None) -> None:
                 include_labels=include_labels,
                 exclude_labels=exclude_labels,
                 max_index_chars=args.max_index_chars,
-                progress_callback=_emit_index_progress,
+                progress_callback=index_progress,
             )
             pending_after = count_pending_vector_updates(
                 conn,
@@ -1954,6 +2061,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             out["pending_before"] = pending_before
             out["pending_after"] = pending_after
+            index_progress({"event": "stage", "stage": "index_done", "result": out})
             print(json.dumps(out, indent=2))
             return
 
