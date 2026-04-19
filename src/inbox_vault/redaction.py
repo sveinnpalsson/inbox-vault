@@ -1118,6 +1118,8 @@ def redact_with_persistent_map(
 
     new_entries: list[dict[str, str]] = []
     persisted_entries: list[dict[str, str]] = []
+    regex_candidate_cache: dict[str, list[RedactionCandidate]] = {}
+    redacted_text_cache: dict[str, str] = {}
 
     def _register(candidates: list[RedactionCandidate], *, candidate_text: str):
         for cand in candidates:
@@ -1159,9 +1161,27 @@ def redact_with_persistent_map(
                     ):
                         persisted_entries.append(entry)
 
-    _register(_regex_detect_candidates(source_text), candidate_text=source_text)
+    def _regex_candidates(text: str) -> list[RedactionCandidate]:
+        cached = regex_candidate_cache.get(text)
+        if cached is not None:
+            return cached
+        detected = _regex_detect_candidates(text)
+        regex_candidate_cache[text] = detected
+        return detected
+
+    def _render_redacted(text: str) -> str:
+        cached = redacted_text_cache.get(text)
+        if cached is not None:
+            return cached
+        redacted = table.apply(text)
+        if selected_mode in {"hybrid", "regex"}:
+            redacted = regex_redact_text(redacted)
+        redacted_text_cache[text] = redacted
+        return redacted
+
+    _register(_regex_candidates(source_text), candidate_text=source_text)
     for chunk_text in chunks:
-        _register(_regex_detect_candidates(chunk_text), candidate_text=chunk_text)
+        _register(_regex_candidates(chunk_text), candidate_text=chunk_text)
 
     if selected_mode in {"model", "hybrid"} and llm_cfg is not None:
         try:
@@ -1198,15 +1218,8 @@ def redact_with_persistent_map(
             except Exception:
                 continue
 
-    source_redacted = table.apply(source_text)
-    chunk_redacted = [table.apply(chunk_text) for chunk_text in chunks]
-
-    if selected_mode == "hybrid":
-        source_redacted = regex_redact_text(source_redacted)
-        chunk_redacted = [regex_redact_text(item) for item in chunk_redacted]
-    elif selected_mode == "regex":
-        source_redacted = regex_redact_text(source_redacted)
-        chunk_redacted = [regex_redact_text(item) for item in chunk_redacted]
+    source_redacted = _render_redacted(source_text)
+    chunk_redacted = [_render_redacted(chunk_text) for chunk_text in chunks]
 
     return RedactionRunResult(
         source_text_redacted=source_redacted,

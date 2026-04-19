@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import requests
@@ -13,6 +14,24 @@ import requests
 from .config import EmbeddingConfig, LLMConfig
 
 LOG = logging.getLogger(__name__)
+_EMBEDDING_BATCH_SIZE = 16
+_EMBEDDING_BATCH_TOKEN_BUDGET = 3000
+_EMBEDDING_MIN_TEXT_CHARS = 256
+
+
+@dataclass(slots=True)
+class _PreparedEmbeddingText:
+    original_index: int
+    text: str
+
+
+class _RetryableEmbeddingSizeError(RuntimeError):
+    def __init__(self, *, status_code: int, approx_tokens: int, batch_items: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.approx_tokens = approx_tokens
+        self.batch_items = batch_items
+        self.message = message
 
 
 def extract_first_json(text: str) -> dict[str, Any] | None:
@@ -243,14 +262,93 @@ def _hash_fallback_embedding(text: str, dim: int) -> list[float]:
     return [v / norm for v in out]
 
 
-def embedding_vector(cfg: EmbeddingConfig, text: str) -> list[float]:
+def _estimate_text_tokens(text: str) -> int:
+    clean = str(text or "").strip()
+    if not clean:
+        return 1
+    token_like = re.findall(r"\w+|[^\w\s]", clean)
+    estimate_chars = math.ceil(len(clean) / 4)
+    estimate_tokens = len(token_like)
+    if " " not in clean:
+        estimate_tokens = max(estimate_tokens, math.ceil(len(clean) / 1.5))
+    return max(1, estimate_chars, estimate_tokens)
+
+
+def _normalize_text_for_embedding(text: str) -> str:
+    return " ".join(str(text or "").split()).strip()
+
+
+def _is_retryable_size_error(message: str) -> bool:
+    lowered = str(message or "").lower()
+    hints = (
+        "context size has been exceeded",
+        "too large to process",
+        "free space in the kv cache",
+        "kv cache",
+        "physical batch size",
+        "input is too large",
+    )
+    return any(hint in lowered for hint in hints)
+
+
+def _shrink_text_for_retry(prepared_text: str) -> str:
+    clean = _normalize_text_for_embedding(prepared_text)
+    if len(clean) <= _EMBEDDING_MIN_TEXT_CHARS:
+        return clean
+    next_limit = max(_EMBEDDING_MIN_TEXT_CHARS, int(len(clean) * 0.6))
+    clipped = clean[:next_limit].rstrip()
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0].rstrip() or clipped
+    return clipped
+
+
+def _build_embedding_batches(
+    texts: list[_PreparedEmbeddingText],
+    *,
+    batch_size: int,
+    token_budget: int,
+    single_text_budget: int,
+) -> list[list[_PreparedEmbeddingText]]:
+    max_items = max(1, int(batch_size))
+    safe_token_budget = max(_EMBEDDING_MIN_TEXT_CHARS, int(token_budget))
+    safe_single_text_budget = max(_EMBEDDING_MIN_TEXT_CHARS, int(single_text_budget))
+    batches: list[list[_PreparedEmbeddingText]] = []
+    current: list[_PreparedEmbeddingText] = []
+    current_tokens = 0
+    for entry in texts:
+        adjusted = entry
+        token_estimate = _estimate_text_tokens(adjusted.text)
+        while (
+            token_estimate > min(safe_token_budget, safe_single_text_budget)
+            and len(adjusted.text) > _EMBEDDING_MIN_TEXT_CHARS
+        ):
+            shrunk = _shrink_text_for_retry(adjusted.text)
+            if shrunk == adjusted.text:
+                break
+            adjusted = _PreparedEmbeddingText(original_index=entry.original_index, text=shrunk)
+            token_estimate = _estimate_text_tokens(adjusted.text)
+        if current and (len(current) >= max_items or (current_tokens + token_estimate) > safe_token_budget):
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append(adjusted)
+        current_tokens += token_estimate
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _request_embedding_batch(
+    cfg: EmbeddingConfig,
+    batch: list[_PreparedEmbeddingText],
+    *,
+    attempts: int,
+) -> list[list[float]]:
     payload = {
         "model": cfg.model,
-        "input": text,
+        "input": [entry.text for entry in batch],
     }
-    attempts = max(1, int(cfg.max_retries) + 1)
     last_exc: Exception | None = None
-
     for attempt in range(1, attempts + 1):
         try:
             resp = requests.post(
@@ -263,34 +361,143 @@ def embedding_vector(cfg: EmbeddingConfig, text: str) -> list[float]:
                     f"retryable status from embedding endpoint: {resp.status_code}",
                     response=resp,
                 )
-
             resp.raise_for_status()
-            data = resp.json()["data"][0]["embedding"]
-            return [float(v) for v in data]
-        except Exception as exc:
-            retryable = isinstance(exc, requests.RequestException)
-            if isinstance(exc, requests.HTTPError) and exc.response is not None:
-                retryable = _retryable_status(exc.response.status_code)
-
-            if not retryable:
-                last_exc = exc
-                break
-
+            body = resp.json()
+            data = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(data, list):
+                raise RuntimeError("embedding response missing data list")
+            if len(data) != len(batch):
+                raise RuntimeError(
+                    f"embedding response item count mismatch: expected {len(batch)} got {len(data)}"
+                )
+            out: list[list[float]] = []
+            expected_dim: int | None = None
+            for entry in data:
+                embedding = entry.get("embedding") if isinstance(entry, dict) else None
+                if not isinstance(embedding, list):
+                    raise RuntimeError("embedding entry missing list")
+                vector = [float(v) for v in embedding]
+                if expected_dim is None:
+                    expected_dim = len(vector)
+                elif len(vector) != expected_dim:
+                    raise RuntimeError(
+                        f"embedding dimension mismatch in batch: expected {expected_dim} got {len(vector)}"
+                    )
+                out.append(vector)
+            return out
+        except requests.HTTPError as exc:
+            response = exc.response
+            response_text = ""
+            if response is not None:
+                try:
+                    response_text = response.text
+                except Exception:
+                    response_text = ""
+            if response is not None and _is_retryable_size_error(response_text):
+                approx_tokens = sum(_estimate_text_tokens(entry.text) for entry in batch)
+                raise _RetryableEmbeddingSizeError(
+                    status_code=int(response.status_code),
+                    approx_tokens=approx_tokens,
+                    batch_items=len(batch),
+                    message=(
+                        f"embedding HTTP {response.status_code}: batch_items={len(batch)} "
+                        f"approx_tokens={approx_tokens} {response_text[:600]}"
+                    ),
+                ) from exc
             last_exc = exc
-            if attempt >= attempts:
-                break
+            retryable = response is not None and _retryable_status(response.status_code)
+        except requests.RequestException as exc:
+            last_exc = exc
+            retryable = True
+        except Exception as exc:
+            last_exc = exc
+            retryable = False
 
-            backoff = min(
-                float(cfg.backoff_max_seconds),
-                float(cfg.backoff_base_seconds) * (2 ** (attempt - 1)),
-            )
-            if backoff > 0:
-                time.sleep(backoff)
+        if not retryable or attempt >= attempts:
+            break
 
-    if cfg.fallback == "hash":
-        LOG.warning("Embedding endpoint unavailable; using hash fallback vectors")
-        return _hash_fallback_embedding(text, cfg.fallback_dim)
+        backoff = min(
+            float(cfg.backoff_max_seconds),
+            float(cfg.backoff_base_seconds) * (2 ** (attempt - 1)),
+        )
+        if backoff > 0:
+            time.sleep(backoff)
 
     if last_exc is not None:
         raise last_exc
-    raise RuntimeError("Embedding generation failed without explicit error")
+    raise RuntimeError("Embedding batch failed without explicit error")
+
+
+def embedding_vectors(cfg: EmbeddingConfig, texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+
+    prepared = [
+        _PreparedEmbeddingText(original_index=idx, text=_normalize_text_for_embedding(text))
+        for idx, text in enumerate(texts)
+    ]
+    results: list[list[float] | None] = [None] * len(prepared)
+    batch_token_budget = _EMBEDDING_BATCH_TOKEN_BUDGET
+    single_text_budget = _EMBEDDING_BATCH_TOKEN_BUDGET
+    pending_batches = _build_embedding_batches(
+        prepared,
+        batch_size=_EMBEDDING_BATCH_SIZE,
+        token_budget=batch_token_budget,
+        single_text_budget=single_text_budget,
+    )
+    attempts = max(1, int(cfg.max_retries) + 1)
+    expected_dim: int | None = None
+
+    try:
+        while pending_batches:
+            batch = pending_batches.pop(0)
+            try:
+                vectors = _request_embedding_batch(cfg, batch, attempts=attempts)
+            except _RetryableEmbeddingSizeError as exc:
+                batch_token_budget = min(
+                    batch_token_budget,
+                    max(_EMBEDDING_MIN_TEXT_CHARS, int(exc.approx_tokens * 0.75)),
+                )
+                if len(batch) > 1:
+                    midpoint = max(1, len(batch) // 2)
+                    pending_batches = [batch[:midpoint], batch[midpoint:], *pending_batches]
+                    continue
+
+                entry = batch[0]
+                shrunk_text = _shrink_text_for_retry(entry.text)
+                if shrunk_text == entry.text:
+                    raise RuntimeError(exc.message) from exc
+                single_text_budget = min(
+                    single_text_budget,
+                    max(_EMBEDDING_MIN_TEXT_CHARS, int(_estimate_text_tokens(shrunk_text) * 1.25)),
+                )
+                pending_batches = [
+                    [_PreparedEmbeddingText(original_index=entry.original_index, text=shrunk_text)],
+                    *pending_batches,
+                ]
+                continue
+
+            batch_dim = len(vectors[0]) if vectors else 0
+            if batch_dim <= 0:
+                raise RuntimeError("embedding endpoint returned zero-dimension vectors")
+            if expected_dim is None:
+                expected_dim = batch_dim
+            elif batch_dim != expected_dim:
+                raise RuntimeError(
+                    f"embedding dimension mismatch across batches: expected {expected_dim} got {batch_dim}"
+                )
+            for entry, vector in zip(batch, vectors):
+                results[entry.original_index] = vector
+    except Exception:
+        if cfg.fallback == "hash":
+            LOG.warning("Embedding endpoint unavailable; using hash fallback vectors")
+            return [_hash_fallback_embedding(text, cfg.fallback_dim) for text in texts]
+        raise
+
+    if any(vector is None for vector in results):
+        raise RuntimeError("Embedding pipeline returned incomplete results")
+    return [vector for vector in results if vector is not None]
+
+
+def embedding_vector(cfg: EmbeddingConfig, text: str) -> list[float]:
+    return embedding_vectors(cfg, [text])[0]

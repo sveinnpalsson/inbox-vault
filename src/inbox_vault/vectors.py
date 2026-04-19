@@ -30,7 +30,7 @@ from .db import (
     vector_index_source_rows,
     vector_level_counts,
 )
-from .llm import embedding_vector
+from .llm import embedding_vector, embedding_vectors
 from .redaction import (
     REDACTION_POLICY_VERSION,
     PersistentRedactionMap,
@@ -42,6 +42,7 @@ LOG = logging.getLogger(__name__)
 INDEX_LEVEL_REDACTED = "redacted"
 INDEX_LEVEL_FULL = "full"
 INDEX_LEVEL_AUTO = "auto"
+_INDEX_EMBED_MESSAGE_BATCH_SIZE = 16
 
 
 @dataclass(slots=True)
@@ -96,6 +97,25 @@ class _ChunkCandidate:
     chunk_text: str
     chunk_text_redacted: str
     score: float
+
+
+@dataclass(slots=True)
+class _PreparedIndexMessage:
+    row_idx: int
+    total_rows: int
+    message_started: float
+    msg_id: str
+    account_email: str
+    thread_id: str | None
+    labels: list[str]
+    source_text: str
+    source_text_redacted: str
+    embed_source_text: str
+    fingerprint: str
+    chunks: list[_Chunk]
+    chunk_text_redacted: list[str]
+    chunk_embedding_inputs: list[str]
+    persisted_entries: list[dict[str, str]]
 
 
 def _compose_source_text(subject: str | None, snippet: str | None, body: str | None) -> str:
@@ -382,6 +402,267 @@ def count_pending_vector_updates(
     )
 
 
+def _embed_prepared_messages(
+    cfg: AppConfig,
+    prepared_messages: list[_PreparedIndexMessage],
+) -> tuple[dict[str, tuple[list[float], list[list[float]]]], set[str]]:
+    if not prepared_messages:
+        return {}, set()
+
+    all_texts: list[str] = []
+    layout: list[tuple[_PreparedIndexMessage, int, int]] = []
+    for item in prepared_messages:
+        all_texts.append(item.embed_source_text)
+        all_texts.extend(item.chunk_embedding_inputs)
+        layout.append((item, len(all_texts) - (1 + len(item.chunk_embedding_inputs)), 1 + len(item.chunk_embedding_inputs)))
+
+    results: dict[str, tuple[list[float], list[list[float]]]] = {}
+    failed: set[str] = set()
+
+    try:
+        vectors = embedding_vectors(cfg.embeddings, all_texts)
+        for item, start, count in layout:
+            item_vectors = vectors[start : start + count]
+            results[item.msg_id] = (item_vectors[0], item_vectors[1:])
+        return results, failed
+    except Exception:
+        LOG.exception(
+            "Batched embedding generation failed for %s messages; retrying individually",
+            len(prepared_messages),
+        )
+
+    for item in prepared_messages:
+        try:
+            item_vectors = embedding_vectors(
+                cfg.embeddings,
+                [item.embed_source_text, *item.chunk_embedding_inputs],
+            )
+            results[item.msg_id] = (item_vectors[0], item_vectors[1:])
+        except Exception:
+            LOG.exception("Vector generation failed for message_id=%s", item.msg_id)
+            failed.add(item.msg_id)
+    return results, failed
+
+
+def _persist_prepared_message(
+    conn,
+    cfg: AppConfig,
+    *,
+    prepared: _PreparedIndexMessage,
+    chosen_index_level: str,
+    message_embedding: list[float],
+    chunk_embeddings: list[list[float]],
+    stats: dict[str, int | str],
+    lock_max_retries: int,
+    lock_backoff_base_seconds: float,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+) -> bool:
+    msg_id = prepared.msg_id
+    acct = prepared.account_email
+
+    if prepared.persisted_entries:
+        try:
+            stats["lock_retries"] += upsert_redaction_entries(
+                conn,
+                scope_type="account",
+                scope_id=acct,
+                entries=prepared.persisted_entries,
+                lock_max_retries=lock_max_retries,
+                lock_backoff_base_seconds=lock_backoff_base_seconds,
+            )
+            stats["redaction_entries_added"] += len(prepared.persisted_entries)
+        except DBLockRetryExhausted as exc:
+            LOG.error(
+                "Redaction table write lock retries exhausted for message_id=%s: %s",
+                msg_id,
+                exc,
+            )
+            stats["lock_errors"] += 1
+            stats["failed"] += 1
+            if progress_callback:
+                progress_callback(
+                    {
+                        "event": "message_failed",
+                        "position": prepared.row_idx,
+                        "total": prepared.total_rows,
+                        "msg_id": msg_id,
+                        "account_email": acct,
+                        "substep": "upsert-redaction-entries",
+                        "elapsed_ms": int((time.perf_counter() - prepared.message_started) * 1000),
+                        "indexed": int(stats["indexed"]),
+                        "chunks_indexed": int(stats["chunks_indexed"]),
+                        "failed": int(stats["failed"]),
+                    }
+                )
+            return False
+
+    try:
+        stats["lock_retries"] += upsert_message_vector(
+            conn,
+            msg_id=msg_id,
+            index_level=chosen_index_level,
+            account_email=acct,
+            thread_id=prepared.thread_id,
+            labels=prepared.labels,
+            source_text=prepared.source_text,
+            source_text_redacted=prepared.source_text_redacted,
+            embedding=message_embedding,
+            embedding_model=cfg.embeddings.model,
+            content_hash=prepared.fingerprint,
+            redaction_policy_version=REDACTION_POLICY_VERSION,
+            lock_max_retries=lock_max_retries,
+            lock_backoff_base_seconds=lock_backoff_base_seconds,
+        )
+        upsert_message_fts_redacted(
+            conn,
+            msg_id=msg_id,
+            account_email=acct,
+            thread_id=prepared.thread_id,
+            labels=prepared.labels,
+            redacted_content=prepared.source_text_redacted,
+        )
+        stats["lock_retries"] += upsert_vector_state(
+            conn,
+            msg_id=msg_id,
+            index_level=chosen_index_level,
+            content_hash=prepared.fingerprint,
+            redaction_policy_version=REDACTION_POLICY_VERSION,
+            lock_max_retries=lock_max_retries,
+            lock_backoff_base_seconds=lock_backoff_base_seconds,
+        )
+    except DBLockRetryExhausted as exc:
+        LOG.error("Vector write lock retries exhausted for message_id=%s: %s", msg_id, exc)
+        stats["lock_errors"] += 1
+        stats["failed"] += 1
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "message_failed",
+                    "position": prepared.row_idx,
+                    "total": prepared.total_rows,
+                    "msg_id": msg_id,
+                    "account_email": acct,
+                    "substep": "upsert-message-vector",
+                    "elapsed_ms": int((time.perf_counter() - prepared.message_started) * 1000),
+                    "indexed": int(stats["indexed"]),
+                    "chunks_indexed": int(stats["chunks_indexed"]),
+                    "failed": int(stats["failed"]),
+                }
+            )
+        return False
+
+    try:
+        stats["lock_retries"] += delete_message_chunk_vectors(
+            conn,
+            msg_id=msg_id,
+            index_level=chosen_index_level,
+            lock_max_retries=lock_max_retries,
+            lock_backoff_base_seconds=lock_backoff_base_seconds,
+        )
+    except DBLockRetryExhausted as exc:
+        LOG.error("Chunk delete lock retries exhausted for message_id=%s: %s", msg_id, exc)
+        stats["lock_errors"] += 1
+        stats["failed"] += 1
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "message_failed",
+                    "position": prepared.row_idx,
+                    "total": prepared.total_rows,
+                    "msg_id": msg_id,
+                    "account_email": acct,
+                    "substep": "delete-old-chunks",
+                    "elapsed_ms": int((time.perf_counter() - prepared.message_started) * 1000),
+                    "indexed": int(stats["indexed"]),
+                    "chunks_indexed": int(stats["chunks_indexed"]),
+                    "failed": int(stats["failed"]),
+                }
+            )
+        return False
+
+    for chunk, chunk_redacted, chunk_input, chunk_embedding in zip(
+        prepared.chunks,
+        prepared.chunk_text_redacted,
+        prepared.chunk_embedding_inputs,
+        chunk_embeddings,
+    ):
+        chunk_fingerprint = _vector_content_hash(
+            source_text=(
+                f"{msg_id}|{chunk.chunk_type}|{chunk.chunk_start}|{chunk.chunk_end}|{chunk_input}"
+            ),
+            index_level=chosen_index_level,
+        )
+        try:
+            stats["lock_retries"] += upsert_message_chunk_vector(
+                conn,
+                chunk_id=chunk.chunk_id,
+                index_level=chosen_index_level,
+                msg_id=msg_id,
+                account_email=acct,
+                thread_id=prepared.thread_id,
+                labels=prepared.labels,
+                chunk_index=chunk.chunk_index,
+                chunk_type=chunk.chunk_type,
+                chunk_start=chunk.chunk_start,
+                chunk_end=chunk.chunk_end,
+                chunk_text=chunk.text,
+                chunk_text_redacted=chunk_redacted,
+                embedding=chunk_embedding,
+                embedding_model=cfg.embeddings.model,
+                content_hash=chunk_fingerprint,
+                redaction_policy_version=REDACTION_POLICY_VERSION,
+                lock_max_retries=lock_max_retries,
+                lock_backoff_base_seconds=lock_backoff_base_seconds,
+            )
+        except DBLockRetryExhausted as exc:
+            LOG.error(
+                "Chunk write lock retries exhausted for message_id=%s chunk_id=%s: %s",
+                msg_id,
+                chunk.chunk_id,
+                exc,
+            )
+            stats["lock_errors"] += 1
+            stats["failed"] += 1
+            if progress_callback:
+                progress_callback(
+                    {
+                        "event": "message_failed",
+                        "position": prepared.row_idx,
+                        "total": prepared.total_rows,
+                        "msg_id": msg_id,
+                        "account_email": acct,
+                        "substep": "upsert-chunk",
+                        "chunk_id": chunk.chunk_id,
+                        "elapsed_ms": int((time.perf_counter() - prepared.message_started) * 1000),
+                        "indexed": int(stats["indexed"]),
+                        "chunks_indexed": int(stats["chunks_indexed"]),
+                        "failed": int(stats["failed"]),
+                    }
+                )
+            return False
+        stats["chunks_indexed"] += 1
+
+    stats["indexed"] += 1
+    if progress_callback:
+        elapsed_s = max(0.0001, time.perf_counter() - prepared.message_started)
+        progress_callback(
+            {
+                "event": "message_done",
+                "position": prepared.row_idx,
+                "total": prepared.total_rows,
+                "msg_id": msg_id,
+                "account_email": acct,
+                "chunk_count": len(prepared.chunks),
+                "elapsed_ms": int(elapsed_s * 1000),
+                "messages_per_min": round(60.0 / elapsed_s, 2),
+                "indexed": int(stats["indexed"]),
+                "chunks_indexed": int(stats["chunks_indexed"]),
+                "failed": int(stats["failed"]),
+            }
+        )
+    return True
+
+
 def index_vectors(
     conn,
     cfg: AppConfig,
@@ -465,6 +746,57 @@ def index_vectors(
 
     redaction_maps_by_account: dict[str, PersistentRedactionMap] = {}
     pruned_accounts: set[str] = set()
+    pending_prepared: list[_PreparedIndexMessage] = []
+
+    def _flush_pending_batch() -> None:
+        nonlocal indexed_since_last_commit, pending_prepared
+        if not pending_prepared:
+            return
+
+        embedding_results, embedding_failures = _embed_prepared_messages(cfg, pending_prepared)
+        for prepared in pending_prepared:
+            if prepared.msg_id in embedding_failures:
+                stats["failed"] += 1
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "event": "message_failed",
+                            "position": prepared.row_idx,
+                            "total": prepared.total_rows,
+                            "msg_id": prepared.msg_id,
+                            "account_email": prepared.account_email,
+                            "substep": "embed-batch",
+                            "elapsed_ms": int(
+                                (time.perf_counter() - prepared.message_started) * 1000
+                            ),
+                            "indexed": int(stats["indexed"]),
+                            "chunks_indexed": int(stats["chunks_indexed"]),
+                            "failed": int(stats["failed"]),
+                        }
+                    )
+                continue
+
+            message_embedding, chunk_embeddings = embedding_results[prepared.msg_id]
+            if not _persist_prepared_message(
+                conn,
+                cfg,
+                prepared=prepared,
+                chosen_index_level=chosen_index_level,
+                message_embedding=message_embedding,
+                chunk_embeddings=chunk_embeddings,
+                stats=stats,
+                lock_max_retries=lock_max_retries,
+                lock_backoff_base_seconds=lock_backoff_base_seconds,
+                progress_callback=progress_callback,
+            ):
+                continue
+
+            indexed_since_last_commit += 1
+            if indexed_since_last_commit >= safe_commit_every_messages:
+                conn.commit()
+                indexed_since_last_commit = 0
+
+        pending_prepared = []
 
     for row_idx, (msg_id, acct, thread_id, subject, snippet, body_text, labels_json) in enumerate(
         rows, start=1
@@ -617,7 +949,6 @@ def index_vectors(
             embed_source_text = (
                 source_text_redacted if chosen_index_level == INDEX_LEVEL_REDACTED else source_text
             )
-            message_embedding = embedding_vector(cfg.embeddings, embed_source_text)
         except Exception:
             LOG.exception("Vector/redaction generation failed for message_id=%s", msg_id)
             stats["failed"] += 1
@@ -638,125 +969,6 @@ def index_vectors(
                 )
             continue
 
-        if redaction_result.persisted_entries:
-            try:
-                stats["lock_retries"] += upsert_redaction_entries(
-                    conn,
-                    scope_type="account",
-                    scope_id=acct,
-                    entries=redaction_result.persisted_entries,
-                    lock_max_retries=lock_max_retries,
-                    lock_backoff_base_seconds=lock_backoff_base_seconds,
-                )
-                stats["redaction_entries_added"] += len(redaction_result.persisted_entries)
-            except DBLockRetryExhausted as exc:
-                LOG.error(
-                    "Redaction table write lock retries exhausted for message_id=%s: %s",
-                    msg_id,
-                    exc,
-                )
-                stats["lock_errors"] += 1
-                stats["failed"] += 1
-                if progress_callback:
-                    progress_callback(
-                        {
-                            "event": "message_failed",
-                            "position": row_idx,
-                            "total": total_rows,
-                            "msg_id": msg_id,
-                            "account_email": acct,
-                            "substep": "upsert-redaction-entries",
-                            "elapsed_ms": int((time.perf_counter() - message_started) * 1000),
-                            "indexed": int(stats["indexed"]),
-                            "chunks_indexed": int(stats["chunks_indexed"]),
-                            "failed": int(stats["failed"]),
-                        }
-                    )
-                continue
-
-        try:
-            stats["lock_retries"] += upsert_message_vector(
-                conn,
-                msg_id=msg_id,
-                index_level=chosen_index_level,
-                account_email=acct,
-                thread_id=thread_id,
-                labels=labels,
-                source_text=source_text,
-                source_text_redacted=source_text_redacted,
-                embedding=message_embedding,
-                embedding_model=cfg.embeddings.model,
-                content_hash=fingerprint,
-                redaction_policy_version=REDACTION_POLICY_VERSION,
-                lock_max_retries=lock_max_retries,
-                lock_backoff_base_seconds=lock_backoff_base_seconds,
-            )
-            upsert_message_fts_redacted(
-                conn,
-                msg_id=msg_id,
-                account_email=acct,
-                thread_id=thread_id,
-                labels=labels,
-                redacted_content=source_text_redacted,
-            )
-            stats["lock_retries"] += upsert_vector_state(
-                conn,
-                msg_id=msg_id,
-                index_level=chosen_index_level,
-                content_hash=fingerprint,
-                redaction_policy_version=REDACTION_POLICY_VERSION,
-                lock_max_retries=lock_max_retries,
-                lock_backoff_base_seconds=lock_backoff_base_seconds,
-            )
-        except DBLockRetryExhausted as exc:
-            LOG.error("Vector write lock retries exhausted for message_id=%s: %s", msg_id, exc)
-            stats["lock_errors"] += 1
-            stats["failed"] += 1
-            if progress_callback:
-                progress_callback(
-                    {
-                        "event": "message_failed",
-                        "position": row_idx,
-                        "total": total_rows,
-                        "msg_id": msg_id,
-                        "account_email": acct,
-                        "substep": "upsert-message-vector",
-                        "elapsed_ms": int((time.perf_counter() - message_started) * 1000),
-                        "indexed": int(stats["indexed"]),
-                        "chunks_indexed": int(stats["chunks_indexed"]),
-                        "failed": int(stats["failed"]),
-                    }
-                )
-            continue
-        try:
-            stats["lock_retries"] += delete_message_chunk_vectors(
-                conn,
-                msg_id=msg_id,
-                index_level=chosen_index_level,
-                lock_max_retries=lock_max_retries,
-                lock_backoff_base_seconds=lock_backoff_base_seconds,
-            )
-        except DBLockRetryExhausted as exc:
-            LOG.error("Chunk delete lock retries exhausted for message_id=%s: %s", msg_id, exc)
-            stats["lock_errors"] += 1
-            stats["failed"] += 1
-            if progress_callback:
-                progress_callback(
-                    {
-                        "event": "message_failed",
-                        "position": row_idx,
-                        "total": total_rows,
-                        "msg_id": msg_id,
-                        "account_email": acct,
-                        "substep": "delete-old-chunks",
-                        "elapsed_ms": int((time.perf_counter() - message_started) * 1000),
-                        "indexed": int(stats["indexed"]),
-                        "chunks_indexed": int(stats["chunks_indexed"]),
-                        "failed": int(stats["failed"]),
-                    }
-                )
-            continue
-
         if progress_callback:
             progress_callback(
                 {
@@ -765,120 +977,37 @@ def index_vectors(
                     "total": total_rows,
                     "msg_id": msg_id,
                     "account_email": acct,
-                    "substep": "embed-chunk/upsert",
+                    "substep": "embed-batch-queued",
                     "chunk_count": len(chunks),
                 }
             )
 
-        for chunk, chunk_redacted in zip(chunks, redaction_result.chunk_text_redacted):
-            try:
-                chunk_input = (
-                    chunk_redacted if chosen_index_level == INDEX_LEVEL_REDACTED else chunk.text
-                )
-                chunk_embedding = embedding_vector(cfg.embeddings, chunk_input)
-            except Exception:
-                LOG.exception(
-                    "Chunk vector/redaction generation failed for message_id=%s chunk_id=%s",
-                    msg_id,
-                    chunk.chunk_id,
-                )
-                stats["failed"] += 1
-                if progress_callback:
-                    progress_callback(
-                        {
-                            "event": "message_failed",
-                            "position": row_idx,
-                            "total": total_rows,
-                            "msg_id": msg_id,
-                            "account_email": acct,
-                            "substep": "embed-chunk",
-                            "chunk_id": chunk.chunk_id,
-                            "elapsed_ms": int((time.perf_counter() - message_started) * 1000),
-                            "indexed": int(stats["indexed"]),
-                            "chunks_indexed": int(stats["chunks_indexed"]),
-                            "failed": int(stats["failed"]),
-                        }
-                    )
-                continue
-
-            chunk_fingerprint = _vector_content_hash(
-                source_text=f"{msg_id}|{chunk.chunk_type}|{chunk.chunk_start}|{chunk.chunk_end}|{chunk_input}",
-                index_level=chosen_index_level,
+        pending_prepared.append(
+            _PreparedIndexMessage(
+                row_idx=row_idx,
+                total_rows=total_rows,
+                message_started=message_started,
+                msg_id=msg_id,
+                account_email=acct,
+                thread_id=thread_id,
+                labels=labels,
+                source_text=source_text,
+                source_text_redacted=source_text_redacted,
+                embed_source_text=embed_source_text,
+                fingerprint=fingerprint,
+                chunks=chunks,
+                chunk_text_redacted=redaction_result.chunk_text_redacted,
+                chunk_embedding_inputs=[
+                    item if chosen_index_level == INDEX_LEVEL_REDACTED else chunk.text
+                    for chunk, item in zip(chunks, redaction_result.chunk_text_redacted)
+                ],
+                persisted_entries=redaction_result.persisted_entries,
             )
-            try:
-                stats["lock_retries"] += upsert_message_chunk_vector(
-                    conn,
-                    chunk_id=chunk.chunk_id,
-                    index_level=chosen_index_level,
-                    msg_id=msg_id,
-                    account_email=acct,
-                    thread_id=thread_id,
-                    labels=labels,
-                    chunk_index=chunk.chunk_index,
-                    chunk_type=chunk.chunk_type,
-                    chunk_start=chunk.chunk_start,
-                    chunk_end=chunk.chunk_end,
-                    chunk_text=chunk.text,
-                    chunk_text_redacted=chunk_redacted,
-                    embedding=chunk_embedding,
-                    embedding_model=cfg.embeddings.model,
-                    content_hash=chunk_fingerprint,
-                    redaction_policy_version=REDACTION_POLICY_VERSION,
-                    lock_max_retries=lock_max_retries,
-                    lock_backoff_base_seconds=lock_backoff_base_seconds,
-                )
-            except DBLockRetryExhausted as exc:
-                LOG.error(
-                    "Chunk write lock retries exhausted for message_id=%s chunk_id=%s: %s",
-                    msg_id,
-                    chunk.chunk_id,
-                    exc,
-                )
-                stats["lock_errors"] += 1
-                stats["failed"] += 1
-                if progress_callback:
-                    progress_callback(
-                        {
-                            "event": "message_failed",
-                            "position": row_idx,
-                            "total": total_rows,
-                            "msg_id": msg_id,
-                            "account_email": acct,
-                            "substep": "upsert-chunk",
-                            "chunk_id": chunk.chunk_id,
-                            "elapsed_ms": int((time.perf_counter() - message_started) * 1000),
-                            "indexed": int(stats["indexed"]),
-                            "chunks_indexed": int(stats["chunks_indexed"]),
-                            "failed": int(stats["failed"]),
-                        }
-                    )
-                continue
-            stats["chunks_indexed"] += 1
+        )
+        if len(pending_prepared) >= _INDEX_EMBED_MESSAGE_BATCH_SIZE:
+            _flush_pending_batch()
 
-        stats["indexed"] += 1
-        if progress_callback:
-            elapsed_s = max(0.0001, time.perf_counter() - message_started)
-            progress_callback(
-                {
-                    "event": "message_done",
-                    "position": row_idx,
-                    "total": total_rows,
-                    "msg_id": msg_id,
-                    "account_email": acct,
-                    "chunk_count": len(chunks),
-                    "elapsed_ms": int(elapsed_s * 1000),
-                    "messages_per_min": round(60.0 / elapsed_s, 2),
-                    "indexed": int(stats["indexed"]),
-                    "chunks_indexed": int(stats["chunks_indexed"]),
-                    "failed": int(stats["failed"]),
-                }
-            )
-
-        indexed_since_last_commit += 1
-        if indexed_since_last_commit >= safe_commit_every_messages:
-            conn.commit()
-            indexed_since_last_commit = 0
-
+    _flush_pending_batch()
     conn.commit()
     return stats
 

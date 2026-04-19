@@ -11,6 +11,14 @@ from inbox_vault.vectors import (
 )
 
 
+def _patch_embeddings(monkeypatch, single_fn):
+    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", single_fn)
+    monkeypatch.setattr(
+        "inbox_vault.vectors.embedding_vectors",
+        lambda cfg, texts: [single_fn(cfg, text) for text in texts],
+    )
+
+
 def _insert_msg(
     conn,
     *,
@@ -78,7 +86,7 @@ def test_index_and_search_with_scope_and_clearance(conn, app_cfg, monkeypatch):
             return [0.1, 0.9]
         return [0.0, 1.0]
 
-    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", fake_embed)
+    _patch_embeddings(monkeypatch, fake_embed)
 
     stats = index_vectors(conn, app_cfg)
     assert stats["indexed"] == 3
@@ -123,7 +131,7 @@ def test_default_index_builds_redacted_level_only(conn, app_cfg, monkeypatch):
     )
     conn.commit()
 
-    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0])
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
 
     stats = index_vectors(conn, app_cfg)
     assert stats["index_level"] == INDEX_LEVEL_REDACTED
@@ -144,7 +152,7 @@ def test_full_clearance_can_fallback_to_redacted_rank_with_diagnostics(conn, app
     )
     conn.commit()
 
-    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0])
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
     index_vectors(conn, app_cfg, index_level=INDEX_LEVEL_REDACTED)
 
     rows, diagnostics = search_vectors(
@@ -172,7 +180,7 @@ def test_explicit_full_search_level_errors_when_unavailable(conn, app_cfg, monke
     )
     conn.commit()
 
-    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0])
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
     index_vectors(conn, app_cfg, index_level=INDEX_LEVEL_REDACTED)
 
     import pytest
@@ -210,9 +218,7 @@ def test_search_applies_date_range_filters_for_dense_and_lexical(conn, app_cfg, 
     )
     conn.commit()
 
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
-    )
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
     stats = index_vectors(conn, app_cfg)
     assert stats["indexed"] == 2
 
@@ -250,9 +256,7 @@ def test_index_vectors_surfaces_lock_diagnostics(conn, app_cfg, monkeypatch):
     )
     conn.commit()
 
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
-    )
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
     stats = index_vectors(conn, app_cfg)
     assert "lock_retries" in stats
     assert "lock_errors" in stats
@@ -272,9 +276,7 @@ def test_index_vectors_skips_unchanged_on_rerun_and_pending_counter_matches(
     )
     conn.commit()
 
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
-    )
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
 
     pending_before = count_pending_vector_updates(conn, app_cfg, index_level=INDEX_LEVEL_REDACTED)
     assert pending_before == 1
@@ -324,9 +326,7 @@ def test_index_vectors_pending_only_limits_to_pending_rows(conn, app_cfg, monkey
     )
     conn.commit()
 
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
-    )
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
 
     first = index_vectors(conn, app_cfg, pending_only=True, limit=2)
     assert first["indexed"] == 2
@@ -350,9 +350,7 @@ def test_index_vectors_lock_exhaustion_marks_failed(conn, app_cfg, monkeypatch):
     )
     conn.commit()
 
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
-    )
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
     monkeypatch.setattr(
         "inbox_vault.vectors.upsert_message_vector",
         lambda *_a, **_k: (_ for _ in ()).throw(DBLockRetryExhausted("forced")),
@@ -383,9 +381,7 @@ def test_index_vectors_commits_incrementally_by_default(conn, app_cfg, monkeypat
     )
     conn.commit()
 
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
-    )
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
 
     from inbox_vault import vectors as vectors_mod
 
@@ -457,7 +453,7 @@ def test_hybrid_rrf_combines_dense_and_lexical(conn, app_cfg, monkeypatch):
             return [0.1, 0.9]
         return [0.0, 1.0]
 
-    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", fake_embed)
+    _patch_embeddings(monkeypatch, fake_embed)
 
     stats = index_vectors(conn, app_cfg)
     assert stats["indexed"] == 2
@@ -493,9 +489,7 @@ def test_reranker_boundary_with_mock(conn, app_cfg, monkeypatch):
     )
     conn.commit()
 
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
-    )
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
     index_vectors(conn, app_cfg)
 
     app_cfg.rerank.enabled = True
@@ -527,9 +521,7 @@ def test_index_vectors_model_mode_uses_redaction_overrides(conn, app_cfg, monkey
     )
     conn.commit()
 
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_args, **_kwargs: [1.0, 0.0]
-    )
+    _patch_embeddings(monkeypatch, lambda *_args, **_kwargs: [1.0, 0.0])
 
     captured: dict[str, str] = {}
 
@@ -577,9 +569,7 @@ def test_index_vectors_uses_single_combined_redaction_pass_per_message(conn, app
     )
     conn.commit()
 
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
-    )
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
 
     calls = {"count": 0, "chunk_count": 0}
 
@@ -602,6 +592,36 @@ def test_index_vectors_uses_single_combined_redaction_pass_per_message(conn, app
     assert stats["indexed"] == 1
     assert calls["count"] == 1
     assert calls["chunk_count"] >= 2
+
+
+def test_index_vectors_batches_embeddings_across_messages(conn, app_cfg, monkeypatch):
+    app_cfg.retrieval.chunk_chars = 4096
+    app_cfg.retrieval.chunk_overlap_chars = 256
+
+    for idx in range(3):
+        _insert_msg(
+            conn,
+            msg_id=f"m-batch-{idx}",
+            account="acct@example.com",
+            labels=["INBOX"],
+            subject=f"Subject {idx}",
+            body=f"Project body {idx}",
+        )
+    conn.commit()
+
+    batch_sizes: list[int] = []
+
+    def fake_embed_many(_cfg, texts: list[str]) -> list[list[float]]:
+        batch_sizes.append(len(texts))
+        return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr("inbox_vault.vectors.embedding_vectors", fake_embed_many)
+    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0])
+
+    stats = index_vectors(conn, app_cfg)
+    assert stats["indexed"] == 3
+    assert stats["failed"] == 0
+    assert batch_sizes == [9]
 
 
 def test_chunk_indexing_with_overlap_and_message_aggregation(conn, app_cfg, monkeypatch):
@@ -630,7 +650,7 @@ def test_chunk_indexing_with_overlap_and_message_aggregation(conn, app_cfg, monk
             return [1.0, 0.0]
         return [0.0, 1.0]
 
-    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", fake_embed)
+    _patch_embeddings(monkeypatch, fake_embed)
 
     stats = index_vectors(conn, app_cfg)
     assert stats["indexed"] == 1
@@ -689,7 +709,7 @@ def test_index_vectors_filters_labels_before_embedding(conn, app_cfg, monkeypatc
         embed_calls["count"] += 1
         return [1.0, 0.0]
 
-    monkeypatch.setattr("inbox_vault.vectors.embedding_vector", fake_embed)
+    _patch_embeddings(monkeypatch, fake_embed)
 
     stats = index_vectors(conn, app_cfg)
     assert stats["scanned"] == 3
@@ -713,9 +733,7 @@ def test_index_vectors_normalizes_and_trims_text(conn, app_cfg, monkeypatch):
     )
     conn.commit()
 
-    monkeypatch.setattr(
-        "inbox_vault.vectors.embedding_vector", lambda *_a, **_k: [1.0, 0.0]
-    )
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
 
     stats = index_vectors(conn, app_cfg)
     assert stats["indexed"] == 1
