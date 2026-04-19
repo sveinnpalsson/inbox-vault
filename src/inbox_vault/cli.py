@@ -1342,17 +1342,25 @@ def _format_repair_index_summary(result: dict[str, int | str]) -> str:
     return " ".join(parts)
 
 
-def _format_eta_s(completed: int, total: int, elapsed_s: float) -> str:
+def _describe_index_scope(*, pending_only: bool, limit: int | None) -> str:
+    scope = "pending rows only" if pending_only else "all candidate rows"
+    if limit is None:
+        return scope
+    return f"{scope}, up to {limit} rows this run"
+
+
+def _format_eta_minutes(completed: int, total: int, elapsed_s: float) -> str:
     if completed < 3 or elapsed_s < 1.0 or total <= completed:
         return ""
     per_item_s = elapsed_s / completed
-    return f" eta_s={int(round((total - completed) * per_item_s))}"
+    eta_min = max(1, int(round(((total - completed) * per_item_s) / 60.0)))
+    return f" | eta: {eta_min} min"
 
 
-def _format_rate_per_min(completed: int, elapsed_s: float) -> str:
-    if completed <= 0 or elapsed_s <= 0:
-        return ""
-    return f" rate_per_min={(completed / elapsed_s) * 60.0:.2f}"
+def _print_pipeline_plan(command: str, stages: list[tuple[str, str]]) -> None:
+    print(f"[{command}] plan", file=sys.stderr, flush=True)
+    for label, description in stages:
+        print(f"  - {label}: {description}", file=sys.stderr, flush=True)
 
 
 def _make_repair_progress_emitter():
@@ -1367,8 +1375,9 @@ def _make_repair_progress_emitter():
         if event_name == "stage" and stage == "enrich_start":
             total = int(event.get("total") or 0)
             include_degraded = bool(event.get("include_degraded"))
+            mode = "pending + degraded retry" if include_degraded else "pending only"
             print(
-                f"[repair-phase] enrich_start total={total} include_degraded={str(include_degraded).lower()}",
+                f"[enrichment] starting, {total} pending ({mode})",
                 file=sys.stderr,
                 flush=True,
             )
@@ -1379,14 +1388,12 @@ def _make_repair_progress_emitter():
             total = int(event.get("total") or 0)
             elapsed_s = float(event.get("elapsed_s") or 0.0)
             line = (
-                "[repair-phase] enrich_progress "
-                f"completed={completed}/{total} "
-                f"fallback_used={int(event.get('fallback_used') or 0)} "
-                f"http_failed={int(event.get('http_failed') or 0)} "
-                f"parse_failed={int(event.get('parse_failed') or 0)} "
-                f"contract_failed={int(event.get('contract_failed') or 0)}"
-                f"{_format_rate_per_min(completed, elapsed_s)}"
-                f"{_format_eta_s(completed, total, elapsed_s)}"
+                f"[enrichment] {completed}/{total}, "
+                f"fallback {int(event.get('fallback_used') or 0)}, "
+                f"http {int(event.get('http_failed') or 0)}, "
+                f"parse {int(event.get('parse_failed') or 0)}, "
+                f"contract {int(event.get('contract_failed') or 0)}"
+                f"{_format_eta_minutes(completed, total, elapsed_s)}"
             )
             print(line, file=sys.stderr, flush=True)
             return
@@ -1396,18 +1403,16 @@ def _make_repair_progress_emitter():
             updated = int(event.get("updated") or 0)
             elapsed_s = float(event.get("elapsed_s") or 0.0)
             line = (
-                "[repair-phase] enrich_done "
-                f"updated={updated} "
+                f"[enrichment] done, updated {updated} | "
                 + _format_repair_diag_summary(diagnostics)
-                + f" elapsed_s={elapsed_s:.1f}"
-                + _format_rate_per_min(updated, elapsed_s)
+                + f" elapsed={elapsed_s:.1f}s"
             )
             print(line, file=sys.stderr, flush=True)
             return
 
         if event_name == "stage" and stage == "index_start":
             state["index_started_at"] = time.perf_counter()
-            print("[repair-phase] index_start", file=sys.stderr, flush=True)
+            print("[indexing] starting", file=sys.stderr, flush=True)
             return
 
         if event_name in {
@@ -1425,12 +1430,10 @@ def _make_repair_progress_emitter():
             started_at = state.get("index_started_at")
             elapsed_s = max(0.0, time.perf_counter() - started_at) if started_at is not None else 0.0
             line = (
-                "[repair-phase] index_progress "
-                f"completed={completed}/{total} "
-                f"indexed={int(event.get('indexed') or 0)} "
-                f"failed={int(event.get('failed') or 0)}"
-                f"{_format_rate_per_min(completed, elapsed_s)}"
-                f"{_format_eta_s(completed, total, elapsed_s)}"
+                f"[indexing] {completed}/{total}, "
+                f"indexed {int(event.get('indexed') or 0)}, "
+                f"failed {int(event.get('failed') or 0)}"
+                f"{_format_eta_minutes(completed, total, elapsed_s)}"
             )
             print(line, file=sys.stderr, flush=True)
             return
@@ -1441,10 +1444,9 @@ def _make_repair_progress_emitter():
             elapsed_s = max(0.0, time.perf_counter() - started_at) if started_at is not None else 0.0
             processed = int(result.get("scanned") or 0)
             line = (
-                "[repair-phase] index_done "
+                "[indexing] done | "
                 + _format_repair_index_summary(result)
-                + f" elapsed_s={elapsed_s:.1f}"
-                + _format_rate_per_min(processed, elapsed_s)
+                + f" elapsed={elapsed_s:.1f}s"
             )
             print(line, file=sys.stderr, flush=True)
 
@@ -1658,6 +1660,28 @@ def main(argv: list[str] | None = None) -> None:
                 args.index_limit if args.index_limit is not None else cfg.indexing.auto_index_limit
             )
 
+            _print_pipeline_plan(
+                "update",
+                [
+                    (
+                        "ingest",
+                        f"sync new Gmail messages{f' or backfill up to {args.backfill} historical messages' if args.backfill is not None else ''}",
+                    ),
+                    (
+                        "enrichment",
+                        "enrich newly ingested messages with the local LLM" if args.enrich else "skipped for this run",
+                    ),
+                    (
+                        "profiles",
+                        "refresh contact profiles from current message data" if args.build_profiles else "skipped for this run",
+                    ),
+                    (
+                        "indexing",
+                        f"update semantic index for new ingest only ({_describe_index_scope(pending_only=pending_only, limit=index_limit)})" if args.index_vectors else "skipped for this run",
+                    ),
+                ],
+            )
+
             if args.backfill is not None:
                 out = {
                     "ingest": backfill(
@@ -1743,6 +1767,24 @@ def main(argv: list[str] | None = None) -> None:
                 args.index_limit if args.index_limit is not None else cfg.indexing.auto_index_limit
             )
             repair_progress = _make_repair_progress_emitter()
+
+            _print_pipeline_plan(
+                "repair",
+                [
+                    (
+                        "ingest",
+                        "scan for historical gaps and ingest missing messages" if args.backfill_limit > 0 else "skip historical Gmail backfill, operate on existing local backlog only",
+                    ),
+                    (
+                        "enrichment",
+                        f"repair pending enrichment backlog{f', up to {args.enrich_limit} messages' if args.enrich_limit is not None else ''}" if args.enrich else "skipped for this run",
+                    ),
+                    (
+                        "indexing",
+                        f"repair semantic index backlog ({_describe_index_scope(pending_only=pending_only, limit=index_limit)})" if args.index_vectors else "skipped for this run",
+                    ),
+                ],
+            )
 
             out: dict[str, object] = {
                 "ingest": repair(

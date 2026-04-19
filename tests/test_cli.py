@@ -630,6 +630,7 @@ def test_repair_emits_post_ingest_progress_to_stderr(
 ):
     cfg = tmp_path / "config.toml"
     _write_config(cfg)
+    cfg.write_text(cfg.read_text() + "\n\n[indexing]\nauto_index_limit = 300\n")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
     perf_values = iter([100.0, 105.0, 112.0])
@@ -706,24 +707,23 @@ def test_repair_emits_post_ingest_progress_to_stderr(
 
     captured = capsys.readouterr()
     err_lines = captured.err.splitlines()
-    assert "[repair-phase] enrich_start total=12 include_degraded=true" in err_lines
+    assert "[repair] plan" in err_lines
+    assert "  - ingest: scan for historical gaps and ingest missing messages" in err_lines
+    assert "  - enrichment: repair pending enrichment backlog" in err_lines
+    assert "  - indexing: repair semantic index backlog (pending rows only, up to 300 rows this run)" in err_lines
+    assert "[enrichment] starting, 12 pending (pending + degraded retry)" in err_lines
     assert (
-        "[repair-phase] enrich_progress completed=10/12 fallback_used=2 http_failed=1 "
-        "parse_failed=3 contract_failed=1 rate_per_min=30.00 eta_s=4"
+        "[enrichment] 10/12, fallback 2, http 1, parse 3, contract 1 | eta: 1 min"
     ) in err_lines
     assert (
-        "[repair-phase] enrich_done updated=12 attempted=12 succeeded=12 fallback_used=2 "
-        "http_failed=1 parse_failed=3 contract_failed=1 repair_attempted=1 repair_succeeded=1 "
-        "elapsed_s=24.0 rate_per_min=30.00"
+        "[enrichment] done, updated 12 | attempted=12 succeeded=12 fallback_used=2 "
+        "http_failed=1 parse_failed=3 contract_failed=1 repair_attempted=1 repair_succeeded=1 elapsed=24.0s"
     ) in err_lines
-    assert "[repair-phase] index_start" in err_lines
+    assert "[indexing] starting" in err_lines
+    assert "[indexing] 3/12, indexed 3, failed 0 | eta: 1 min" in err_lines
     assert (
-        "[repair-phase] index_progress completed=3/12 indexed=3 failed=0 "
-        "rate_per_min=36.00 eta_s=15"
-    ) in err_lines
-    assert (
-        "[repair-phase] index_done scanned=12 indexed=10 unchanged=2 failed=0 "
-        "pending_before=5 pending_after=5 skip_applied_light=False elapsed_s=12.0 rate_per_min=60.00"
+        "[indexing] done | scanned=12 indexed=10 unchanged=2 failed=0 "
+        "pending_before=5 pending_after=5 skip_applied_light=False elapsed=12.0s"
     ) in err_lines
 
 
