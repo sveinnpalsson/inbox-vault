@@ -61,8 +61,8 @@ query = "label:inbox"
     assert cfg.gmail_idle_backfill_limit is None
     assert cfg.gmail_request_timeout_seconds == 60.0
     assert cfg.gmail_progress_every == 100
-    assert cfg.gmail_materialize_attachments_on_update is True
-    assert cfg.gmail_materialize_attachments_on_repair is True
+    assert cfg.gmail_materialize_attachments_on_update is False
+    assert cfg.gmail_materialize_attachments_on_repair is False
     assert cfg.ingest_triage.enabled is False
     assert cfg.ingest_triage.mode == "observe"
 

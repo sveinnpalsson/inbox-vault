@@ -124,8 +124,8 @@ class AppConfig:
     gmail_idle_backfill_limit: int | None = None
     gmail_request_timeout_seconds: float = 60.0
     gmail_progress_every: int = 100
-    gmail_materialize_attachments_on_update: bool = True
-    gmail_materialize_attachments_on_repair: bool = True
+    gmail_materialize_attachments_on_update: bool = False
+    gmail_materialize_attachments_on_repair: bool = False
 
 
 DEFAULT_CONFIG_PATH = "config.toml"
@@ -295,11 +295,11 @@ def load_config(path: str | None = None) -> AppConfig:
         min_value=1,
     )
     gmail_materialize_attachments_on_update = _parse_bool(
-        gmail_raw.get("materialize_attachments_on_update", True),
+        gmail_raw.get("materialize_attachments_on_update", False),
         key="gmail.materialize_attachments_on_update",
     )
     gmail_materialize_attachments_on_repair = _parse_bool(
-        gmail_raw.get("materialize_attachments_on_repair", True),
+        gmail_raw.get("materialize_attachments_on_repair", False),
         key="gmail.materialize_attachments_on_repair",
     )
 

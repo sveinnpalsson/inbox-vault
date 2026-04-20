@@ -7,7 +7,7 @@ Use Inbox Vault when you want Gmail sync, encrypted local mail storage, and mail
 - **Inbox Vault** owns Gmail auth, sync, repair, local enrichment, and the encrypted mail database.
 - **`llm-vault`** reads from Inbox Vault through a **read-only mail bridge**.
 - Inbox Vault does **not** currently ship its own OpenClaw plugin/tool surface for autonomous agents. For agent-facing mail retrieval, prefer the safe surface exposed by `llm-vault`.
-- **`llm-vault`** is also the canonical owner of the shared redaction contract, benchmark harness, and published quality claims. Inbox Vault should keep mail-specific validation, but not a separate competing benchmark track.
+- **`llm-vault`** also owns the shared redaction contract, benchmark harness, and published quality claims. Inbox Vault can keep mail-specific validation without maintaining a separate benchmark program.
 
 ## Straight-line setup
 
@@ -68,21 +68,21 @@ The intended contract is:
 
 Once the bridge is configured in `llm-vault`, use the normal `llm-vault` status/update flow there to confirm mail is visible through the bridge.
 
-## Operator guidance
+## When to use which repo
 
 Use Inbox Vault directly when you need:
 - Gmail auth setup
 - first sync / repair / backfill
 - mailbox-specific validation
 - operator-clearance mail inspection
-- concrete mail-side failure examples to feed back into the canonical `llm-vault` benchmark later
+- concrete mail-side failure examples to feed back into the shared `llm-vault` benchmark later
 
 Use `llm-vault` when you need:
 - unified retrieval across docs + photos + mail
 - the current OpenClaw-facing safe search/tool surface
 - one redacted-first retrieval layer across sources
-- the canonical redaction benchmark story and quality bar
+- the shared redaction benchmark and quality bar
 
 ## Unified skill note
 
-If you mirror `vault-unified-local` into this repo for a local deployment, treat the copy in `llm-vault` as canonical and keep the mirror aligned before release.
+If you mirror `vault-unified-local` into this repo for a local deployment, treat the copy in `llm-vault` as the upstream version to follow.
