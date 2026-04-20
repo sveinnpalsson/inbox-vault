@@ -25,7 +25,7 @@ This document is a short operator-facing review of the current design.
 3. Maintain small local qrels files and run `eval-retrieval` before major config/model changes
 4. Periodically review redaction outputs for missed sensitive tokens
 
-## Acceptance checks for release
+## Quick validation checklist
 
 - `inbox-vault --help` works
 - `inbox-vault status --json` works with local config

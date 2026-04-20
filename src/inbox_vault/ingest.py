@@ -15,15 +15,15 @@ from .config import AppConfig
 from .db import (
     attachment_key,
     get_cursor,
-    get_stream_observation_count,
     get_oldest_internal_ts,
+    get_stream_observation_count,
     message_exists,
     update_attachment_materialization,
     upsert_contact_seen,
     upsert_cursor,
+    upsert_message,
     upsert_message_attachments,
     upsert_message_ingest_triage,
-    upsert_message,
     upsert_raw,
 )
 from .gmail_client import (

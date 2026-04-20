@@ -2,6 +2,10 @@
 
 ## Context
 
+Status today:
+- Inbox Vault already ships additive ingest triage tables, `status --json` summary output, and config-gated `observe` / `enforce` modes.
+- The current implementation derives stream fingerprints after payload normalization and can downgrade downstream work for low-value streams, but it does not yet do metadata-first Gmail fetch avoidance.
+
 Inbox Vault currently treats ingestion as a message-first pipeline:
 
 1. list message ids from Gmail
@@ -14,15 +18,15 @@ That keeps the system simple and idempotent, but it also means recurring low-val
 
 This is increasingly expensive for high-volume inboxes with repetitive digests, promo mail, social updates, and list traffic. The waste is not only in embeddings. It also shows up in local LLM latency, redaction workload, larger databases, and noisier retrieval.
 
-## Goals
+## Next goals
 
 1. Add a cheap triage layer before expensive processing.
 2. Make decisions at the stream level, not only the sender level.
 3. Preserve safety by preferring downgrade over hard skip.
 4. Use a local LLM only where it adds value.
-5. Roll out additively, with diagnostics first and no breaking changes to the existing ingest commands.
+5. Keep future rollouts additive and reversible, without breaking the existing ingest commands.
 
-## Non-goals for the first slice
+## Non-goals for the next slice
 
 - replacing the current Gmail sync/update entry points
 - changing clearance behavior or redaction contracts
@@ -101,7 +105,7 @@ For each candidate message id:
    - `suppressed`: record existence and stream counters only
 8. **Update stream reputation** based on the observed result and any later evidence of usefulness.
 
-The first rollout does not need to gate Gmail fetches yet. It can compute the tier and diagnostics first, then continue with normal ingest while collecting evidence.
+The shipped rollout does not gate Gmail fetches yet. It computes the tier and diagnostics after payload normalization, then continues with normal ingest while collecting evidence or applying safe downstream downgrades.
 
 ## Deterministic signals
 
@@ -187,7 +191,7 @@ Capture that the message existed without paying the full cost.
 
 Likely behavior:
 - store message id, account, timestamps, sender, subject, snippet, stream_id, triage diagnostics
-- no full body persistence on the first rollout where feasible
+- keep full fetch behavior unchanged in the current implementation; true metadata-only persistence remains future work
 - no enrichment or vectors
 
 Use for:
@@ -314,38 +318,43 @@ allow_suppressed = false
 promotion_keywords = ["security", "verification", "fraud", "invoice", "payment", "renewal"]
 ```
 
-Suggested modes:
-- `off`: current behavior
+Current modes:
+- `disabled`: current default behavior
 - `observe`: compute diagnostics only, do not change ingest behavior
-- `enforce`: allow tier-based behavior changes
+- `enforce`: allow safe tier-based behavior changes after payload normalization
 
 ## Rollout plan
 
-### Phase 1, observe only
-- add stream fingerprinting and deterministic signal extraction
-- persist per-message and per-stream diagnostics
-- keep current fetch/store behavior unchanged
-- surface counts in `status --json` or progress output
+### Shipped foundation
+- stream fingerprinting and deterministic signal extraction are in place
+- per-message and per-stream diagnostics are persisted
+- `status --json` surfaces aggregate triage counts
+- current fetch/store behavior remains unchanged
 
-### Phase 2, safe downgrade
+### Next phase, metadata-first triage
+- move the earliest triage pass closer to Gmail metadata fetches
+- avoid unnecessary full payload retrieval only when confidence is high
+- preserve novelty promotion and conservative fallbacks
+
+### Later phase, safe downgrade
 - enable `light` recommendations for high-confidence low-value streams
 - keep full fetch/store available
 - skip only selected downstream expensive steps
 
-### Phase 3, metadata-only mode
+### Later phase, metadata-only mode
 - allow `minimal` for very stable streams
 - measure false-negative rate and manual overrides
 
-### Phase 4, true suppression
+### Later phase, true suppression
 - allow `suppressed` only for mature, extremely stable low-value streams
 - require novelty promotion checks before suppression applies
 
-## Recommended first implementation slice
+## Recommended next implementation slice
 
-1. Add a new triage module that computes `stream_id`, deterministic signals, novelty flags, and a proposed tier.
-2. Add additive DB tables for `message_ingest_triage` and `message_stream_reputation`.
-3. Wire the module into ingest in observe-only mode after payload normalization, so there is no behavior risk.
-4. Expose aggregate counters in `status --json` and, optionally, ingest progress output.
-5. Collect real usage data before letting `minimal` or `suppressed` affect fetch behavior.
+1. Move the earliest triage step toward Gmail metadata fetches instead of post-normalization payload handling.
+2. Keep additive DB/state compatibility with the existing `message_ingest_triage` and `message_stream_reputation` tables.
+3. Gather evidence on when metadata-only confidence is high enough to avoid full fetches safely.
+4. Expand operator-visible diagnostics only where they help validate downgrade decisions.
+5. Collect more real usage data before letting `minimal` or `suppressed` affect fetch behavior.
 
-This keeps the first slice measurable, reversible, and aligned with the current pipeline architecture.
+This keeps the next slice measurable, reversible, and aligned with the current pipeline architecture.

@@ -27,7 +27,7 @@ Design notes:
 ## What it does
 
 - **Syncs Gmail** into a local SQLCipher-encrypted database (`update`, `update --backfill`, `repair`)
-- **Inventories attachment metadata safely** -- captures filename, MIME type, size, and inline/disposition hints without fetching, parsing, or opening attachment bytes
+- **Inventories attachment metadata safely by default** -- captures filename, MIME type, size, and inline/disposition hints without fetching, parsing, or opening attachment bytes unless you explicitly enable attachment materialization
 - **Enriches messages** with a local LLM -- category, importance, action items, summaries
 - **Redacts PII** through three configurable modes: regex patterns, LLM-based detection, or hybrid with persistent coreference-preserving placeholder maps
 - **Builds contact profiles** from conversation history using signal-based tiering and a two-step evidence-then-synthesis LLM pipeline
@@ -161,7 +161,7 @@ The two primary commands are `update` and `repair`. Everything else is available
 | **`update`** | **Sync + enrich + index in one step** (incremental by default; `--backfill N` for historical import) |
 | **`repair`** | **Catch up gaps** with bounded historical backfill + pending enrichment/indexing |
 | `backfill-attachments` | Refresh attachment metadata for already-ingested messages without rerunning enrichment or vector indexing |
-| `materialize-attachments` | Materialize or repair attachment bytes for already-ingested mail without rerunning enrichment or vector indexing |
+| `materialize-attachments` | Fetch or repair attachment bytes for already-ingested mail without rerunning enrichment or vector indexing |
 | `enrich` | Run enrichment separately (classification, summaries via local LLM) |
 | `build-profiles` | Generate contact profiles from conversation history |
 | `index-vectors` | Build chunk-level vector embeddings with redaction |
@@ -200,7 +200,7 @@ The two primary commands are `update` and `repair`. Everything else is available
 | `config.multi-account.example.toml` | Sanitized multi-account example |
 | `config.toml` / `config.local*.toml` | Your local config (git-ignored) |
 
-Key config sections: `[database]`, `[gmail]`, `[llm]`, `[embeddings]`, `[redaction]`, `[retrieval]`, `[indexing]`, `[profiles]`, `[[accounts]]`. Gmail attachment materialization is enabled by default during `update` and `repair`; use `materialize-attachments` for catch-up on older rows already in the database. See `config.example.toml` for all options with comments.
+Key config sections: `[database]`, `[gmail]`, `[llm]`, `[embeddings]`, `[redaction]`, `[retrieval]`, `[indexing]`, `[profiles]`, `[[accounts]]`. Gmail attachment handling stays metadata-only by default during `update` and `repair`; enable attachment materialization in config if you want bytes fetched during those flows, or use `materialize-attachments` later for a targeted backfill. See `config.example.toml` for all options with comments.
 
 ## Automation
 
@@ -219,10 +219,10 @@ Scripts auto-resolve the repo path from their location. Override with `INBOX_VAU
 
 Inbox Vault is the **mail ingestion and encrypted storage layer**. `llm-vault` can consume mail through a **read-only bridge** to the Inbox Vault database; Inbox Vault itself does **not** currently ship a separate OpenClaw plugin/tool package for autonomous agent use.
 
-Redaction/evaluation ownership for the combined stack is split like this:
+Redaction/evaluation responsibilities for the combined stack are split like this:
 
-- `llm-vault` owns the canonical redaction contract, benchmark harness, and published quality claims
-- Inbox Vault applies that contract to mail data and can keep mail-specific validation, but should not grow a second competing benchmark track
+- `llm-vault` owns the shared redaction contract, benchmark harness, and published quality claims
+- Inbox Vault applies that contract to mail data and can keep mail-specific validation without maintaining a separate benchmark program
 
 Straight-line flow:
 1. install Inbox Vault and run a first successful `inbox-vault update`
@@ -248,8 +248,8 @@ For the exact operator flow, see [`docs/llm-vault-bridge.md`](docs/llm-vault-bri
 Inbox Vault can participate in a shared operator surface across Gmail + docs + photos.
 
 Current boundary:
-- the canonical unified skill currently lives in the `llm-vault` repo
-- some deployments mirror that skill into `inbox-vault`
+- the unified skill lives in the `llm-vault` repo
+- some deployments also mirror that skill into `inbox-vault`
 - a fresh `inbox-vault` clone should assume the mirror is absent unless you install it intentionally
 
 Examples:
@@ -265,7 +265,7 @@ Default behavior:
 - redacted clearance by default
 - weighted RRF fusion over backend results
 
-If you mirror the skill into this repo, keep it aligned with the canonical copy in `llm-vault` before release.
+If you mirror the skill into this repo for a local deployment, treat the `llm-vault` copy as the source to follow.
 
 ## Privacy and safety defaults
 

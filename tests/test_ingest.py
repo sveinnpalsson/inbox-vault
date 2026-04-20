@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
-from dataclasses import replace
 import hashlib
 import json
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from googleapiclient.errors import HttpError
@@ -148,7 +148,7 @@ def test_update_counts_failed_ingest_and_continues(conn, app_cfg, monkeypatch: p
     }
 
 
-def test_update_materializes_attachment_bytes_by_default(
+def test_update_does_not_materialize_attachment_bytes_by_default(
     conn, app_cfg, monkeypatch: pytest.MonkeyPatch
 ):
     service = object()
@@ -192,10 +192,10 @@ def test_update_materializes_attachment_bytes_by_default(
         "cursor_resets": 0,
         "failed": 0,
         "selected_attachments": 1,
-        "materialized_attachments": 1,
+        "materialized_attachments": 0,
         "attachment_materialization_failed": 0,
-        "attachment_bytes_written": len(b"invoice-bytes"),
-        "inline_attachment_sources": 1,
+        "attachment_bytes_written": 0,
+        "inline_attachment_sources": 0,
         "gmail_attachment_fetches": 0,
     }
     row = conn.execute(
@@ -207,12 +207,10 @@ def test_update_materializes_attachment_bytes_by_default(
         ("m-attach", "2"),
     ).fetchone()
     assert row is not None
-    assert row[0] == "file"
-    cache_path = Path(app_cfg.db.path).resolve().parent / str(row[1])
-    assert cache_path.is_file()
-    assert cache_path.read_bytes() == b"invoice-bytes"
-    assert row[2] == hashlib.sha256(b"invoice-bytes").hexdigest()
-    assert row[3] == len(b"invoice-bytes")
+    assert row[0] == ""
+    assert row[1] == ""
+    assert row[2] == ""
+    assert row[3] == 0
 
 
 def test_update_persists_attachment_inventory_metadata_only_when_auto_materialization_disabled(
@@ -976,7 +974,7 @@ def test_repair_backfill_ingests_bounded_missing_history(conn, app_cfg, monkeypa
     assert out["materialized_attachments"] == 0
 
 
-def test_repair_materializes_attachments_for_backfilled_messages_by_default(
+def test_repair_does_not_materialize_attachments_for_backfilled_messages_by_default(
     conn, app_cfg, monkeypatch: pytest.MonkeyPatch
 ):
     service = object()
@@ -1019,10 +1017,10 @@ def test_repair_materializes_attachments_for_backfilled_messages_by_default(
 
     assert out["backfill_ingested"] == 1
     assert out["selected_attachments"] == 1
-    assert out["materialized_attachments"] == 1
+    assert out["materialized_attachments"] == 0
     assert out["attachment_materialization_failed"] == 0
-    assert out["attachment_bytes_written"] == len(b"older-bytes")
-    assert out["inline_attachment_sources"] == 1
+    assert out["attachment_bytes_written"] == 0
+    assert out["inline_attachment_sources"] == 0
     assert out["gmail_attachment_fetches"] == 0
 
     row = conn.execute(
@@ -1034,12 +1032,10 @@ def test_repair_materializes_attachments_for_backfilled_messages_by_default(
         ("older-attach", "2"),
     ).fetchone()
     assert row is not None
-    assert row[0] == "file"
-    cache_path = Path(app_cfg.db.path).resolve().parent / str(row[1])
-    assert cache_path.is_file()
-    assert cache_path.read_bytes() == b"older-bytes"
-    assert row[2] == hashlib.sha256(b"older-bytes").hexdigest()
-    assert row[3] == len(b"older-bytes")
+    assert row[0] == ""
+    assert row[1] == ""
+    assert row[2] == ""
+    assert row[3] == 0
 
 
 def test_repair_commits_partial_progress_on_keyboard_interrupt(

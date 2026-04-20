@@ -16,8 +16,8 @@ from inbox_vault.db import (
     upsert_contact_seen,
     upsert_cursor,
     upsert_enrichment,
-    upsert_message_attachments,
     upsert_message,
+    upsert_message_attachments,
     upsert_raw,
 )
 

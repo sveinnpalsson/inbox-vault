@@ -25,7 +25,7 @@ def test_llm_vault_bridge_doc_covers_contract() -> None:
     assert "INBOX_VAULT_DB_PASSWORD" in bridge
     assert "read-only" in bridge
     assert "does **not** currently ship its own OpenClaw plugin/tool surface" in bridge
-    assert "canonical unified skill currently lives in the `llm-vault` repo" in readme
+    assert "the unified skill lives in the `llm-vault` repo" in readme
 
 
 def test_editable_install_creates_console_script(tmp_path: Path) -> None:

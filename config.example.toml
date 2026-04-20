@@ -15,10 +15,12 @@ query = "label:inbox OR label:sent"
 request_timeout_seconds = 60
 # Emit privacy-safe ingest progress every N scanned/processed messages.
 progress_every = 100
-# Materialize attachment bytes during normal incremental update runs.
-materialize_attachments_on_update = true
-# Materialize attachment bytes during repair backfill ingest.
-materialize_attachments_on_repair = true
+# Keep attachment handling metadata-only during normal update runs by default.
+# Enable if you want Inbox Vault to fetch and store attachment bytes locally.
+materialize_attachments_on_update = false
+# Keep repair metadata-only by default as well; use `materialize-attachments`
+# later if you want to backfill stored attachment bytes.
+materialize_attachments_on_repair = false
 
 [llm]
 enabled = true
