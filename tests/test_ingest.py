@@ -250,7 +250,8 @@ def test_update_materializes_attachment_bytes_via_gmail_fetch_by_default(
     )
     monkeypatch.setattr(ingest, "fetch_full_message_payload", lambda *_args, **_kwargs: payload)
 
-    out = ingest.update(conn, app_cfg)
+    cfg = replace(app_cfg, gmail_materialize_attachments_on_update=True)
+    out = ingest.update(conn, cfg)
 
     assert out == {
         "accounts": 1,
@@ -1066,7 +1067,8 @@ def test_repair_materializes_existing_metadata_only_attachments_without_backfill
 
     monkeypatch.setattr(ingest, "fetch_attachment_bytes", _fetch_attachment_bytes)
 
-    out = ingest.repair(conn, app_cfg)
+    cfg = replace(app_cfg, gmail_materialize_attachments_on_repair=True)
+    out = ingest.repair(conn, cfg)
 
     assert out["backfill_limit"] == 0
     assert out["backfill_ingested"] == 0
