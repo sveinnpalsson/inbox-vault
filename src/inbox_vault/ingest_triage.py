@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
-
 _SUBJECT_PREFIX_RE = re.compile(r"^(?:(?:re|fw|fwd)\s*:\s*)+", re.IGNORECASE)
 _SUBJECT_NOISE_RE = re.compile(
     r"\b(?:\d{1,4}[-/]\d{1,2}[-/]\d{1,4}|\d{1,2}:\d{2}(?::\d{2})?|\d{5,}|[a-f0-9]{8,})\b",

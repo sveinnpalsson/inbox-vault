@@ -15,15 +15,15 @@ from .config import AppConfig
 from .db import (
     attachment_key,
     get_cursor,
-    get_stream_observation_count,
     get_oldest_internal_ts,
+    get_stream_observation_count,
     message_exists,
     update_attachment_materialization,
     upsert_contact_seen,
     upsert_cursor,
+    upsert_message,
     upsert_message_attachments,
     upsert_message_ingest_triage,
-    upsert_message,
     upsert_raw,
 )
 from .gmail_client import (
@@ -970,6 +970,7 @@ def update(
         "attachment_bytes_written": 0,
         "inline_attachment_sources": 0,
         "gmail_attachment_fetches": 0,
+        "ingested_msg_ids": [],
     }
 
     _emit_progress(
@@ -1057,6 +1058,7 @@ def update(
             )
             if ingested:
                 stats["ingested"] += 1
+                stats["ingested_msg_ids"].append(msg_id)
                 _merge_attachment_materialization_stats(stats, materialization)
             else:
                 stats["failed"] += 1
@@ -1292,6 +1294,16 @@ def repair(
                 "account_failed": state["account_failed"],
             },
         )
+
+    if cfg.gmail_materialize_attachments_on_repair:
+        repair_materialization = materialize_attachment_bytes(
+            conn,
+            cfg,
+            missing_only=True,
+            commit_every_attachments=safe_commit_every,
+            progress_callback=progress_callback,
+        )
+        _merge_attachment_materialization_stats(stats, repair_materialization)
 
     stats["ingested"] = stats["backfill_ingested"]
     stats["failed"] = stats["backfill_failed"]

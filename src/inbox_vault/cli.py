@@ -1551,6 +1551,7 @@ def _run_index_vectors_for_ingest(
     limit: int | None,
     pending_only: bool,
     progress_callback,
+    msg_ids: list[str] | None = None,
 ) -> dict[str, int | str]:
     skip_applied_light = bool(cfg.ingest_triage.enabled and cfg.ingest_triage.mode == "enforce")
     progress_callback({"event": "stage", "stage": "index_start"})
@@ -1559,6 +1560,7 @@ def _run_index_vectors_for_ingest(
         cfg,
         index_level=INDEX_LEVEL_REDACTED,
         skip_applied_light=skip_applied_light,
+        msg_ids=msg_ids,
     )
     out = index_vectors(
         conn,
@@ -1568,12 +1570,14 @@ def _run_index_vectors_for_ingest(
         pending_only=pending_only,
         progress_callback=progress_callback,
         skip_applied_light=skip_applied_light,
+        msg_ids=msg_ids,
     )
     pending_after = count_pending_vector_updates(
         conn,
         cfg,
         index_level=INDEX_LEVEL_REDACTED,
         skip_applied_light=skip_applied_light,
+        msg_ids=msg_ids,
     )
     out["pending_before"] = pending_before
     out["pending_after"] = pending_after
@@ -1781,6 +1785,7 @@ def main(argv: list[str] | None = None) -> None:
                 ],
             )
 
+            ingested_msg_ids = None
             if args.backfill is not None:
                 out = {
                     "ingest": backfill(
@@ -1798,21 +1803,31 @@ def main(argv: list[str] | None = None) -> None:
                         progress_callback=_emit_ingest_progress,
                     )
                 }
+                ingested_msg_ids = list(out["ingest"].get("ingested_msg_ids") or [])
 
             if args.enrich:
-                if cfg.llm.enabled and _endpoint_reachable(cfg.llm.endpoint):
-                    enrich_diag: dict[str, int] = {}
-                    out["enrich"] = {
-                        "updated": enrich_pending(conn, cfg, diagnostics=enrich_diag),
-                        "diagnostics": enrich_diag,
-                    }
-                elif cfg.llm.enabled:
-                    print(
-                        f"[warning] LLM endpoint not reachable ({cfg.llm.endpoint}), "
-                        "skipping enrichment. Use --no-enrich to silence.",
-                        file=sys.stderr,
-                    )
-                    out["enrich"] = {"skipped": "endpoint_unreachable"}
+                if ingested_msg_ids:
+                    if cfg.llm.enabled and _endpoint_reachable(cfg.llm.endpoint):
+                        enrich_diag: dict[str, int] = {}
+                        out["enrich"] = {
+                            "updated": enrich_pending(
+                                conn,
+                                cfg,
+                                diagnostics=enrich_diag,
+                                msg_ids=ingested_msg_ids,
+                            ),
+                            "diagnostics": enrich_diag,
+                            "scope": "new_ingest_only",
+                        }
+                    elif cfg.llm.enabled:
+                        print(
+                            f"[warning] LLM endpoint not reachable ({cfg.llm.endpoint}), "
+                            "skipping enrichment. Use --no-enrich to silence.",
+                            file=sys.stderr,
+                        )
+                        out["enrich"] = {"skipped": "endpoint_unreachable", "scope": "new_ingest_only"}
+                else:
+                    out["enrich"] = {"updated": 0, "diagnostics": {}, "scope": "new_ingest_only"}
 
             if args.build_profiles:
                 profile_diag: dict[str, int] = {}
@@ -1827,26 +1842,48 @@ def main(argv: list[str] | None = None) -> None:
                 }
 
             if args.index_vectors:
-                if _endpoint_reachable(cfg.embeddings.endpoint):
-                    index_progress = _make_index_progress_emitter(
-                        verbose=bool(args.verbose),
-                        redaction_mode=cfg.redaction.mode,
-                        llm_enabled=bool(cfg.llm.enabled),
-                    )
-                    out["index_vectors"] = _run_index_vectors_for_ingest(
-                        conn,
-                        cfg,
-                        limit=index_limit,
-                        pending_only=pending_only,
-                        progress_callback=index_progress,
-                    )
+                if ingested_msg_ids:
+                    if _endpoint_reachable(cfg.embeddings.endpoint):
+                        index_progress = _make_index_progress_emitter(
+                            verbose=bool(args.verbose),
+                            redaction_mode=cfg.redaction.mode,
+                            llm_enabled=bool(cfg.llm.enabled),
+                        )
+                        out["index_vectors"] = _run_index_vectors_for_ingest(
+                            conn,
+                            cfg,
+                            limit=index_limit,
+                            pending_only=pending_only,
+                            progress_callback=index_progress,
+                            msg_ids=ingested_msg_ids,
+                        )
+                        out["index_vectors"]["scope"] = "new_ingest_only"
+                    else:
+                        print(
+                            f"[warning] Embedding endpoint not reachable ({cfg.embeddings.endpoint}), "
+                            "skipping indexing. Use --no-index-vectors to silence.",
+                            file=sys.stderr,
+                        )
+                        out["index_vectors"] = {"skipped": "endpoint_unreachable", "scope": "new_ingest_only"}
                 else:
-                    print(
-                        f"[warning] Embedding endpoint not reachable ({cfg.embeddings.endpoint}), "
-                        "skipping indexing. Use --no-index-vectors to silence.",
-                        file=sys.stderr,
-                    )
-                    out["index_vectors"] = {"skipped": "endpoint_unreachable"}
+                    out["index_vectors"] = {
+                        "scanned": 0,
+                        "indexed": 0,
+                        "unchanged": 0,
+                        "skipped_filtered": 0,
+                        "skipped_triage_light": 0,
+                        "failed": 0,
+                        "chunks_indexed": 0,
+                        "lock_retries": 0,
+                        "lock_errors": 0,
+                        "redaction_entries_added": 0,
+                        "redaction_entries_pruned": 0,
+                        "index_level": INDEX_LEVEL_REDACTED,
+                        "pending_before": 0,
+                        "pending_after": 0,
+                        "skip_applied_light": bool(cfg.ingest_triage.enabled and cfg.ingest_triage.mode == "enforce"),
+                        "scope": "new_ingest_only",
+                    }
 
             print(json.dumps(out, indent=2))
             return

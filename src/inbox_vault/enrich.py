@@ -174,6 +174,7 @@ def enrich_pending(
     *,
     include_degraded: bool = False,
     progress_callback=None,
+    msg_ids: list[str] | None = None,
 ) -> int:
     stats = _empty_diag()
     if not cfg.llm.enabled:
@@ -182,6 +183,13 @@ def enrich_pending(
         return 0
 
     rows = enrichment_repair_candidates(conn, limit=limit, include_degraded=include_degraded)
+    if msg_ids is not None:
+        wanted = {str(msg_id) for msg_id in msg_ids if str(msg_id).strip()}
+        if not wanted:
+            if diagnostics is not None:
+                diagnostics.update(stats)
+            return 0
+        rows = [row for row in rows if str(row[0]) in wanted]
     started_at = time.perf_counter()
     if progress_callback is not None:
         progress_callback(
