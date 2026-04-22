@@ -320,8 +320,14 @@ def _pending_message_ids_for_index(
     limit: int | None = None,
     index_level: str = INDEX_LEVEL_REDACTED,
     skip_applied_light: bool = False,
+    msg_ids: list[str] | None = None,
 ) -> list[str]:
     rows = vector_index_source_rows(conn, account_email=account_email, limit=None)
+    wanted_ids = None
+    if msg_ids is not None:
+        wanted_ids = {str(msg_id) for msg_id in msg_ids if str(msg_id).strip()}
+        if not wanted_ids:
+            return []
     effective_include_labels = _normalized_label_set(
         include_labels if include_labels is not None else cfg.indexing.include_labels
     )
@@ -338,6 +344,8 @@ def _pending_message_ids_for_index(
 
     pending_msg_ids: list[str] = []
     for msg_id, _acct, _thread_id, subject, snippet, body_text, labels_json in rows:
+        if wanted_ids is not None and str(msg_id) not in wanted_ids:
+            continue
         if msg_id in applied_light_ids:
             continue
         labels = json.loads(labels_json or "[]")
@@ -387,6 +395,7 @@ def count_pending_vector_updates(
     max_index_chars: int | None = None,
     index_level: str = INDEX_LEVEL_REDACTED,
     skip_applied_light: bool = False,
+    msg_ids: list[str] | None = None,
 ) -> int:
     return len(
         _pending_message_ids_for_index(
@@ -398,6 +407,7 @@ def count_pending_vector_updates(
             max_index_chars=max_index_chars,
             index_level=index_level,
             skip_applied_light=skip_applied_light,
+            msg_ids=msg_ids,
         )
     )
 
@@ -683,6 +693,7 @@ def index_vectors(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     commit_every_messages: int = 1,
     skip_applied_light: bool = False,
+    msg_ids: list[str] | None = None,
 ) -> dict[str, int | str]:
     chosen_index_level = (index_level or INDEX_LEVEL_REDACTED).strip().lower()
     if chosen_index_level not in {INDEX_LEVEL_REDACTED, INDEX_LEVEL_FULL}:
@@ -713,12 +724,16 @@ def index_vectors(
             limit=limit,
             index_level=chosen_index_level,
             skip_applied_light=skip_applied_light,
+            msg_ids=msg_ids,
         )
         pending_id_set = set(pending_ids)
         source_rows = vector_index_source_rows(conn, account_email=account_email, limit=None)
         rows = [row for row in source_rows if row[0] in pending_id_set]
     else:
         rows = vector_index_source_rows(conn, account_email=account_email, limit=limit)
+        if msg_ids is not None:
+            wanted_ids = {str(msg_id) for msg_id in msg_ids if str(msg_id).strip()}
+            rows = [row for row in rows if str(row[0]) in wanted_ids]
     total_rows = len(rows)
     safe_commit_every_messages = max(1, int(commit_every_messages))
     indexed_since_last_commit = 0

@@ -78,7 +78,7 @@ def test_validate_command_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         (
             ["update"],
             {
-                "update": lambda *_args, **_kwargs: {"ingested": 1, "new_ids": 1},
+                "update": lambda *_args, **_kwargs: {"ingested": 1, "new_ids": 1, "ingested_msg_ids": ["m1"]},
                 "enrich_pending": lambda *_args, **_kwargs: 1,
                 "count_pending_vector_updates": lambda *_args, **_kwargs: 0,
                 "index_vectors": lambda *_args, **_kwargs: {
@@ -89,8 +89,8 @@ def test_validate_command_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                 },
             },
                 {
-                    "ingest": {"ingested": 1, "new_ids": 1},
-                    "enrich": {"updated": 1, "diagnostics": {}},
+                    "ingest": {"ingested": 1, "new_ids": 1, "ingested_msg_ids": ["m1"]},
+                    "enrich": {"updated": 1, "diagnostics": {}, "scope": "new_ingest_only"},
                     "index_vectors": {
                         "scanned": 0,
                         "indexed": 0,
@@ -99,6 +99,7 @@ def test_validate_command_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                         "pending_before": 0,
                         "pending_after": 0,
                         "skip_applied_light": False,
+                        "scope": "new_ingest_only",
                     },
                 },
             ),
@@ -457,7 +458,7 @@ def test_update_index_vectors_flag_runs_single_index_pass_and_emits_stats(
 
     captured: dict[str, object] = {"calls": 0}
 
-    monkeypatch.setattr(cli, "update", lambda *_args, **_kwargs: {"ingested": 2, "new_ids": 2})
+    monkeypatch.setattr(cli, "update", lambda *_args, **_kwargs: {"ingested": 2, "new_ids": 2, "ingested_msg_ids": ["m1", "m2"]})
 
     monkeypatch.setattr(cli, "enrich_pending", lambda *_args, **_kwargs: 0)
 
@@ -486,8 +487,8 @@ def test_update_index_vectors_flag_runs_single_index_pass_and_emits_stats(
     )
 
     out = json.loads(capsys.readouterr().out)
-    assert out["ingest"] == {"ingested": 2, "new_ids": 2}
-    assert out["enrich"] == {"updated": 0, "diagnostics": {}}
+    assert out["ingest"] == {"ingested": 2, "new_ids": 2, "ingested_msg_ids": ["m1", "m2"]}
+    assert out["enrich"] == {"updated": 0, "diagnostics": {}, "scope": "new_ingest_only"}
     assert out["index_vectors"] == {
         "scanned": 4,
         "indexed": 4,
@@ -496,11 +497,13 @@ def test_update_index_vectors_flag_runs_single_index_pass_and_emits_stats(
         "pending_before": 5,
         "pending_after": 1,
         "skip_applied_light": False,
+        "scope": "new_ingest_only",
     }
     assert captured["calls"] == 1
     assert captured["pending_only"] is True
     assert captured["limit"] == 25
     assert captured["skip_applied_light"] is False
+    assert captured["msg_ids"] == ["m1", "m2"]
 
 
 def test_update_indexes_by_default_and_can_be_disabled_per_run(
@@ -515,7 +518,7 @@ def test_update_indexes_by_default_and_can_be_disabled_per_run(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
 
-    monkeypatch.setattr(cli, "update", lambda *_args, **_kwargs: {"ingested": 0})
+    monkeypatch.setattr(cli, "update", lambda *_args, **_kwargs: {"ingested": 0, "ingested_msg_ids": []})
 
     call_counter = {"count": 0}
 
@@ -533,16 +536,14 @@ def test_update_indexes_by_default_and_can_be_disabled_per_run(
 
     cli.main(["--config", str(cfg), "update"])
     out_auto = json.loads(capsys.readouterr().out)
-    assert "index_vectors" in out_auto
-    assert call_counter["count"] == 1
-    assert captured["pending_only"] is True
-    assert captured["limit"] == 7
-    assert captured["skip_applied_light"] is False
+    assert out_auto["index_vectors"]["indexed"] == 0
+    assert out_auto["index_vectors"]["scope"] == "new_ingest_only"
+    assert call_counter["count"] == 0
 
     cli.main(["--config", str(cfg), "update", "--no-index-vectors", "--no-enrich"])
     out_disabled = json.loads(capsys.readouterr().out)
-    assert out_disabled == {"ingest": {"ingested": 0}}
-    assert call_counter["count"] == 1
+    assert out_disabled == {"ingest": {"ingested": 0, "ingested_msg_ids": []}}
+    assert call_counter["count"] == 0
 
 
 def test_repair_defaults_run_enrich_and_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
@@ -1160,7 +1161,7 @@ def test_update_auto_index_skips_applied_light_when_enforced(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TEST_DB_PASSWORD", "pw")
 
-    monkeypatch.setattr(cli, "update", lambda *_args, **_kwargs: {"ingested": 1, "new_ids": 1})
+    monkeypatch.setattr(cli, "update", lambda *_args, **_kwargs: {"ingested": 1, "new_ids": 1, "ingested_msg_ids": ["m1"]})
     monkeypatch.setattr(cli, "enrich_pending", lambda *_args, **_kwargs: 0)
 
     seen_pending_kwargs: list[dict[str, object]] = []
@@ -1189,8 +1190,11 @@ def test_update_auto_index_skips_applied_light_when_enforced(
     out = json.loads(capsys.readouterr().out)
 
     assert out["index_vectors"]["skip_applied_light"] is True
+    assert out["index_vectors"]["scope"] == "new_ingest_only"
     assert captured["skip_applied_light"] is True
+    assert captured["msg_ids"] == ["m1"]
     assert all(kwargs["skip_applied_light"] is True for kwargs in seen_pending_kwargs)
+    assert all(kwargs["msg_ids"] == ["m1"] for kwargs in seen_pending_kwargs)
 
 
 def test_backfill_max_messages_passthrough_and_help_text(

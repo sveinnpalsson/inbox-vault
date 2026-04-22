@@ -72,19 +72,18 @@ def test_update_uses_cursor_and_ingests_incremental(conn, app_cfg, monkeypatch: 
 
     out = ingest.update(conn, app_cfg)
 
-    assert out == {
-        "accounts": 1,
-        "new_ids": 2,
-        "ingested": 2,
-        "cursor_resets": 0,
-        "failed": 0,
-        "selected_attachments": 0,
-        "materialized_attachments": 0,
-        "attachment_materialization_failed": 0,
-        "attachment_bytes_written": 0,
-        "inline_attachment_sources": 0,
-        "gmail_attachment_fetches": 0,
-    }
+    assert out["accounts"] == 1
+    assert out["new_ids"] == 2
+    assert out["ingested"] == 2
+    assert sorted(out["ingested_msg_ids"]) == ["m3", "m4"]
+    assert out["cursor_resets"] == 0
+    assert out["failed"] == 0
+    assert out["selected_attachments"] == 0
+    assert out["materialized_attachments"] == 0
+    assert out["attachment_materialization_failed"] == 0
+    assert out["attachment_bytes_written"] == 0
+    assert out["inline_attachment_sources"] == 0
+    assert out["gmail_attachment_fetches"] == 0
     assert seen_start_ids == [400]
     assert get_cursor(conn, app_cfg.accounts[0].email, ingest.MAILBOX_SCOPE) == 450
 
@@ -105,6 +104,7 @@ def test_update_resets_cursor_on_404_history_gap(conn, app_cfg, monkeypatch: pyt
         "accounts": 1,
         "new_ids": 0,
         "ingested": 0,
+        "ingested_msg_ids": [],
         "cursor_resets": 1,
         "failed": 0,
         "selected_attachments": 0,
@@ -137,6 +137,7 @@ def test_update_counts_failed_ingest_and_continues(conn, app_cfg, monkeypatch: p
         "accounts": 1,
         "new_ids": 2,
         "ingested": 1,
+        "ingested_msg_ids": ["m-ok"],
         "cursor_resets": 0,
         "failed": 1,
         "selected_attachments": 0,
@@ -189,6 +190,7 @@ def test_update_does_not_materialize_attachment_bytes_by_default(
         "accounts": 1,
         "new_ids": 1,
         "ingested": 1,
+        "ingested_msg_ids": ["m-attach"],
         "cursor_resets": 0,
         "failed": 0,
         "selected_attachments": 1,
@@ -211,6 +213,77 @@ def test_update_does_not_materialize_attachment_bytes_by_default(
     assert row[1] == ""
     assert row[2] == ""
     assert row[3] == 0
+
+
+def test_update_materializes_attachment_bytes_via_gmail_fetch_by_default(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+    monkeypatch.setattr(ingest, "get_profile_history_id", lambda *_: 400)
+    monkeypatch.setattr(
+        ingest, "list_incremental_added_ids", lambda *_args, **_kwargs: ({"m-attach"}, 450)
+    )
+
+    fetch_calls: list[tuple[str, str]] = []
+
+    def _fetch_attachment_bytes(_svc, msg_id, attachment_id):
+        fetch_calls.append((msg_id, attachment_id))
+        return b"invoice-bytes"
+
+    monkeypatch.setattr(ingest, "fetch_attachment_bytes", _fetch_attachment_bytes)
+
+    payload = gmail_message_payload(
+        "m-attach",
+        history_id=450,
+        labels=["INBOX"],
+        attachments=[
+            {
+                "part_id": "2",
+                "attachment_id": "att-pdf",
+                "mime_type": "application/pdf",
+                "filename": "invoice.pdf",
+                "size_bytes": 13,
+                "content_disposition": "attachment",
+            }
+        ],
+    )
+    monkeypatch.setattr(ingest, "fetch_full_message_payload", lambda *_args, **_kwargs: payload)
+
+    out = ingest.update(conn, app_cfg)
+
+    assert out == {
+        "accounts": 1,
+        "new_ids": 1,
+        "ingested": 1,
+        "ingested_msg_ids": ["m-attach"],
+        "cursor_resets": 0,
+        "failed": 0,
+        "selected_attachments": 1,
+        "materialized_attachments": 1,
+        "attachment_materialization_failed": 0,
+        "attachment_bytes_written": len(b"invoice-bytes"),
+        "inline_attachment_sources": 0,
+        "gmail_attachment_fetches": 1,
+    }
+    assert fetch_calls == [("m-attach", "att-pdf")]
+    row = conn.execute(
+        """
+        SELECT storage_kind, storage_path, content_sha256, content_size_bytes, materialized_at
+        FROM message_attachments
+        WHERE msg_id = ? AND part_id = ?
+        """,
+        ("m-attach", "2"),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "file"
+    assert row[1]
+    assert row[4]
+    cache_path = Path(app_cfg.db.path).resolve().parent / str(row[1])
+    assert cache_path.is_file()
+    assert cache_path.read_bytes() == b"invoice-bytes"
+    assert row[2] == hashlib.sha256(b"invoice-bytes").hexdigest()
+    assert row[3] == len(b"invoice-bytes")
 
 
 def test_update_persists_attachment_inventory_metadata_only_when_auto_materialization_disabled(
@@ -256,6 +329,7 @@ def test_update_persists_attachment_inventory_metadata_only_when_auto_materializ
         "accounts": 1,
         "new_ids": 1,
         "ingested": 1,
+        "ingested_msg_ids": ["m-attach"],
         "cursor_resets": 0,
         "failed": 0,
         "selected_attachments": 2,
@@ -668,6 +742,7 @@ def test_update_persists_observe_only_ingest_triage(conn, app_cfg, monkeypatch: 
         "accounts": 1,
         "new_ids": 1,
         "ingested": 1,
+        "ingested_msg_ids": ["m-triage"],
         "cursor_resets": 0,
         "failed": 0,
         "selected_attachments": 0,
@@ -913,6 +988,113 @@ def test_repair_default_skips_historical_gmail_listing(conn, app_cfg, monkeypatc
     assert out["backfill_ingested"] == 0
     assert out["materialized_attachments"] == 0
     assert out["attachment_materialization_failed"] == 0
+
+
+def test_repair_materializes_existing_metadata_only_attachments_without_backfill(
+    conn, app_cfg, monkeypatch: pytest.MonkeyPatch
+):
+    service = object()
+    monkeypatch.setattr(ingest, "get_service", lambda *_args, **_kwargs: service)
+    monkeypatch.setattr(ingest, "get_profile_history_id", lambda *_: 333)
+    monkeypatch.setattr(
+        ingest,
+        "list_message_ids_paged",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("historical listing must not run when repair backfill limit is 0")
+        ),
+    )
+
+    msg_id = "m-existing-attach"
+    raw_payload = gmail_message_payload(
+        msg_id,
+        history_id=333,
+        labels=["INBOX"],
+        attachments=[
+            {
+                "part_id": "2",
+                "attachment_id": "att-existing",
+                "mime_type": "application/pdf",
+                "filename": "invoice.pdf",
+                "size_bytes": 13,
+                "content_disposition": "attachment",
+            }
+        ],
+    )
+    upsert_message(
+        conn,
+        {
+            "msg_id": msg_id,
+            "account_email": app_cfg.accounts[0].email,
+            "thread_id": "t-existing-attach",
+            "date_iso": "2026-04-18",
+            "internal_ts": 1713398400000,
+            "from_addr": "sender@example.com",
+            "to_addr": "acct@example.com",
+            "subject": "existing attach",
+            "snippet": "existing attach",
+            "body_text": "existing attach",
+            "labels": ["INBOX"],
+            "history_id": 1,
+        },
+    )
+    upsert_raw(conn, msg_id, app_cfg.accounts[0].email, raw_payload)
+    upsert_message_attachments(
+        conn,
+        msg_id,
+        app_cfg.accounts[0].email,
+        [
+            {
+                "part_id": "2",
+                "gmail_attachment_id": "att-existing",
+                "mime_type": "application/pdf",
+                "filename": "invoice.pdf",
+                "size_bytes": 13,
+                "content_disposition": "attachment",
+                "content_id": "",
+                "is_inline": False,
+                "inventory_state": "metadata_only",
+            }
+        ],
+    )
+    conn.commit()
+
+    fetch_calls: list[tuple[str, str]] = []
+
+    def _fetch_attachment_bytes(_svc, fetched_msg_id, attachment_id):
+        fetch_calls.append((fetched_msg_id, attachment_id))
+        return b"invoice-bytes"
+
+    monkeypatch.setattr(ingest, "fetch_attachment_bytes", _fetch_attachment_bytes)
+
+    out = ingest.repair(conn, app_cfg)
+
+    assert out["backfill_limit"] == 0
+    assert out["backfill_ingested"] == 0
+    assert out["selected_attachments"] == 1
+    assert out["materialized_attachments"] == 1
+    assert out["attachment_materialization_failed"] == 0
+    assert out["attachment_bytes_written"] == len(b"invoice-bytes")
+    assert out["inline_attachment_sources"] == 0
+    assert out["gmail_attachment_fetches"] == 1
+    assert fetch_calls == [(msg_id, "att-existing")]
+
+    row = conn.execute(
+        """
+        SELECT storage_kind, storage_path, content_sha256, content_size_bytes, materialized_at
+        FROM message_attachments
+        WHERE msg_id = ? AND part_id = ?
+        """,
+        (msg_id, "2"),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "file"
+    assert row[1]
+    assert row[4]
+    cache_path = Path(app_cfg.db.path).resolve().parent / str(row[1])
+    assert cache_path.is_file()
+    assert cache_path.read_bytes() == b"invoice-bytes"
+    assert row[2] == hashlib.sha256(b"invoice-bytes").hexdigest()
+    assert row[3] == len(b"invoice-bytes")
 
 
 def test_repair_backfill_ingests_bounded_missing_history(conn, app_cfg, monkeypatch: pytest.MonkeyPatch):

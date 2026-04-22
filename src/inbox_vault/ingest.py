@@ -970,6 +970,7 @@ def update(
         "attachment_bytes_written": 0,
         "inline_attachment_sources": 0,
         "gmail_attachment_fetches": 0,
+        "ingested_msg_ids": [],
     }
 
     _emit_progress(
@@ -1057,6 +1058,7 @@ def update(
             )
             if ingested:
                 stats["ingested"] += 1
+                stats["ingested_msg_ids"].append(msg_id)
                 _merge_attachment_materialization_stats(stats, materialization)
             else:
                 stats["failed"] += 1
@@ -1292,6 +1294,16 @@ def repair(
                 "account_failed": state["account_failed"],
             },
         )
+
+    if cfg.gmail_materialize_attachments_on_repair:
+        repair_materialization = materialize_attachment_bytes(
+            conn,
+            cfg,
+            missing_only=True,
+            commit_every_attachments=safe_commit_every,
+            progress_callback=progress_callback,
+        )
+        _merge_attachment_materialization_stats(stats, repair_materialization)
 
     stats["ingested"] = stats["backfill_ingested"]
     stats["failed"] = stats["backfill_failed"]

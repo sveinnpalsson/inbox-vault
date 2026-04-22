@@ -1311,47 +1311,92 @@ def upsert_redaction_entries(
 
     now = utc_now()
 
+    def _entry_params(entry: dict[str, str]) -> tuple[Any, ...]:
+        return (
+            scope_type,
+            scope_id,
+            entry["key_name"],
+            entry["placeholder"],
+            entry["value_norm"],
+            entry["original_value"],
+            entry.get("source_mode", "unknown"),
+            entry.get("policy_version", REDACTION_POLICY_VERSION),
+            entry.get("status", "active"),
+            entry.get("validator_name", "typed_v1"),
+            entry.get("detector_sources", entry.get("source_mode", "unknown")),
+            entry.get("modality", ""),
+            entry.get("source_field", ""),
+            now,
+            now,
+        )
+
+    def _upsert_by_identity(entry: dict[str, str]) -> None:
+        conn.execute(
+            """
+            INSERT INTO redaction_entries (
+              scope_type, scope_id, key_name, placeholder, value_norm,
+              original_value, source_mode, policy_version, status, validator_name, detector_sources,
+              modality, source_field, first_seen_at, last_seen_at, hit_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(scope_type, scope_id, key_name, value_norm) DO UPDATE SET
+              placeholder=excluded.placeholder,
+              original_value=excluded.original_value,
+              source_mode=excluded.source_mode,
+              policy_version=excluded.policy_version,
+              status=excluded.status,
+              validator_name=excluded.validator_name,
+              detector_sources=excluded.detector_sources,
+              modality=excluded.modality,
+              source_field=excluded.source_field,
+              last_seen_at=excluded.last_seen_at,
+              hit_count=redaction_entries.hit_count + 1
+            """,
+            _entry_params(entry),
+        )
+
     def _write():
         for entry in sanitized_entries:
-            conn.execute(
-                """
-                INSERT INTO redaction_entries (
-                  scope_type, scope_id, key_name, placeholder, value_norm,
-                  original_value, source_mode, policy_version, status, validator_name, detector_sources,
-                  modality, source_field, first_seen_at, last_seen_at, hit_count
+            try:
+                _upsert_by_identity(entry)
+            except sqlite.IntegrityError as exc:
+                if "redaction_entries.scope_type, redaction_entries.scope_id, redaction_entries.placeholder" not in str(exc):
+                    raise
+                conn.execute(
+                    """
+                    UPDATE redaction_entries
+                    SET
+                      key_name = ?,
+                      value_norm = ?,
+                      original_value = ?,
+                      source_mode = ?,
+                      policy_version = ?,
+                      status = ?,
+                      validator_name = ?,
+                      detector_sources = ?,
+                      modality = ?,
+                      source_field = ?,
+                      last_seen_at = ?,
+                      hit_count = hit_count + 1
+                    WHERE scope_type = ? AND scope_id = ? AND placeholder = ?
+                    """,
+                    (
+                        entry["key_name"],
+                        entry["value_norm"],
+                        entry["original_value"],
+                        entry.get("source_mode", "unknown"),
+                        entry.get("policy_version", REDACTION_POLICY_VERSION),
+                        entry.get("status", "active"),
+                        entry.get("validator_name", "typed_v1"),
+                        entry.get("detector_sources", entry.get("source_mode", "unknown")),
+                        entry.get("modality", ""),
+                        entry.get("source_field", ""),
+                        now,
+                        scope_type,
+                        scope_id,
+                        entry["placeholder"],
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(scope_type, scope_id, key_name, value_norm) DO UPDATE SET
-                  placeholder=excluded.placeholder,
-                  original_value=excluded.original_value,
-                  source_mode=excluded.source_mode,
-                  policy_version=excluded.policy_version,
-                  status=excluded.status,
-                  validator_name=excluded.validator_name,
-                  detector_sources=excluded.detector_sources,
-                  modality=excluded.modality,
-                  source_field=excluded.source_field,
-                  last_seen_at=excluded.last_seen_at,
-                  hit_count=redaction_entries.hit_count + 1
-                """,
-                (
-                    scope_type,
-                    scope_id,
-                    entry["key_name"],
-                    entry["placeholder"],
-                    entry["value_norm"],
-                    entry["original_value"],
-                    entry.get("source_mode", "unknown"),
-                    entry.get("policy_version", REDACTION_POLICY_VERSION),
-                    entry.get("status", "active"),
-                    entry.get("validator_name", "typed_v1"),
-                    entry.get("detector_sources", entry.get("source_mode", "unknown")),
-                    entry.get("modality", ""),
-                    entry.get("source_field", ""),
-                    now,
-                    now,
-                ),
-            )
 
     _, retries_used = _run_with_lock_retry(
         _write,
