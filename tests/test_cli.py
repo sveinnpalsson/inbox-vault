@@ -29,6 +29,29 @@ password_env = "TEST_DB_PASSWORD"
     (path.parent / "fake-creds.json").write_text("{}")
 
 
+def _write_accounts_config(path: Path, accounts: list[dict[str, str]]):
+    parts: list[str] = []
+    for account in accounts:
+        parts.extend(
+            [
+                "[[accounts]]",
+                f'name = "{account["name"]}"',
+                f'email = "{account["email"]}"',
+                f'credentials_file = "{account["credentials_file"]}"',
+                f'token_file = "{account["token_file"]}"',
+                "",
+            ]
+        )
+    parts.extend(
+        [
+            "[database]",
+            'path = "test.db"',
+            'password_env = "TEST_DB_PASSWORD"',
+        ]
+    )
+    path.write_text("\n".join(parts).strip())
+
+
 def _search_diag(
     *,
     requested: str = "auto",
@@ -57,6 +80,177 @@ def test_validate_command_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     cli.main(["--config", str(cfg), "validate"])
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True
+
+
+def test_auth_success_calls_force_reauth_and_emits_success_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    cfg = tmp_path / "config.toml"
+    creds = tmp_path / "oauth" / "main-creds.json"
+    token = tmp_path / "state" / "main" / "token.json"
+    creds.parent.mkdir(parents=True, exist_ok=True)
+    creds.write_text("{}", encoding="utf-8")
+    _write_accounts_config(
+        cfg,
+        [
+            {
+                "name": "main",
+                "email": "main@example.com",
+                "credentials_file": str(creds),
+                "token_file": str(token),
+            }
+        ],
+    )
+    monkeypatch.chdir(tmp_path)
+
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        cli,
+        "force_reauth",
+        lambda credentials_file, token_file: captured.update(
+            {"credentials_file": credentials_file, "token_file": token_file}
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_password",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("resolve_password should not run")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "get_conn",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("get_conn should not run")
+        ),
+    )
+
+    cli.main(["--config", str(cfg), "auth", "--account", "main"])
+
+    out = json.loads(capsys.readouterr().out)
+    assert out == {
+        "ok": True,
+        "account": "main",
+        "email": "main@example.com",
+        "token_file": str(token),
+    }
+    assert captured == {
+        "credentials_file": str(creds),
+        "token_file": str(token),
+    }
+
+
+@pytest.mark.parametrize(
+    ("selector", "expected_email"),
+    [
+        ("main", "main@example.com"),
+        ("MAIN@EXAMPLE.COM", "main@example.com"),
+    ],
+)
+def test_auth_matches_account_by_name_and_email(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    selector: str,
+    expected_email: str,
+):
+    cfg = tmp_path / "config.toml"
+    main_creds = tmp_path / "main-creds.json"
+    other_creds = tmp_path / "other-creds.json"
+    main_creds.write_text("{}", encoding="utf-8")
+    other_creds.write_text("{}", encoding="utf-8")
+    _write_accounts_config(
+        cfg,
+        [
+            {
+                "name": "main",
+                "email": "main@example.com",
+                "credentials_file": str(main_creds),
+                "token_file": str(tmp_path / "main-token.json"),
+            },
+            {
+                "name": "other",
+                "email": "other@example.com",
+                "credentials_file": str(other_creds),
+                "token_file": str(tmp_path / "other-token.json"),
+            },
+        ],
+    )
+    monkeypatch.chdir(tmp_path)
+
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        cli,
+        "force_reauth",
+        lambda credentials_file, token_file: captured.update(
+            {"credentials_file": credentials_file, "token_file": token_file}
+        ),
+    )
+
+    cli.main(["--config", str(cfg), "auth", "--account", selector])
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["email"] == expected_email
+    assert captured["credentials_file"] == str(main_creds)
+
+
+def test_auth_unknown_account_failure_lists_configured_accounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg = tmp_path / "config.toml"
+    creds = tmp_path / "main-creds.json"
+    creds.write_text("{}", encoding="utf-8")
+    _write_accounts_config(
+        cfg,
+        [
+            {
+                "name": "main",
+                "email": "main@example.com",
+                "credentials_file": str(creds),
+                "token_file": str(tmp_path / "main-token.json"),
+            }
+        ],
+    )
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="Unknown account 'missing'") as excinfo:
+        cli.main(["--config", str(cfg), "auth", "--account", "missing"])
+
+    assert "main <main@example.com>" in str(excinfo.value)
+
+
+def test_auth_duplicate_name_ambiguity_suggests_email(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg = tmp_path / "config.toml"
+    first_creds = tmp_path / "first-creds.json"
+    second_creds = tmp_path / "second-creds.json"
+    first_creds.write_text("{}", encoding="utf-8")
+    second_creds.write_text("{}", encoding="utf-8")
+    _write_accounts_config(
+        cfg,
+        [
+            {
+                "name": "main",
+                "email": "main@example.com",
+                "credentials_file": str(first_creds),
+                "token_file": str(tmp_path / "main-token.json"),
+            },
+            {
+                "name": "main",
+                "email": "alt@example.com",
+                "credentials_file": str(second_creds),
+                "token_file": str(tmp_path / "alt-token.json"),
+            },
+        ],
+    )
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="Ambiguous account name 'main'") as excinfo:
+        cli.main(["--config", str(cfg), "auth", "--account", "main"])
+
+    assert "use exact email instead" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(

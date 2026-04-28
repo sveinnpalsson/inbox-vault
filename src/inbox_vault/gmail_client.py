@@ -164,6 +164,47 @@ def _is_invalid_scope(exc: Exception) -> bool:
     return "invalid_scope" in msg or "invalid scope" in msg
 
 
+def _write_token_file(token_file: str, creds: Credentials) -> None:
+    token_path = os.path.abspath(token_file)
+    token_parent = os.path.dirname(token_path)
+    if token_parent:
+        os.makedirs(token_parent, exist_ok=True)
+    with open(token_path, "w", encoding="utf-8") as f:
+        f.write(creds.to_json())
+
+
+def force_reauth(credentials_file: str, token_file: str) -> Credentials:
+    if not os.path.isfile(credentials_file):
+        raise FileNotFoundError(
+            f"Gmail OAuth credentials file not found: {credentials_file}\n\n"
+            "To set up credentials:\n"
+            "  1. Go to https://console.cloud.google.com/apis/credentials\n"
+            "  2. Create an OAuth 2.0 Client ID (type: Desktop app)\n"
+            "  3. Download the JSON and save it to the path above\n"
+            "  4. Enable the Gmail API at https://console.cloud.google.com/apis/library/gmail.googleapis.com\n\n"
+            "See the README 'Getting started' section for a full walkthrough."
+        )
+
+    flow = InstalledAppFlow.from_client_secrets_file(credentials_file, SCOPES)
+    try:
+        webbrowser.get()
+        open_browser = True
+    except webbrowser.Error:
+        open_browser = False
+        print(
+            "No browser detected (headless / WSL / SSH).\n"
+            "A URL will be printed below -- open it in any browser to authorize.\n"
+            "On WSL2, use your Windows browser; localhost is shared.\n",
+            file=sys.stderr,
+        )
+
+    creds = flow.run_local_server(
+        port=0, access_type="offline", prompt="consent", open_browser=open_browser
+    )
+    _write_token_file(token_file, creds)
+    return creds
+
+
 def get_service(credentials_file: str, token_file: str, *, timeout_seconds: float = 60.0):
     creds = None
     try:
@@ -190,37 +231,10 @@ def get_service(credentials_file: str, token_file: str, *, timeout_seconds: floa
             fallback_creds.refresh(Request())
             creds = fallback_creds
 
-        with open(token_file, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
+        _write_token_file(token_file, creds)
 
     if not creds or not creds.valid:
-        if not os.path.isfile(credentials_file):
-            raise FileNotFoundError(
-                f"Gmail OAuth credentials file not found: {credentials_file}\n\n"
-                "To set up credentials:\n"
-                "  1. Go to https://console.cloud.google.com/apis/credentials\n"
-                "  2. Create an OAuth 2.0 Client ID (type: Desktop app)\n"
-                "  3. Download the JSON and save it to the path above\n"
-                "  4. Enable the Gmail API at https://console.cloud.google.com/apis/library/gmail.googleapis.com\n\n"
-                "See the README 'Getting started' section for a full walkthrough."
-            )
-        flow = InstalledAppFlow.from_client_secrets_file(credentials_file, SCOPES)
-        try:
-            webbrowser.get()
-            open_browser = True
-        except webbrowser.Error:
-            open_browser = False
-            print(
-                "No browser detected (headless / WSL / SSH).\n"
-                "A URL will be printed below -- open it in any browser to authorize.\n"
-                "On WSL2, use your Windows browser; localhost is shared.\n",
-                file=sys.stderr,
-            )
-        creds = flow.run_local_server(
-            port=0, access_type="offline", prompt="consent", open_browser=open_browser
-        )
-        with open(token_file, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
+        creds = force_reauth(credentials_file, token_file)
 
     timeout = max(1.0, float(timeout_seconds))
     if AuthorizedHttp is not None:

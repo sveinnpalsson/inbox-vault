@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from .config import load_config, resolve_password
 from .consolidation import run_consolidation
@@ -18,6 +20,7 @@ from .db import (
 )
 from .enrich import enrich_pending
 from .evals import bootstrap_eval_template, run_retrieval_eval
+from .gmail_client import force_reauth
 from .ingest import (
     backfill,
     backfill_attachment_inventory,
@@ -59,6 +62,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_auth = sub.add_parser("auth", help="Force Gmail OAuth re-authentication for one configured account")
+    p_auth.add_argument(
+        "--account",
+        required=True,
+        help="Configured account name or email.",
+    )
 
     p_backfill = sub.add_parser(
         "backfill", help="One-time full import from Gmail into encrypted DB"
@@ -1599,8 +1609,6 @@ def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
 
 def _validate_accounts(cfg) -> None:
     """Pre-flight check: verify credential files exist for all configured accounts."""
-    import os
-
     for acct in cfg.accounts:
         if not os.path.isfile(acct.credentials_file):
             raise FileNotFoundError(
@@ -1613,6 +1621,74 @@ def _validate_accounts(cfg) -> None:
                 "https://console.cloud.google.com/apis/library/gmail.googleapis.com\n\n"
                 "See the README 'Getting started' section for a full walkthrough."
             )
+
+
+def _configured_accounts_summary(cfg) -> list[str]:
+    return [f"{acct.name} <{acct.email}>" for acct in cfg.accounts]
+
+
+def _resolve_configured_account(cfg, selector: str):
+    requested = str(selector or "").strip()
+    if not requested:
+        raise ValueError(
+            "The auth command requires --account <name-or-email>. "
+            f"Configured accounts: {', '.join(_configured_accounts_summary(cfg))}"
+        )
+
+    exact_name_matches = [acct for acct in cfg.accounts if acct.name == requested]
+    if len(exact_name_matches) == 1:
+        return exact_name_matches[0]
+    if len(exact_name_matches) > 1:
+        raise ValueError(
+            "Ambiguous account name "
+            f"'{requested}'. Multiple configured accounts share that name; use exact email instead. "
+            f"Configured accounts: {', '.join(_configured_accounts_summary(cfg))}"
+        )
+
+    lowered = requested.lower()
+    for acct in cfg.accounts:
+        if acct.email == lowered:
+            return acct
+
+    raise ValueError(
+        f"Unknown account '{requested}'. "
+        f"Configured accounts: {', '.join(_configured_accounts_summary(cfg))}"
+    )
+
+
+def _run_auth_command(cfg, *, account_selector: str) -> dict[str, object]:
+    acct = _resolve_configured_account(cfg, account_selector)
+    if not os.path.isfile(acct.credentials_file):
+        raise FileNotFoundError(
+            f"Gmail OAuth credentials file not found for account '{acct.name}' <{acct.email}>: "
+            f"{acct.credentials_file}"
+        )
+
+    token_parent = Path(acct.token_file).expanduser().resolve().parent
+    token_parent.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"Starting Gmail OAuth re-auth for {acct.name} <{acct.email}>.",
+        file=sys.stderr,
+        flush=True,
+    )
+    force_reauth(acct.credentials_file, acct.token_file)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "account": acct.name,
+                "email": acct.email,
+                "token_file": acct.token_file,
+            }
+        )
+    )
+    return {
+        "ok": True,
+        "account": acct.name,
+        "email": acct.email,
+        "token_file": acct.token_file,
+    }
 
 
 def _check_python_version() -> None:
@@ -1630,6 +1706,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
+    if args.command == "auth":
+        _run_auth_command(cfg, account_selector=args.account)
+        return
+
     password = resolve_password(cfg.db)
 
     if args.command == "stress-run":

@@ -25,6 +25,47 @@ class _FakeCreds:
         return "{}"
 
 
+def test_force_reauth_writes_token_and_creates_parent_dir(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    credentials_file = tmp_path / "oauth-client.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    token_file = tmp_path / "nested" / "oauth" / "token.json"
+
+    class _Flow:
+        def run_local_server(self, **kwargs):
+            assert kwargs["port"] == 0
+            assert kwargs["access_type"] == "offline"
+            assert kwargs["prompt"] == "consent"
+            assert kwargs["open_browser"] is True
+            return type(
+                "_Creds",
+                (),
+                {"to_json": lambda self: '{"refresh_token":"new-token"}'},
+            )()
+
+    monkeypatch.setattr(gmail_client.webbrowser, "get", lambda: object())
+
+    def _from_client_secrets_file(path, scopes):
+        assert path == str(credentials_file)
+        assert scopes == gmail_client.SCOPES
+        return _Flow()
+
+    monkeypatch.setattr(
+        gmail_client.InstalledAppFlow,
+        "from_client_secrets_file",
+        _from_client_secrets_file,
+    )
+
+    gmail_client.force_reauth(str(credentials_file), str(token_file))
+
+    assert token_file.parent.is_dir()
+    assert token_file.read_text(encoding="utf-8") == '{"refresh_token":"new-token"}'
+
+
+def test_force_reauth_missing_credentials_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Gmail OAuth credentials file not found"):
+        gmail_client.force_reauth(str(tmp_path / "missing-creds.json"), str(tmp_path / "token.json"))
+
+
 def test_get_service_refresh_falls_back_to_token_scopes(tmp_path, monkeypatch: pytest.MonkeyPatch):
     token_file = tmp_path / "token.json"
     token_file.write_text(
