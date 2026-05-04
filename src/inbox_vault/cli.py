@@ -33,6 +33,7 @@ from .redaction import (
     REDACTION_POLICY_VERSION,
     is_persistent_redaction_value_allowed,
     redact_text,
+    resolve_redaction_backend,
 )
 from .stress import run_isolated_stress
 from .vectors import (
@@ -1303,29 +1304,38 @@ def _emit_ingest_progress(event: dict) -> None:
 
         print(line, file=sys.stderr, flush=True)
 
-def _describe_index_redaction_mode(mode: str | None, *, llm_enabled: bool = True) -> str:
+def _describe_index_redaction_mode(cfg, mode: str | None) -> str:
     selected = str(mode or "hybrid").strip().lower() or "hybrid"
     if selected == "regex":
         return "regex only"
-    if not llm_enabled:
-        return f"{selected} (regex fallback; llm disabled)"
+    resolved = resolve_redaction_backend(cfg)
+    if resolved.llm_cfg is None and resolved.candidate_detector is None:
+        backend_name = "OPF privacy filter" if resolved.backend == "opf" else "local redaction model"
+        reason = resolved.unavailable_reason or "unavailable"
+        if selected == "model":
+            return f"model ({backend_name} unavailable: {reason})"
+        return f"{selected} ({backend_name} unavailable: {reason}; regex fallback)"
     if selected == "model":
-        return "model (llm chat)"
-    return "hybrid (llm chat + regex)"
+        if resolved.backend == "opf":
+            return "model (OPF privacy filter)"
+        return "model (local redaction model)"
+    if resolved.backend == "opf":
+        return "hybrid (OPF privacy filter + regex)"
+    return "hybrid (local redaction model + regex)"
 
 
 def _make_index_progress_emitter(
     *,
+    cfg,
     verbose: bool,
     redaction_mode: str | None,
-    llm_enabled: bool = True,
 ) -> callable:
     state: dict[str, object] = {
         "started_at": None,
         "prepare_announced": False,
         "redaction_summary": _describe_index_redaction_mode(
+            cfg,
             redaction_mode,
-            llm_enabled=llm_enabled,
         ),
     }
 
@@ -1496,11 +1506,11 @@ def _print_pipeline_plan(command: str, stages: list[tuple[str, str]]) -> None:
         print(f"  - {label}: {description}", file=sys.stderr, flush=True)
 
 
-def _make_repair_progress_emitter(*, verbose: bool, redaction_mode: str | None, llm_enabled: bool):
+def _make_repair_progress_emitter(*, cfg, verbose: bool, redaction_mode: str | None):
     index_emit = _make_index_progress_emitter(
+        cfg=cfg,
         verbose=verbose,
         redaction_mode=redaction_mode,
-        llm_enabled=llm_enabled,
     )
 
     def _emit(event: dict) -> None:
@@ -1812,9 +1822,9 @@ def main(argv: list[str] | None = None) -> None:
                 }
             if should_index:
                 index_progress = _make_index_progress_emitter(
+                    cfg=cfg,
                     verbose=bool(args.verbose),
                     redaction_mode=cfg.redaction.mode,
-                    llm_enabled=bool(cfg.llm.enabled),
                 )
                 out["index_vectors"] = _run_index_vectors_for_ingest(
                     conn,
@@ -1925,9 +1935,9 @@ def main(argv: list[str] | None = None) -> None:
                 if ingested_msg_ids:
                     if _endpoint_reachable(cfg.embeddings.endpoint):
                         index_progress = _make_index_progress_emitter(
+                            cfg=cfg,
                             verbose=bool(args.verbose),
                             redaction_mode=cfg.redaction.mode,
-                            llm_enabled=bool(cfg.llm.enabled),
                         )
                         out["index_vectors"] = _run_index_vectors_for_ingest(
                             conn,
@@ -1989,9 +1999,9 @@ def main(argv: list[str] | None = None) -> None:
                 args.index_limit if args.index_limit is not None else cfg.indexing.auto_index_limit
             )
             repair_progress = _make_repair_progress_emitter(
+                cfg=cfg,
                 verbose=bool(args.verbose),
                 redaction_mode=cfg.redaction.mode,
-                llm_enabled=bool(cfg.llm.enabled),
             )
 
             _print_pipeline_plan(
@@ -2137,9 +2147,9 @@ def main(argv: list[str] | None = None) -> None:
             include_labels = _parse_label_overrides(args.include_label)
             exclude_labels = _parse_label_overrides(args.exclude_label)
             index_progress = _make_index_progress_emitter(
+                cfg=cfg,
                 verbose=bool(args.verbose),
                 redaction_mode=args.redaction_mode or cfg.redaction.mode,
-                llm_enabled=bool(cfg.llm.enabled),
             )
             index_progress({"event": "stage", "stage": "index_start"})
             pending_before = count_pending_vector_updates(

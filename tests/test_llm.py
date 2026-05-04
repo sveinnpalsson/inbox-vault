@@ -172,6 +172,28 @@ def test_chat_text_supports_content_array(monkeypatch):
     assert out == "hello world"
 
 
+def test_chat_text_adds_authorization_header_from_env(
+    monkeypatch,
+):
+    cfg = LLMConfig(
+        endpoint="http://llm.local",
+        model="test-model",
+        timeout_seconds=1.0,
+        provider="openai",
+        api_key_env="OPENAI_API_KEY",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def fake_post(*_args, **kwargs):
+        assert kwargs["headers"] == {"Authorization": "Bearer test-key"}
+        return _Resp(200, {"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("inbox_vault.llm.requests.post", fake_post)
+
+    out = chat_text(cfg, [{"role": "user", "content": "say hi"}])
+    assert out == "ok"
+
+
 def test_chat_text_retries_without_response_format_then_chat_template_kwargs(monkeypatch):
     cfg = LLMConfig(endpoint="http://llm.local", model="test-model", timeout_seconds=1.0)
     payloads: list[dict] = []

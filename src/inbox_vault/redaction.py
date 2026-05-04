@@ -3,9 +3,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
+from typing import Callable
 
-from .config import LLMConfig
+from .config import AppConfig, LLMConfig
 from .llm import chat_text, extract_first_json
+from .opf import OPFUnavailableError, resolve_opf_detector
 from .prompts import build_redaction_messages
 from .redaction_map import DeterministicRedactionMap, apply_deterministic_redaction
 
@@ -34,6 +36,7 @@ _RE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 _ALLOWED_MODES = {"regex", "model", "hybrid"}
+_ALLOWED_BACKENDS = {"opf", "local"}
 _KNOWN_KEYS = {"EMAIL", "PHONE", "URL", "ACCOUNT", "PERSON", "ADDRESS", "CUSTOM"}
 _GENERIC_LABELS = {
     "",
@@ -423,6 +426,14 @@ class RedactionRunResult:
     chunk_text_redacted: list[str]
     inserted_entries: list[dict[str, str]]
     persisted_entries: list[dict[str, str]]
+
+
+@dataclass(slots=True)
+class ResolvedRedactionBackend:
+    backend: str
+    llm_cfg: LLMConfig | None
+    candidate_detector: Callable[..., list[RedactionCandidate]] | None = None
+    unavailable_reason: str | None = None
 
 
 def _normalize_key_name(raw: str) -> str:
@@ -1102,12 +1113,50 @@ def _model_detect_candidates(
     return out
 
 
+def _opf_detect_candidates(
+    text: str,
+    *,
+    detector: Callable[[str], list[tuple[str, str]]],
+    source: str,
+) -> list[RedactionCandidate]:
+    out: list[RedactionCandidate] = []
+    for key_name, value in detector(text):
+        display = _normalize_candidate_display(value)
+        mapped_key_name = _remap_model_candidate_key_name(
+            key_name,
+            display,
+            source_text=text,
+        )
+        candidate_values = [display]
+        if mapped_key_name == "ADDRESS" and display and not _candidate_present_in_text(
+            "ADDRESS", display, text
+        ):
+            expanded = _expand_address_literals(display, text)
+            if expanded:
+                candidate_values = expanded
+        for candidate_value in candidate_values:
+            if candidate_value and is_redaction_value_allowed(
+                mapped_key_name,
+                candidate_value,
+                source_text=text,
+            ):
+                out.append(
+                    RedactionCandidate(
+                        key_name=mapped_key_name,
+                        value=candidate_value,
+                        source=source,
+                    )
+                )
+    return out
+
+
 def redact_with_persistent_map(
     source_text: str,
     *,
     chunks: list[str],
     mode: str,
     llm_cfg: LLMConfig | None,
+    candidate_detector: Callable[..., list[RedactionCandidate]] | None = None,
     profile: str,
     instruction: str,
     table: PersistentRedactionMap,
@@ -1183,40 +1232,72 @@ def redact_with_persistent_map(
     for chunk_text in chunks:
         _register(_regex_candidates(chunk_text), candidate_text=chunk_text)
 
-    if selected_mode in {"model", "hybrid"} and llm_cfg is not None:
-        try:
-            _register(
-                _model_detect_candidates(
-                    source_text,
-                    llm_cfg=llm_cfg,
-                    profile=profile,
-                    instruction=instruction,
-                    chunk_index=1,
-                    chunk_total=1,
-                    source="llm_document",
-                ),
-                candidate_text=source_text,
-            )
-        except Exception:
-            pass
-
+    if selected_mode in {"model", "hybrid"}:
         chunk_total = max(1, len(chunks))
-        for idx, chunk_text in enumerate(chunks, start=1):
+        if candidate_detector is not None:
+            try:
+                _register(
+                    candidate_detector(
+                        source_text,
+                        profile=profile,
+                        instruction=instruction,
+                        chunk_index=1,
+                        chunk_total=1,
+                        source="opf_document",
+                    ),
+                    candidate_text=source_text,
+                )
+            except Exception:
+                pass
+
+            for idx, chunk_text in enumerate(chunks, start=1):
+                try:
+                    _register(
+                        candidate_detector(
+                            chunk_text,
+                            profile=profile,
+                            instruction=instruction,
+                            chunk_index=idx,
+                            chunk_total=chunk_total,
+                            source="opf_chunk",
+                        ),
+                        candidate_text=chunk_text,
+                    )
+                except Exception:
+                    continue
+        elif llm_cfg is not None:
             try:
                 _register(
                     _model_detect_candidates(
-                        chunk_text,
+                        source_text,
                         llm_cfg=llm_cfg,
                         profile=profile,
                         instruction=instruction,
-                        chunk_index=idx,
-                        chunk_total=chunk_total,
-                        source="llm_chunk",
+                        chunk_index=1,
+                        chunk_total=1,
+                        source="llm_document",
                     ),
-                    candidate_text=chunk_text,
+                    candidate_text=source_text,
                 )
             except Exception:
-                continue
+                pass
+
+            for idx, chunk_text in enumerate(chunks, start=1):
+                try:
+                    _register(
+                        _model_detect_candidates(
+                            chunk_text,
+                            llm_cfg=llm_cfg,
+                            profile=profile,
+                            instruction=instruction,
+                            chunk_index=idx,
+                            chunk_total=chunk_total,
+                            source="llm_chunk",
+                        ),
+                        candidate_text=chunk_text,
+                    )
+                except Exception:
+                    continue
 
     source_redacted = _render_redacted(source_text)
     chunk_redacted = [_render_redacted(chunk_text) for chunk_text in chunks]
@@ -1226,6 +1307,49 @@ def redact_with_persistent_map(
         chunk_text_redacted=chunk_redacted,
         inserted_entries=new_entries,
         persisted_entries=persisted_entries,
+    )
+
+
+def resolve_redaction_backend(cfg: AppConfig) -> ResolvedRedactionBackend:
+    backend = str(cfg.redaction.backend or "opf").strip().lower() or "opf"
+    if backend not in _ALLOWED_BACKENDS:
+        backend = "opf"
+
+    if backend == "local":
+        if not cfg.llm.enabled:
+            return ResolvedRedactionBackend(
+                backend="local",
+                llm_cfg=None,
+                unavailable_reason="local LLM redaction is disabled",
+            )
+        return ResolvedRedactionBackend(
+            backend="local",
+            llm_cfg=LLMConfig(
+                enabled=True,
+                endpoint=cfg.redaction.endpoint or cfg.llm.endpoint,
+                model=cfg.redaction.model or cfg.llm.model,
+                timeout_seconds=cfg.redaction.timeout_seconds or cfg.llm.timeout_seconds,
+                provider="local",
+            ),
+        )
+
+    try:
+        detector = resolve_opf_detector(cfg.redaction.model)
+    except OPFUnavailableError as exc:
+        return ResolvedRedactionBackend(
+            backend="opf",
+            llm_cfg=None,
+            unavailable_reason=str(exc),
+        )
+
+    return ResolvedRedactionBackend(
+        backend="opf",
+        llm_cfg=None,
+        candidate_detector=lambda text, **kwargs: _opf_detect_candidates(
+            text,
+            detector=detector,
+            source=str(kwargs.get("source") or "opf"),
+        ),
     )
 
 

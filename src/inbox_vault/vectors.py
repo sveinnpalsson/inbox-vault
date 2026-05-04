@@ -35,6 +35,7 @@ from .redaction import (
     REDACTION_POLICY_VERSION,
     PersistentRedactionMap,
     redact_text,
+    resolve_redaction_backend,
     redact_with_persistent_map,
 )
 
@@ -745,6 +746,10 @@ def index_vectors(
     instruction = (
         redaction_instruction if redaction_instruction is not None else cfg.redaction.instruction
     ).strip()
+    resolved_redaction = resolve_redaction_backend(cfg)
+    if mode == "model" and resolved_redaction.llm_cfg is None and resolved_redaction.candidate_detector is None:
+        reason = resolved_redaction.unavailable_reason or "redaction backend unavailable"
+        raise ValueError(f"redaction backend unavailable for mode=model: {reason}")
 
     effective_include_labels = _normalized_label_set(
         include_labels if include_labels is not None else cfg.indexing.include_labels
@@ -1004,7 +1009,8 @@ def index_vectors(
                 source_text,
                 chunks=[chunk.text for chunk in chunks],
                 mode=mode,
-                llm_cfg=cfg.llm,
+                llm_cfg=resolved_redaction.llm_cfg,
+                candidate_detector=resolved_redaction.candidate_detector,
                 profile=profile,
                 instruction=instruction,
                 table=redaction_map,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from inbox_vault.db import DBLockRetryExhausted, upsert_message, vector_level_counts
+from inbox_vault.opf import OPFUnavailableError
 from inbox_vault.redaction import redact_text
 from inbox_vault.vectors import (
     INDEX_LEVEL_FULL,
@@ -139,6 +140,64 @@ def test_default_index_builds_redacted_level_only(conn, app_cfg, monkeypatch):
     counts = vector_level_counts(conn)
     assert counts[INDEX_LEVEL_REDACTED]["messages"] == 1
     assert INDEX_LEVEL_FULL not in counts
+
+
+def test_opf_redaction_backend_unavailable_falls_back_to_regex_without_model_calls(
+    conn, app_cfg, monkeypatch
+):
+    _insert_msg(
+        conn,
+        msg_id="m-opf-fallback",
+        account="acct@example.com",
+        labels=["INBOX"],
+        subject="Project alpha",
+        body="Reach alice@example.com about the project",
+    )
+    conn.commit()
+
+    app_cfg.redaction.mode = "hybrid"
+    app_cfg.redaction.backend = "opf"
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
+    monkeypatch.setattr(
+        "inbox_vault.redaction.resolve_opf_detector",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OPFUnavailableError("opf missing")),
+    )
+    monkeypatch.setattr(
+        "inbox_vault.redaction._model_detect_candidates",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not call model")),
+    )
+
+    stats = index_vectors(conn, app_cfg)
+    assert stats["indexed"] == 1
+
+    rows = search_vectors(conn, app_cfg, "project", clearance="redacted")
+    assert len(rows) == 1
+    assert ("[REDACTED_EMAIL]" in rows[0].content) or ("<REDACTED_EMAIL_" in rows[0].content)
+
+
+def test_model_mode_errors_when_opf_backend_is_unavailable(conn, app_cfg, monkeypatch):
+    _insert_msg(
+        conn,
+        msg_id="m-opf-model-unavailable",
+        account="acct@example.com",
+        labels=["INBOX"],
+        subject="Project alpha",
+        body="Reach alice@example.com about the project",
+    )
+    conn.commit()
+
+    app_cfg.redaction.mode = "model"
+    app_cfg.redaction.backend = "opf"
+    _patch_embeddings(monkeypatch, lambda *_a, **_k: [1.0, 0.0])
+    monkeypatch.setattr(
+        "inbox_vault.redaction.resolve_opf_detector",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OPFUnavailableError("opf missing")),
+    )
+
+    import pytest
+
+    with pytest.raises(ValueError, match="redaction backend unavailable for mode=model: opf missing"):
+        index_vectors(conn, app_cfg)
 
 
 def test_full_clearance_can_fallback_to_redacted_rank_with_diagnostics(conn, app_cfg, monkeypatch):
@@ -539,6 +598,19 @@ def test_index_vectors_model_mode_uses_redaction_overrides(conn, app_cfg, monkey
 
     monkeypatch.setattr(
         "inbox_vault.vectors.redact_with_persistent_map", fake_redact_pipeline
+    )
+    monkeypatch.setattr(
+        "inbox_vault.vectors.resolve_redaction_backend",
+        lambda *_args, **_kwargs: type(
+            "Resolved",
+            (),
+            {
+                "backend": "opf",
+                "llm_cfg": None,
+                "candidate_detector": lambda *_a, **_k: [],
+                "unavailable_reason": None,
+            },
+        )(),
     )
 
     stats = index_vectors(

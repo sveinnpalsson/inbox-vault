@@ -34,6 +34,14 @@ fallback_dim = 256
 [redaction]
 # hybrid | model | regex
 mode = "hybrid"
+# default local OPF privacy filter
+backend = "opf"
+# optional local OPF model/package identifier:
+# model = "your-opf-model"
+# local-only/offline legacy endpoint option:
+# backend = "local"
+# endpoint = "http://localhost:8080"
+# model = "local-redaction-model"
 profile = "standard"
 instruction = ""
 chunk_chars = 1200

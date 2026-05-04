@@ -39,6 +39,8 @@ query = "label:inbox"
     assert cfg.embeddings.max_retries == 4
     assert cfg.embeddings.fallback == "none"
     assert cfg.redaction.mode == "hybrid"
+    assert cfg.redaction.backend == "opf"
+    assert cfg.redaction.api_key_env == ""
     assert cfg.retrieval.search_strategy == "hybrid"
     assert cfg.retrieval.chunk_chars == 900
     assert cfg.retrieval.chunk_overlap_chars == 150
@@ -109,18 +111,42 @@ enabled = "false"
 
 [redaction]
 mode = "hybrid"
+backend = "local"
 profile = "restricted"
 instruction = "Mask people names as well"
 chunk_chars = 900
 model = "redactor-v1"
+endpoint = "http://localhost:9999"
+timeout_seconds = 9
 """.strip()
     )
 
     cfg = load_config(str(cfg_path))
     assert cfg.llm.enabled is False
     assert cfg.redaction.mode == "hybrid"
+    assert cfg.redaction.backend == "local"
     assert cfg.redaction.profile == "restricted"
     assert cfg.redaction.model == "redactor-v1"
+    assert cfg.redaction.endpoint == "http://localhost:9999"
+    assert cfg.redaction.timeout_seconds == 9.0
+
+
+def test_load_config_rejects_invalid_redaction_backend(tmp_path: Path):
+    cfg_path = tmp_path / "cfg.toml"
+    cfg_path.write_text(
+        """
+[[accounts]]
+email = "acct@example.com"
+credentials_file = "credentials.json"
+token_file = "token.json"
+
+[redaction]
+backend = "hosted"
+""".strip()
+    )
+
+    with pytest.raises(ValueError, match="redaction.backend"):
+        load_config(str(cfg_path))
 
     dup_path = tmp_path / "dup.toml"
     dup_path.write_text(

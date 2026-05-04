@@ -45,13 +45,28 @@ fallback_dim = 256
 [redaction]
 # hybrid (default) | model | regex
 mode = "hybrid"
-# named clearance profile passed to the local redaction model prompt
+# preferred redaction backend:
+# opf   = local OpenAI Privacy Filter package / Hugging Face token-classification backend
+# local = local-only OpenAI-compatible endpoint (offline/operator-managed legacy path)
+backend = "opf"
+# named clearance profile passed to the local redaction backend
 profile = "standard"
-# optional extra prompt instruction for model/hybrid modes
+# optional extra instruction for local endpoint model/hybrid mode
 instruction = ""
-# chunk size for model redaction requests
+# chunk size for local endpoint model redaction requests
 chunk_chars = 1200
-# optional model override for redaction calls (defaults to [llm].model)
+# OPF backend: optionally set a local model/package identifier if your operator
+# install exposes the filter through transformers token-classification.
+# model = "your-opf-model"
+#
+# local backend only: optional endpoint/model override
+# endpoint = "http://localhost:8080"
+# model = "local-redaction-model"
+# optional timeout override for redaction calls; defaults to [llm].timeout_seconds
+# timeout_seconds = 60
+# Local-only/offline legacy endpoint example:
+# backend = "local"
+# endpoint = "http://localhost:8080"
 # model = "local-redaction-model"
 
 [retrieval]

@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from inbox_vault.config import LLMConfig
+from inbox_vault.config import (
+    AccountConfig,
+    AppConfig,
+    DBConfig,
+    EmbeddingConfig,
+    LLMConfig,
+    RedactionConfig,
+    RetrievalConfig,
+)
 from inbox_vault.redaction import (
     is_redaction_value_allowed,
     model_redact_text,
     redact_text,
     regex_redact_text,
+    resolve_redaction_backend,
 )
+from inbox_vault.opf import OPFUnavailableError
 
 
 def test_regex_redaction_masks_common_tokens():
@@ -81,3 +91,91 @@ def test_redaction_value_validator_rejects_custom_and_accepts_valid_entities():
     assert is_redaction_value_allowed("PERSON", "Alice Johnson") is True
     assert is_redaction_value_allowed("PERSON", "Tempobono", source_text='Last Name: "Tempobono"') is True
     assert is_redaction_value_allowed("ADDRESS", "123 Main Street") is True
+
+
+def test_resolve_redaction_backend_builds_opf_detector(monkeypatch):
+    detector = lambda text: [("EMAIL", text)]
+    monkeypatch.setattr("inbox_vault.redaction.resolve_opf_detector", lambda *_args, **_kwargs: detector)
+    cfg = AppConfig(
+        accounts=[
+            AccountConfig(
+                name="main",
+                email="acct@example.com",
+                credentials_file="credentials.json",
+                token_file="token.json",
+            )
+        ],
+        llm=LLMConfig(enabled=False, endpoint="http://localhost:8080", model="local-model"),
+        db=DBConfig(),
+        embeddings=EmbeddingConfig(),
+        redaction=RedactionConfig(mode="hybrid", backend="opf", model="opf-local"),
+        retrieval=RetrievalConfig(),
+    )
+
+    resolved = resolve_redaction_backend(cfg)
+    assert resolved.backend == "opf"
+    assert resolved.llm_cfg is None
+    assert resolved.candidate_detector is not None
+    detected = resolved.candidate_detector("alice@example.com", source="test")
+    assert [(item.key_name, item.value, item.source) for item in detected] == [
+        ("EMAIL", "alice@example.com", "test")
+    ]
+
+
+def test_resolve_redaction_backend_reports_opf_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        "inbox_vault.redaction.resolve_opf_detector",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OPFUnavailableError("opf missing")),
+    )
+    cfg = AppConfig(
+        accounts=[
+            AccountConfig(
+                name="main",
+                email="acct@example.com",
+                credentials_file="credentials.json",
+                token_file="token.json",
+            )
+        ],
+        llm=LLMConfig(enabled=False, endpoint="http://localhost:8080", model="local-model"),
+        db=DBConfig(),
+        embeddings=EmbeddingConfig(),
+        redaction=RedactionConfig(mode="hybrid", backend="opf"),
+        retrieval=RetrievalConfig(),
+    )
+
+    resolved = resolve_redaction_backend(cfg)
+    assert resolved.backend == "opf"
+    assert resolved.llm_cfg is None
+    assert resolved.candidate_detector is None
+    assert resolved.unavailable_reason == "opf missing"
+
+
+def test_resolve_redaction_backend_keeps_local_endpoint_optional():
+    cfg = AppConfig(
+        accounts=[
+            AccountConfig(
+                name="main",
+                email="acct@example.com",
+                credentials_file="credentials.json",
+                token_file="token.json",
+            )
+        ],
+        llm=LLMConfig(enabled=True, endpoint="http://localhost:8080", model="local-model"),
+        db=DBConfig(),
+        embeddings=EmbeddingConfig(),
+        redaction=RedactionConfig(
+            mode="hybrid",
+            backend="local",
+            endpoint="http://localhost:9090",
+            model="local-redactor",
+            timeout_seconds=5.0,
+        ),
+        retrieval=RetrievalConfig(),
+    )
+
+    resolved = resolve_redaction_backend(cfg)
+    assert resolved.backend == "local"
+    assert resolved.llm_cfg is not None
+    assert resolved.llm_cfg.endpoint == "http://localhost:9090"
+    assert resolved.llm_cfg.model == "local-redactor"
+    assert resolved.llm_cfg.timeout_seconds == 5.0

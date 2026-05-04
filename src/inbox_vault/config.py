@@ -21,6 +21,8 @@ class LLMConfig:
     endpoint: str = "http://localhost:8080"
     model: str = "local-model"
     timeout_seconds: float = 60.0
+    provider: str = "local"
+    api_key_env: str = ""
 
 
 @dataclass(slots=True)
@@ -44,10 +46,14 @@ class EmbeddingConfig:
 @dataclass(slots=True)
 class RedactionConfig:
     mode: str = "hybrid"
+    backend: str = "opf"
     profile: str = "standard"
     instruction: str = ""
     chunk_chars: int = 1200
     model: str | None = None
+    endpoint: str | None = None
+    timeout_seconds: float | None = None
+    api_key_env: str = ""
 
 
 @dataclass(slots=True)
@@ -359,10 +365,33 @@ def load_config(path: str | None = None) -> AppConfig:
     if redaction_mode not in {"regex", "model", "hybrid"}:
         raise ValueError("Invalid redaction.mode: expected one of regex|model|hybrid")
 
+    redaction_backend = str(redaction_raw.get("backend", "opf")).strip().lower()
+    if redaction_backend not in {"opf", "local"}:
+        raise ValueError("Invalid redaction.backend: expected one of opf|local")
+
     redaction_profile = str(redaction_raw.get("profile", "standard")).strip()
     redaction_instruction = str(redaction_raw.get("instruction", "")).strip()
     redaction_model_raw = redaction_raw.get("model")
     redaction_model = None if redaction_model_raw is None else str(redaction_model_raw).strip()
+    redaction_endpoint_raw = redaction_raw.get("endpoint")
+    redaction_endpoint = (
+        None if redaction_endpoint_raw is None else str(redaction_endpoint_raw).strip()
+    )
+    if redaction_endpoint == "":
+        redaction_endpoint = None
+
+    redaction_timeout_raw = redaction_raw.get("timeout_seconds")
+    if redaction_timeout_raw is None:
+        redaction_timeout_seconds = None
+    else:
+        try:
+            redaction_timeout_seconds = float(redaction_timeout_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid redaction.timeout_seconds: expected number") from exc
+        if redaction_timeout_seconds <= 0:
+            raise ValueError("Invalid redaction.timeout_seconds: must be > 0")
+
+    redaction_api_key_env = str(redaction_raw.get("api_key_env", "")).strip()
 
     redaction_chunk_chars = _parse_positive_int(
         redaction_raw.get("chunk_chars", 1200),
@@ -521,6 +550,7 @@ def load_config(path: str | None = None) -> AppConfig:
             endpoint=llm_endpoint,
             model=llm_model,
             timeout_seconds=timeout_seconds,
+            provider="local",
         ),
         db=DBConfig(
             path=db_path,
@@ -538,10 +568,14 @@ def load_config(path: str | None = None) -> AppConfig:
         ),
         redaction=RedactionConfig(
             mode=redaction_mode,
+            backend=redaction_backend,
             profile=redaction_profile,
             instruction=redaction_instruction,
             chunk_chars=redaction_chunk_chars,
             model=redaction_model or None,
+            endpoint=redaction_endpoint,
+            timeout_seconds=redaction_timeout_seconds,
+            api_key_env=redaction_api_key_env,
         ),
         retrieval=RetrievalConfig(
             search_strategy=retrieval_strategy,

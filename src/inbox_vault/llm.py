@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -135,6 +136,12 @@ def chat_text(
     response_format: dict[str, Any] | None = None,
     allow_reasoning_fallback: bool = False,
 ) -> str:
+    headers: dict[str, str] = {}
+    if cfg.api_key_env:
+        api_key = os.environ.get(cfg.api_key_env, "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
     payload: dict[str, Any] = {
         "model": cfg.model,
         "messages": messages,
@@ -151,6 +158,7 @@ def chat_text(
         resp = requests.post(
             f"{cfg.endpoint.rstrip('/')}/v1/chat/completions",
             json=payload,
+            headers=headers or None,
             timeout=cfg.timeout_seconds,
         )
         resp.raise_for_status()
@@ -164,6 +172,7 @@ def chat_text(
                     resp = requests.post(
                         f"{cfg.endpoint.rstrip('/')}/v1/chat/completions",
                         json=payload,
+                        headers=headers or None,
                         timeout=cfg.timeout_seconds,
                     )
                     resp.raise_for_status()
@@ -174,6 +183,7 @@ def chat_text(
                     resp = requests.post(
                         f"{cfg.endpoint.rstrip('/')}/v1/chat/completions",
                         json=payload,
+                        headers=headers or None,
                         timeout=cfg.timeout_seconds,
                     )
                     resp.raise_for_status()
@@ -182,6 +192,7 @@ def chat_text(
                 resp = requests.post(
                     f"{cfg.endpoint.rstrip('/')}/v1/chat/completions",
                     json=payload,
+                    headers=headers or None,
                     timeout=cfg.timeout_seconds,
                 )
                 resp.raise_for_status()

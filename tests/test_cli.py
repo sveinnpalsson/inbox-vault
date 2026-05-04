@@ -836,6 +836,20 @@ def test_repair_emits_post_ingest_progress_to_stderr(
         "repair",
         lambda *_args, **_kwargs: {"backfill_ingested": 4, "interrupted": False},
     )
+    monkeypatch.setattr(
+        cli,
+        "resolve_redaction_backend",
+        lambda *_args, **_kwargs: type(
+            "Resolved",
+            (),
+            {
+                "backend": "opf",
+                "llm_cfg": None,
+                "candidate_detector": None,
+                "unavailable_reason": "opf missing",
+            },
+        )(),
+    )
 
     def fake_enrich(*_args, **kwargs):
         progress_callback = kwargs["progress_callback"]
@@ -924,9 +938,13 @@ def test_repair_emits_post_ingest_progress_to_stderr(
         "[enrichment] done, updated 12 | attempted=12 succeeded=12 fallback_used=2 "
         "http_failed=1 parse_failed=3 contract_failed=1 repair_attempted=1 repair_succeeded=1 elapsed=24.0s"
     ) in err_lines
-    assert "[indexing] starting | redaction=hybrid (llm chat + regex) | embeddings=batched" in err_lines
     assert (
-        "[indexing] preparing 1/12 | step=normalization | redaction=hybrid (llm chat + regex)"
+        "[indexing] starting | redaction=hybrid (OPF privacy filter unavailable: "
+        "opf missing; regex fallback) | embeddings=batched"
+    ) in err_lines
+    assert (
+        "[indexing] preparing 1/12 | step=normalization | redaction=hybrid "
+        "(OPF privacy filter unavailable: opf missing; regex fallback)"
         in err_lines
     )
     assert "[indexing] 3/12, indexed 3, failed 0 | eta: 1 min" in err_lines
@@ -950,6 +968,20 @@ def test_repair_verbose_emits_rich_index_substeps(
         cli,
         "repair",
         lambda *_args, **_kwargs: {"backfill_ingested": 0, "interrupted": False},
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_redaction_backend",
+        lambda *_args, **_kwargs: type(
+            "Resolved",
+            (),
+            {
+                "backend": "opf",
+                "llm_cfg": None,
+                "candidate_detector": None,
+                "unavailable_reason": "opf missing",
+            },
+        )(),
     )
     monkeypatch.setattr(cli, "count_pending_vector_updates", lambda *_args, **_kwargs: 4)
 
@@ -1059,7 +1091,10 @@ def test_repair_verbose_emits_rich_index_substeps(
     cli.main(["--config", str(cfg), "repair", "--backfill-limit", "0", "--no-enrich", "--verbose"])
 
     err_lines = capsys.readouterr().err.splitlines()
-    assert "[indexing] starting | redaction=hybrid (llm chat + regex) | embeddings=batched" in err_lines
+    assert (
+        "[indexing] starting | redaction=hybrid (OPF privacy filter unavailable: "
+        "opf missing; regex fallback) | embeddings=batched"
+    ) in err_lines
     assert "[indexing] msg 1/4 m-100 (acct@example.com) start | step=normalization" in err_lines
     assert "[indexing] msg 1/4 m-100 (acct@example.com) chunks=3 | next=redaction" in err_lines
     assert "[indexing] msg 1/4 m-100 (acct@example.com) step=redaction" in err_lines

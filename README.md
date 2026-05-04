@@ -6,7 +6,7 @@
 
 **A privacy firewall between your email and AI agents.**
 
-Inbox Vault syncs Gmail into a local SQLCipher-encrypted database, redacts PII automatically, builds searchable contact profiles, and exposes a clearance-gated CLI that agents can query safely. Everything runs locally.
+Inbox Vault syncs Gmail into a local SQLCipher-encrypted database, redacts PII automatically, builds searchable contact profiles, and exposes a clearance-gated CLI that agents can query safely. Storage and retrieval stay local; redaction can use either a local OPF privacy filter or a local-only model endpoint depending on operator config.
 
 ## Why
 
@@ -29,7 +29,7 @@ Design notes:
 - **Syncs Gmail** into a local SQLCipher-encrypted database (`update`, `update --backfill`, `repair`)
 - **Inventories attachment metadata safely by default** -- captures filename, MIME type, size, and inline/disposition hints without fetching, parsing, or opening attachment bytes unless you explicitly enable attachment materialization
 - **Enriches messages** with a local LLM -- category, importance, action items, summaries
-- **Redacts PII** through three configurable modes: regex patterns, LLM-based detection, or hybrid with persistent coreference-preserving placeholder maps
+- **Redacts PII** through three configurable modes: regex patterns, model-backed detection, or hybrid with persistent coreference-preserving placeholder maps
 - **Builds contact profiles** from conversation history using signal-based tiering and a two-step evidence-then-synthesis LLM pipeline
 - **Searches** with hybrid retrieval: dense vectors + BM25 lexical search fused via Reciprocal Rank Fusion, with optional cross-encoder reranking
 - **Controls access** via `--clearance redacted` (default) and `--clearance full` output modes
@@ -42,8 +42,14 @@ The redaction system uses a **persistent map** that assigns stable placeholders 
 
 Three detection modes are configurable per deployment:
 - **Regex** -- fast, deterministic pattern matching for emails, phones, URLs, account numbers
-- **LLM** -- contextual detection via local model, catches PII that patterns miss
+- **Model** -- contextual detection via the configured redaction backend, catches PII that patterns miss
 - **Hybrid** -- combines contextual model detection with regex coverage and keeps regex as a final safety net
+
+Redaction backends are separate from the general enrichment/profile LLM path:
+- **OPF privacy filter** -- preferred default; a local package-backed/Hugging Face token-classification privacy filter that never requires `OPENAI_API_KEY`
+- **Local endpoint** -- explicit offline/operator-managed legacy option using an OpenAI-compatible server on your machine or LAN
+
+If hybrid redaction is selected but OPF is unavailable, Inbox Vault falls back to regex redaction rather than sending mail to an unintended endpoint. If model redaction is selected and OPF is unavailable, the run fails clearly instead of silently calling a hosted API.
 
 ## Who is this for
 
@@ -108,9 +114,9 @@ command -v inbox-vault
 inbox-vault --help
 ```
 
-### 4. Set up a local LLM / embedding endpoint (optional)
+### 4. Set up enrichment/indexing models (optional)
 
-Enrichment (classification, summaries) and vector indexing (semantic search) require a local LLM and embedding model. The default config points to `http://localhost:8080` for both.
+Enrichment (classification, summaries) and vector indexing (semantic search) require a local LLM and embedding model. The default `[llm]` and `[embeddings]` config points to `http://localhost:8080`.
 
 Any OpenAI-compatible local server works -- [llama.cpp](https://github.com/ggml-org/llama.cpp), [Ollama](https://ollama.com), [vLLM](https://github.com/vllm-project/vllm), etc. You need:
 - A **chat completion** endpoint for enrichment and profiles (e.g. Qwen3-14B)
@@ -118,7 +124,17 @@ Any OpenAI-compatible local server works -- [llama.cpp](https://github.com/ggml-
 
 Update `[llm]` and `[embeddings]` in your `config.toml` with the correct endpoint and model name. If you skip this step, `update` will still sync messages and warn that enrichment/indexing were skipped.
 
-### 5. First sync
+### 5. Choose a redaction backend
+
+`[redaction]` is separate from `[llm]`.
+
+- Preferred default: set `backend = "opf"`. Install the local OPF package and, if needed, set `redaction.model` to the local Hugging Face/token-classification model identifier your operator deploys.
+- Local-only legacy option: set `backend = "local"` and point `endpoint`/`model` at your local OpenAI-compatible redaction server.
+- Strictly local deterministic option: set `mode = "regex"` and Inbox Vault will avoid model-backed redaction entirely.
+
+Inbox Vault does not send mailbox content to hosted OpenAI endpoints for redaction. This repo does not use live mailbox traffic in tests, and the test suite does not require network calls for redaction coverage.
+
+### 6. First sync
 
 ```bash
 # pull a small batch to verify everything works
@@ -131,7 +147,7 @@ On the first run, a browser window will open asking you to authorize Gmail acces
 
 You should see JSON output with an `ingested` count. If your LLM/embedding endpoints are running, enrichment and indexing happen automatically. If they're not reachable, you'll see a warning and those steps are skipped -- you can re-run later.
 
-### 6. Daily use
+### 7. Daily use
 
 ```bash
 # sync new messages + auto-enrich + auto-index
