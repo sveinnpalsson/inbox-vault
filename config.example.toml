@@ -43,32 +43,30 @@ fallback = "none"
 fallback_dim = 256
 
 [redaction]
-# hybrid (default) | model | regex
+# regex = deterministic scrubadub-only redaction
+# model = use the selected backend detector only
+# hybrid = backend detector first, then regex safety pass (default)
 mode = "hybrid"
-# preferred redaction backend:
-# opf   = local OpenAI Privacy Filter package / Hugging Face token-classification backend
-# local = local-only OpenAI-compatible endpoint (offline/operator-managed legacy path)
+
+# Default backend: local OpenAI Privacy Filter package / Hugging Face token-classification.
+# This does not use hosted OpenAI and does not need [llm] endpoint settings.
 backend = "opf"
-# named clearance profile passed to the local redaction backend
-profile = "standard"
-# optional extra instruction for local endpoint model/hybrid mode
-instruction = ""
-# chunk size for local endpoint model redaction requests
-chunk_chars = 1200
-# OPF backend: leave model unset for the official package's default checkpoint,
-# or set a local checkpoint/model path if your operator provides one.
-# Set INBOX_VAULT_OPF_DEVICE=cuda to opt into GPU inference.
+
+# OPF options:
+# - leave model unset for the official package's default checkpoint
+# - set model to a local checkpoint/model path only if your operator provides one
+# - set INBOX_VAULT_OPF_DEVICE=cuda to opt into GPU inference
 # model = "/path/to/privacy_filter_checkpoint"
-#
-# local backend only: optional endpoint/model override
-# endpoint = "http://localhost:8080"
-# model = "local-redaction-model"
-# optional timeout override for redaction calls; defaults to [llm].timeout_seconds
-# timeout_seconds = 60
-# Local-only/offline legacy endpoint example:
+
+# Legacy local endpoint backend, only if you intentionally run an offline
+# OpenAI-compatible redaction service yourself:
 # backend = "local"
 # endpoint = "http://localhost:8080"
 # model = "local-redaction-model"
+# profile = "standard"
+# instruction = ""
+# chunk_chars = 1200
+# timeout_seconds = 60
 
 [retrieval]
 # dense | lexical | hybrid
