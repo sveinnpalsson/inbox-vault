@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from inbox_vault import redaction as redaction_module
 from inbox_vault.config import LLMConfig
 from inbox_vault.db import (
     fetch_redaction_entries,
@@ -76,6 +77,55 @@ def test_boundary_spanning_value_replaced_with_full_placeholder():
 
     assert "<REDACTED_EMAIL_A>" in result.chunk_text_redacted[0]
     assert "<REDACTED_EMAIL_A>" in result.chunk_text_redacted[1]
+
+
+def test_persistent_map_replaces_exact_and_whitespace_tolerant_values():
+    table = PersistentRedactionMap()
+    email_placeholder, _, _ = table.register("EMAIL", "match@example.com")
+    person_placeholder, _, _ = table.register("PERSON", "Alice Example")
+
+    out = table.apply("Email MATCH@example.com and Alice\n\tExample today")
+
+    assert email_placeholder in out
+    assert person_placeholder in out
+    assert "MATCH@example.com" not in out
+    assert "Alice\n\tExample" not in out
+
+
+def test_persistent_map_caches_patterns_and_skips_absent_values(monkeypatch):
+    table = PersistentRedactionMap()
+    email_placeholder, _, _ = table.register("EMAIL", "hit@example.com")
+    person_placeholder, _, _ = table.register("PERSON", "Alice Example")
+    for idx in range(100):
+        table.register("EMAIL", f"miss{idx}@example.com")
+
+    calls = {"exact": 0, "whitespace": 0}
+    original_exact = redaction_module._compile_exact_value_pattern
+    original_whitespace = redaction_module._compile_whitespace_tolerant_pattern
+
+    def counted_exact(value: str):
+        calls["exact"] += 1
+        return original_exact(value)
+
+    def counted_whitespace(value: str):
+        calls["whitespace"] += 1
+        return original_whitespace(value)
+
+    monkeypatch.setattr(redaction_module, "_compile_exact_value_pattern", counted_exact)
+    monkeypatch.setattr(
+        redaction_module,
+        "_compile_whitespace_tolerant_pattern",
+        counted_whitespace,
+    )
+
+    text = "Use hit@example.com for Alice\nExample."
+    first = table.apply(text)
+    second = table.apply(text)
+
+    assert first == second
+    assert email_placeholder in first
+    assert person_placeholder in first
+    assert calls == {"exact": 1, "whitespace": 1}
 
 
 def test_unredaction_round_trip_with_db(conn):

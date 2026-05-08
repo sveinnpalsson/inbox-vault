@@ -358,11 +358,104 @@ class RedactionCandidate:
 
 
 @dataclass(slots=True)
+class _PersistentReplacement:
+    value: str
+    exact_literal_folded: str
+    has_whitespace_pattern: bool
+    whitespace_literal_folds: tuple[str, ...]
+    partial_prefixes: tuple[str, ...]
+    partial_suffixes: tuple[str, ...]
+    exact_pattern: re.Pattern[str] | None = None
+    whitespace_pattern: re.Pattern[str] | None = None
+    whitespace_pattern_loaded: bool = False
+
+    @classmethod
+    def from_value(cls, value: str):
+        normalized = _normalize_candidate_display(value)
+        parts = tuple(part for part in normalized.split(" ") if part)
+        has_whitespace_pattern = bool(
+            normalized and len(parts) >= 2 and re.search(r"\s", value)
+        )
+        whitespace_literal_folds = (
+            tuple(dict.fromkeys(part.casefold() for part in parts))
+            if has_whitespace_pattern and all(part.isascii() for part in parts)
+            else ()
+        )
+
+        target = value.lower()
+        best = min(4, len(target) - 1) if len(target) > 1 else 0
+        partial_prefixes: tuple[str, ...] = ()
+        partial_suffixes: tuple[str, ...] = ()
+        if best > 0:
+            partial_prefixes = tuple(
+                target[:k] for k in range(len(target) - 1, best - 1, -1)
+            )
+            partial_suffixes = tuple(
+                target[len(target) - k :] for k in range(len(target) - 1, best - 1, -1)
+            )
+
+        return cls(
+            value=value,
+            exact_literal_folded=value.casefold() if value.isascii() else "",
+            has_whitespace_pattern=has_whitespace_pattern,
+            whitespace_literal_folds=whitespace_literal_folds,
+            partial_prefixes=partial_prefixes,
+            partial_suffixes=partial_suffixes,
+        )
+
+    def exact_may_match(self, folded_text: str) -> bool:
+        return not self.exact_literal_folded or self.exact_literal_folded in folded_text
+
+    def whitespace_may_match(self, folded_text: str) -> bool:
+        if not self.has_whitespace_pattern:
+            return False
+        if not self.whitespace_literal_folds:
+            return True
+        return all(literal in folded_text for literal in self.whitespace_literal_folds)
+
+    def partial_may_match(self, lowered_text: str) -> bool:
+        return any(lowered_text.endswith(prefix) for prefix in self.partial_prefixes) or any(
+            lowered_text.startswith(suffix) for suffix in self.partial_suffixes
+        )
+
+    def exact_regex(self) -> re.Pattern[str]:
+        if self.exact_pattern is None:
+            self.exact_pattern = _compile_exact_value_pattern(self.value)
+        return self.exact_pattern
+
+    def whitespace_regex(self) -> re.Pattern[str] | None:
+        if not self.whitespace_pattern_loaded:
+            self.whitespace_pattern = _compile_whitespace_tolerant_pattern(self.value)
+            self.whitespace_pattern_loaded = True
+        return self.whitespace_pattern
+
+    def replace_partial_boundary(self, text: str, placeholder: str) -> str:
+        if not text or not self.value:
+            return text
+
+        lowered = text.lower()
+        for prefix in self.partial_prefixes:
+            if lowered.endswith(prefix):
+                text = text[: len(text) - len(prefix)] + placeholder
+                lowered = text.lower()
+                break
+
+        for suffix in self.partial_suffixes:
+            if lowered.startswith(suffix):
+                text = placeholder + text[len(suffix) :]
+                break
+        return text
+
+
+@dataclass(slots=True)
 class PersistentRedactionMap:
     value_to_placeholder: dict[str, str] = field(default_factory=dict)
     placeholder_to_value: dict[str, str] = field(default_factory=dict)
     placeholder_to_key: dict[str, str] = field(default_factory=dict)
     key_counts: dict[str, int] = field(default_factory=dict)
+    _replacement_cache: dict[str, _PersistentReplacement] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     @classmethod
     def from_rows(cls, rows: list[tuple[str, str, str, str]]):
@@ -405,22 +498,48 @@ class PersistentRedactionMap:
         self.value_to_placeholder[normalized] = placeholder
         self.placeholder_to_value[placeholder] = value
         self.placeholder_to_key[placeholder] = key
+        self._replacement_cache[placeholder] = _PersistentReplacement.from_value(value)
         return placeholder, normalized, True
 
     def apply(self, text: str) -> str:
         if not text:
             return ""
         out = text
+        folded = out.casefold()
+        lowered = out.lower()
         for placeholder, value in sorted(
             self.placeholder_to_value.items(), key=lambda item: len(item[1]), reverse=True
         ):
-            exact_pattern = _compile_exact_value_pattern(value)
-            out = exact_pattern.sub(placeholder, out)
-            whitespace_pattern = _compile_whitespace_tolerant_pattern(value)
-            if whitespace_pattern is not None:
-                out = whitespace_pattern.sub(placeholder, out)
-            out = _replace_partial_boundary(out, value, placeholder)
+            replacement = self._replacement_for(placeholder, value)
+            if replacement.exact_may_match(folded):
+                next_out = replacement.exact_regex().sub(placeholder, out)
+                if next_out != out:
+                    out = next_out
+                    folded = out.casefold()
+                    lowered = out.lower()
+            if replacement.whitespace_may_match(folded):
+                whitespace_pattern = replacement.whitespace_regex()
+                if whitespace_pattern is not None:
+                    next_out = whitespace_pattern.sub(placeholder, out)
+                    if next_out != out:
+                        out = next_out
+                        folded = out.casefold()
+                        lowered = out.lower()
+            if replacement.partial_may_match(lowered):
+                next_out = replacement.replace_partial_boundary(out, placeholder)
+                if next_out != out:
+                    out = next_out
+                    folded = out.casefold()
+                    lowered = out.lower()
         return out
+
+    def _replacement_for(self, placeholder: str, value: str) -> _PersistentReplacement:
+        cached = self._replacement_cache.get(placeholder)
+        if cached is not None and cached.value == value:
+            return cached
+        replacement = _PersistentReplacement.from_value(value)
+        self._replacement_cache[placeholder] = replacement
+        return replacement
 
     def unredact(self, text: str) -> str:
         if not text:
