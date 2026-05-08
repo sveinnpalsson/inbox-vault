@@ -311,7 +311,7 @@ def build_redaction_messages(
         "Chunk handling rule: analyze this chunk independently, but include any full sensitive value visible in this chunk.\n\n"
         "Return JSON only with this exact shape:\n"
         "{\"redactions\":[{\"key_name\":\"EMAIL\",\"values\":[\"alice@example.com\"]}]}\n"
-        "- key_name must be one of: EMAIL, PHONE, URL, ACCOUNT, PERSON, ADDRESS.\n"
+        "- key_name must be one of: EMAIL, PHONE, URL, ACCOUNT, PERSON, ADDRESS, DATE.\n"
         "- values must be concrete sensitive strings found verbatim in the chunk.\n"
         "- Never emit labels, placeholders, summaries, or guessed values.\n"
         "- If nothing sensitive is found, return {\"redactions\":[]}.\n\n"

@@ -9,6 +9,7 @@ from inbox_vault.config import (
     RedactionConfig,
     RetrievalConfig,
 )
+from inbox_vault.opf import OPFUnavailableError
 from inbox_vault.redaction import (
     is_redaction_value_allowed,
     model_redact_text,
@@ -16,7 +17,6 @@ from inbox_vault.redaction import (
     regex_redact_text,
     resolve_redaction_backend,
 )
-from inbox_vault.opf import OPFUnavailableError
 
 
 def test_regex_redaction_masks_common_tokens():
@@ -94,7 +94,9 @@ def test_redaction_value_validator_rejects_custom_and_accepts_valid_entities():
 
 
 def test_resolve_redaction_backend_builds_opf_detector(monkeypatch):
-    detector = lambda text: [("EMAIL", text)]
+    def detector(text):
+        return [("EMAIL", text)]
+
     monkeypatch.setattr("inbox_vault.redaction.resolve_opf_detector", lambda *_args, **_kwargs: detector)
     cfg = AppConfig(
         accounts=[
@@ -120,6 +122,59 @@ def test_resolve_redaction_backend_builds_opf_detector(monkeypatch):
     assert [(item.key_name, item.value, item.source) for item in detected] == [
         ("EMAIL", "alice@example.com", "test")
     ]
+
+
+def test_resolve_opf_detector_supports_official_opf_api(monkeypatch):
+    from inbox_vault import opf as opf_module
+
+    opf_module._native_opf_detector.cache_clear()
+    init_kwargs: dict[str, object] = {}
+
+    class FakeSpan:
+        def __init__(self, label: str, start: int, end: int, text: str):
+            self.label = label
+            self.start = start
+            self.end = end
+            self.text = text
+
+    class FakeResult:
+        def __init__(self):
+            self.detected_spans = (
+                FakeSpan("private_email", 14, 30, "jane@example.com"),
+                FakeSpan("private_date", 34, 45, "May 3, 2026"),
+            )
+
+    class FakeOPF:
+        def __init__(self, *, model=None, device="cuda", output_mode="typed", output_text_only=False):
+            init_kwargs.update(
+                {
+                    "model": model,
+                    "device": device,
+                    "output_mode": output_mode,
+                    "output_text_only": output_text_only,
+                }
+            )
+
+        def redact(self, text: str):
+            assert "jane@example.com" in text
+            return FakeResult()
+
+    class FakeModule:
+        OPF = FakeOPF
+
+    monkeypatch.setattr(opf_module.importlib, "import_module", lambda name: FakeModule)
+
+    detector = opf_module.resolve_opf_detector("openai-privacy-filter")
+    detected = detector("Email Jane at jane@example.com on May 3, 2026")
+
+    assert init_kwargs == {
+        "model": None,
+        "device": "cpu",
+        "output_mode": "typed",
+        "output_text_only": False,
+    }
+    assert detected == [("EMAIL", "jane@example.com"), ("DATE", "May 3, 2026")]
+    opf_module._native_opf_detector.cache_clear()
 
 
 def test_resolve_redaction_backend_reports_opf_unavailable(monkeypatch):

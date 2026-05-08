@@ -16,6 +16,17 @@ REDACTION_POLICY_VERSION = "2026-03-22-precision-2"
 _EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", flags=re.I)
 _PHONE_PATTERN = re.compile(r"\b(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}\b")
 _URL_PATTERN = re.compile(r"\bhttps?://[^\s)]+", flags=re.I)
+_DATE_VALUE_PATTERN = re.compile(
+    r"""
+    ^(?:
+        \d{4}[-/]\d{1,2}[-/]\d{1,2}
+        |\d{1,2}[-/]\d{1,2}[-/]\d{2,4}
+        |(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+)\d{2,4}
+        |\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?(?:,?\s+)\d{2,4}
+    )$
+    """,
+    flags=re.I | re.X,
+)
 _ACCOUNT_INLINE_PATTERN = re.compile(
     r"\b(?:acct|account|iban|routing|card|ssn)[:\s#-]*[A-Z0-9-]{5,}\b", flags=re.I
 )
@@ -37,7 +48,7 @@ _RE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
 _ALLOWED_MODES = {"regex", "model", "hybrid"}
 _ALLOWED_BACKENDS = {"opf", "local"}
-_KNOWN_KEYS = {"EMAIL", "PHONE", "URL", "ACCOUNT", "PERSON", "ADDRESS", "CUSTOM"}
+_KNOWN_KEYS = {"EMAIL", "PHONE", "URL", "ACCOUNT", "PERSON", "ADDRESS", "DATE", "CUSTOM"}
 _GENERIC_LABELS = {
     "",
     ".",
@@ -706,6 +717,9 @@ def is_redaction_value_allowed(
 
     if key == "URL":
         return bool(_URL_PATTERN.fullmatch(display))
+
+    if key == "DATE":
+        return bool(_DATE_VALUE_PATTERN.fullmatch(display))
 
     if key == "ACCOUNT":
         digits = re.sub(r"\D", "", display)

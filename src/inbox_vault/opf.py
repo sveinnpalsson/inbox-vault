@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 import re
 from functools import lru_cache
 from typing import Any, Callable
@@ -14,20 +15,32 @@ class OPFUnavailableError(RuntimeError):
 EntityPair = tuple[str, str]
 EntityDetector = Callable[[str], list[EntityPair]]
 
-_LABEL_KEYS = ("entity_group", "entity", "label", "type", "tag")
-_TEXT_KEYS = ("word", "text", "value", "entity")
+_LABEL_KEYS = ("key_name", "entity_group", "entity", "label", "type", "tag")
+_TEXT_KEYS = ("word", "text", "value", "span", "entity")
+_DEFAULT_NATIVE_MODEL_ALIASES = {
+    "",
+    "default",
+    "openai-privacy-filter",
+    "openai/privacy-filter",
+    "privacy-filter",
+}
 _SUPPORTED_LABELS = {
+    "PRIVATE_PERSON": "PERSON",
     "PER": "PERSON",
     "PERSON": "PERSON",
+    "PRIVATE_EMAIL": "EMAIL",
     "EMAIL": "EMAIL",
     "MAIL": "EMAIL",
+    "PRIVATE_PHONE": "PHONE",
     "PHONE": "PHONE",
     "TEL": "PHONE",
     "TELEPHONE": "PHONE",
     "MOBILE": "PHONE",
+    "PRIVATE_URL": "URL",
     "URL": "URL",
     "URI": "URL",
     "WEB": "URL",
+    "ACCOUNT_NUMBER": "ACCOUNT",
     "ACCOUNT": "ACCOUNT",
     "IBAN": "ACCOUNT",
     "ROUTING": "ACCOUNT",
@@ -42,6 +55,10 @@ _SUPPORTED_LABELS = {
     "LOC": "ADDRESS",
     "LOCATION": "ADDRESS",
     "GPE": "ADDRESS",
+    "PRIVATE_ADDRESS": "ADDRESS",
+    "PRIVATE_DATE": "DATE",
+    "DATE": "DATE",
+    "SECRET": "CUSTOM",
 }
 
 
@@ -78,8 +95,17 @@ def _native_opf_detector(model_name: str | None) -> EntityDetector:
     if callable(detect):
         return _coerce_detector(detect, model_name=model_name)
 
+    opf_class = getattr(module, "OPF", None)
+    if callable(opf_class):
+        detector = _instantiate_native_opf(opf_class, model_name)
+        return _coerce_detector(detector)
+
+    redact = getattr(module, "redact", None)
+    if callable(redact):
+        return _coerce_detector(redact, model_name=model_name)
+
     raise OPFUnavailableError(
-        "opf package is installed but does not expose load_detector() or detect()"
+        "opf package is installed but does not expose OPF, load_detector(), detect(), or redact()"
     )
 
 
@@ -108,7 +134,8 @@ def _transformers_opf_detector(model_name: str | None) -> EntityDetector:
 
 
 def _call_with_optional_model(factory: Callable[..., Any], model_name: str | None) -> Any:
-    if model_name is None:
+    native_model_name = _native_model_argument(model_name)
+    if native_model_name is None:
         try:
             return factory()
         except TypeError:
@@ -121,25 +148,71 @@ def _call_with_optional_model(factory: Callable[..., Any], model_name: str | Non
 
     if signature is not None:
         if "model_name" in signature.parameters:
-            return factory(model_name=model_name)
+            return factory(model_name=native_model_name)
         if "model" in signature.parameters:
-            return factory(model=model_name)
+            return factory(model=native_model_name)
     try:
-        return factory(model_name)
+        return factory(native_model_name)
     except TypeError:
         return factory()
+
+
+def _native_model_argument(model_name: str | None) -> str | None:
+    cleaned = str(model_name or "").strip()
+    if cleaned.lower() in _DEFAULT_NATIVE_MODEL_ALIASES:
+        return None
+    return cleaned or None
+
+
+def _native_opf_device() -> str:
+    return (
+        os.getenv("INBOX_VAULT_OPF_DEVICE")
+        or os.getenv("OPF_DEVICE")
+        or "cpu"
+    ).strip() or "cpu"
+
+
+def _call_with_supported_kwargs(func: Callable[..., Any], /, **kwargs: Any) -> Any:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return func(**kwargs)
+
+    accepts_var_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    )
+    if accepts_var_kwargs:
+        return func(**kwargs)
+
+    supported = {
+        name: value for name, value in kwargs.items() if name in signature.parameters
+    }
+    return func(**supported)
+
+
+def _instantiate_native_opf(opf_class: Callable[..., Any], model_name: str | None) -> Any:
+    return _call_with_supported_kwargs(
+        opf_class,
+        model=_native_model_argument(model_name),
+        device=_native_opf_device(),
+        output_mode="typed",
+        output_text_only=False,
+    )
 
 
 def _coerce_detector(detector: Any, *, model_name: str | None = None) -> EntityDetector:
     def _detect(text: str) -> list[EntityPair]:
         if callable(detector):
             result = _invoke_detector(detector, text=text, model_name=model_name)
+        elif hasattr(detector, "redact") and callable(detector.redact):
+            result = _invoke_detector(detector.redact, text=text, model_name=None)
         elif hasattr(detector, "detect") and callable(detector.detect):
             result = _invoke_detector(detector.detect, text=text, model_name=model_name)
         elif hasattr(detector, "predict") and callable(detector.predict):
             result = _invoke_detector(detector.predict, text=text, model_name=model_name)
         else:
-            raise OPFUnavailableError("OPF detector does not expose a callable detect/predict API")
+            raise OPFUnavailableError("OPF detector does not expose a callable redact/detect/predict API")
         return _normalize_detector_output(result, source_text=text)
 
     return _detect
@@ -165,6 +238,21 @@ def _invoke_detector(func: Callable[..., Any], *, text: str, model_name: str | N
 
 
 def _normalize_detector_output(result: Any, *, source_text: str) -> list[EntityPair]:
+    if hasattr(result, "to_dict") and callable(result.to_dict):
+        result = result.to_dict()
+    if hasattr(result, "detected_spans"):
+        result = getattr(result, "detected_spans")
+    elif isinstance(result, dict):
+        result = (
+            result.get("detected_spans")
+            or result.get("redactions")
+            or result.get("spans")
+            or result.get("entities")
+        )
+    if isinstance(result, dict):
+        result = [result]
+    if isinstance(result, tuple):
+        result = list(result)
     if not isinstance(result, list):
         return []
 
@@ -183,7 +271,26 @@ def _extract_entity(item: Any, *, source_text: str) -> EntityPair:
         return label, value
 
     if not isinstance(item, dict):
-        return "", ""
+        raw_label = ""
+        for key in _LABEL_KEYS:
+            value = getattr(item, key, None)
+            if value is not None:
+                raw_label = str(value)
+                break
+        label = _normalize_label(raw_label)
+
+        text_value = ""
+        for key in _TEXT_KEYS:
+            value = getattr(item, key, None)
+            if isinstance(value, str) and value.strip():
+                text_value = value
+                break
+        if not text_value:
+            start = getattr(item, "start", None)
+            end = getattr(item, "end", None)
+            if isinstance(start, int) and isinstance(end, int) and 0 <= start < end <= len(source_text):
+                text_value = source_text[start:end]
+        return label, _normalize_wordpiece_text(text_value)
 
     raw_label = ""
     for key in _LABEL_KEYS:
@@ -210,6 +317,7 @@ def _extract_entity(item: Any, *, source_text: str) -> EntityPair:
 
 def _normalize_label(raw_label: str) -> str:
     cleaned = re.sub(r"^(?:B|I|L|U|S|E)-", "", (raw_label or "").strip().upper())
+    cleaned = re.sub(r"[^A-Z0-9]+", "_", cleaned).strip("_")
     return _SUPPORTED_LABELS.get(cleaned, "")
 
 

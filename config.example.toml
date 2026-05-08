@@ -55,9 +55,10 @@ profile = "standard"
 instruction = ""
 # chunk size for local endpoint model redaction requests
 chunk_chars = 1200
-# OPF backend: optionally set a local model/package identifier if your operator
-# install exposes the filter through transformers token-classification.
-# model = "your-opf-model"
+# OPF backend: leave model unset for the official package's default checkpoint,
+# or set a local checkpoint/model path if your operator provides one.
+# Set INBOX_VAULT_OPF_DEVICE=cuda to opt into GPU inference.
+# model = "/path/to/privacy_filter_checkpoint"
 #
 # local backend only: optional endpoint/model override
 # endpoint = "http://localhost:8080"

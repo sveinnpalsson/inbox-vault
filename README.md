@@ -128,7 +128,7 @@ Update `[llm]` and `[embeddings]` in your `config.toml` with the correct endpoin
 
 `[redaction]` is separate from `[llm]`.
 
-- Preferred default: set `backend = "opf"`. Install the local OPF package and, if needed, set `redaction.model` to the local Hugging Face/token-classification model identifier your operator deploys.
+- Preferred default: set `backend = "opf"`. Install the local OPF package, which imports as `opf`. Leave `redaction.model` unset for OPF's default checkpoint, or set it to a local checkpoint/model path when your operator provides one. Set `INBOX_VAULT_OPF_DEVICE=cuda` to opt into GPU inference.
 - Local-only legacy option: set `backend = "local"` and point `endpoint`/`model` at your local OpenAI-compatible redaction server.
 - Strictly local deterministic option: set `mode = "regex"` and Inbox Vault will avoid model-backed redaction entirely.
 
