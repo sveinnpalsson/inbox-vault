@@ -23,6 +23,7 @@ _DEFAULT_NATIVE_MODEL_ALIASES = {
     "openai-privacy-filter",
     "openai/privacy-filter",
     "privacy-filter",
+    "opf",
 }
 _SUPPORTED_LABELS = {
     "PRIVATE_PERSON": "PERSON",
@@ -258,10 +259,18 @@ def _normalize_detector_output(result: Any, *, source_text: str) -> list[EntityP
 
     entities: list[EntityPair] = []
     for item in result:
-        label, value = _extract_entity(item, source_text=source_text)
-        if label and value:
-            entities.append((label, value))
+        entities.extend(_extract_entities(item, source_text=source_text))
     return entities
+
+
+def _extract_entities(item: Any, *, source_text: str) -> list[EntityPair]:
+    grouped = _extract_grouped_values(item)
+    if grouped is not None:
+        return grouped
+    label, value = _extract_entity(item, source_text=source_text)
+    if label and value:
+        return [(label, value)]
+    return []
 
 
 def _extract_entity(item: Any, *, source_text: str) -> EntityPair:
@@ -315,8 +324,44 @@ def _extract_entity(item: Any, *, source_text: str) -> EntityPair:
     return label, _normalize_wordpiece_text(text_value)
 
 
+def _extract_grouped_values(item: Any) -> list[EntityPair] | None:
+    values = _item_value(item, "values")
+    if values is None:
+        return None
+    label = _normalize_label(
+        str(
+            _item_value(item, "key_name")
+            or _item_value(item, "label")
+            or _item_value(item, "entity_group")
+            or _item_value(item, "entity")
+            or _item_value(item, "type")
+            or ""
+        )
+    )
+    if not label:
+        return []
+    if isinstance(values, str):
+        iterable = [values]
+    elif isinstance(values, (list, tuple)):
+        iterable = values
+    else:
+        return []
+    pairs: list[EntityPair] = []
+    for value in iterable:
+        text_value = _normalize_wordpiece_text(str(value))
+        if text_value:
+            pairs.append((label, text_value))
+    return pairs
+
+
+def _item_value(item: Any, key: str) -> Any:
+    if isinstance(item, dict):
+        return item.get(key)
+    return getattr(item, key, None)
+
+
 def _normalize_label(raw_label: str) -> str:
-    cleaned = re.sub(r"^(?:B|I|L|U|S|E)-", "", (raw_label or "").strip().upper())
+    cleaned = re.sub(r"^(?:B|I|L|U|S|E)[-_]", "", (raw_label or "").strip().upper())
     cleaned = re.sub(r"[^A-Z0-9]+", "_", cleaned).strip("_")
     return _SUPPORTED_LABELS.get(cleaned, "")
 

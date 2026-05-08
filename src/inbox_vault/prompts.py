@@ -82,7 +82,7 @@ REDACTION_SYSTEM_PROMPT = (
     "Safety and behavior constraints:\n"
     "- Identify only concrete sensitive values present in the provided text.\n"
     "- Never add new facts, summaries, or commentary.\n"
-    "- Allowed key names are only: EMAIL, PHONE, URL, ACCOUNT, PERSON, ADDRESS.\n"
+    "- Allowed key names are only: EMAIL, PHONE, URL, ACCOUNT, PERSON, ADDRESS, DATE.\n"
     "- Do not emit generic categories such as NAME, LOCATION, SECRET, ID, CUSTOM, or OTHER.\n"
     "- Do not emit field labels, headers, or generic words such as 'name', 'last name', 'address', or state abbreviations by themselves.\n"
     "- If uncertain, abstain and return no candidate for that span.\n"

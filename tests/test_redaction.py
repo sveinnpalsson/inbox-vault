@@ -177,6 +177,77 @@ def test_resolve_opf_detector_supports_official_opf_api(monkeypatch):
     opf_module._native_opf_detector.cache_clear()
 
 
+
+def test_resolve_opf_detector_handles_grouped_values_alias_and_device(monkeypatch):
+    from inbox_vault import opf as opf_module
+
+    opf_module._native_opf_detector.cache_clear()
+    init_kwargs: dict[str, object] = {}
+
+    class FakeOPF:
+        def __init__(self, *, model=None, device="cpu", output_mode="typed", output_text_only=False):
+            init_kwargs.update(
+                {
+                    "model": model,
+                    "device": device,
+                    "output_mode": output_mode,
+                    "output_text_only": output_text_only,
+                }
+            )
+
+        def redact(self, text: str):
+            return {
+                "redactions": [
+                    {"key_name": "B_PRIVATE_EMAIL", "values": ["jane@example.com", "ops@example.com"]},
+                    {"label": "private_date", "values": "May 7, 2026"},
+                ]
+            }
+
+    class FakeModule:
+        OPF = FakeOPF
+
+    monkeypatch.setenv("INBOX_VAULT_OPF_DEVICE", "cuda")
+    monkeypatch.setattr(opf_module.importlib, "import_module", lambda name: FakeModule)
+
+    detector = opf_module.resolve_opf_detector("opf")
+    detected = detector("Email jane@example.com and ops@example.com on May 7, 2026")
+
+    assert init_kwargs == {
+        "model": None,
+        "device": "cuda",
+        "output_mode": "typed",
+        "output_text_only": False,
+    }
+    assert detected == [
+        ("EMAIL", "jane@example.com"),
+        ("EMAIL", "ops@example.com"),
+        ("DATE", "May 7, 2026"),
+    ]
+    opf_module._native_opf_detector.cache_clear()
+
+
+def test_resolve_opf_detector_supports_module_level_redact(monkeypatch):
+    from inbox_vault import opf as opf_module
+
+    opf_module._native_opf_detector.cache_clear()
+
+    class Span:
+        entity_group = "PRIVATE_PHONE"
+        start = 5
+        end = 17
+
+    class FakeModule:
+        @staticmethod
+        def redact(text: str, model=None):
+            assert model == "custom-checkpoint"
+            return {"detected_spans": (Span(),)}
+
+    monkeypatch.setattr(opf_module.importlib, "import_module", lambda name: FakeModule)
+
+    detector = opf_module.resolve_opf_detector("custom-checkpoint")
+    assert detector("Call 212-555-1212 today") == [("PHONE", "212-555-1212")]
+    opf_module._native_opf_detector.cache_clear()
+
 def test_resolve_redaction_backend_reports_opf_unavailable(monkeypatch):
     monkeypatch.setattr(
         "inbox_vault.redaction.resolve_opf_detector",
